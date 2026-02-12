@@ -280,7 +280,7 @@ pub fn handle_config_list(filter: Option<&str>) -> Result<()> {
 /// # use devcon::command::handle_build_command;
 ///
 /// let project_path = PathBuf::from("/path/to/project");
-/// handle_build_command(project_path)?;
+/// handle_build_command(project_path, None)?;
 /// # Ok::<(), devcon::error::Error>(())
 /// ```
 pub fn handle_build_command(path: PathBuf, build_path: Option<PathBuf>) -> Result<()> {
@@ -417,7 +417,7 @@ pub fn handle_shell_command(path: PathBuf, _env: &[String]) -> Result<()> {
 /// # use devcon::command::handle_up_command;
 ///
 /// let project_path = PathBuf::from("/path/to/project");
-/// handle_up_command(project_path)?;
+/// handle_up_command(project_path, None)?;
 /// # Ok::<(), devcon::error::Error>(())
 /// ```
 pub fn handle_up_command(path: PathBuf, build_path: Option<PathBuf>) -> Result<()> {

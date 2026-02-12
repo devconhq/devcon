@@ -35,19 +35,24 @@
 //! ## Usage
 //!
 //! ```no_run
-//! use devcon::devcontainer::Devcontainer;
+//! use devcon::config::{Config, DockerRuntimeConfig};
+//! use devcon::workspace::Workspace;
 //! use devcon::driver::container::ContainerDriver;
+//! use devcon::driver::runtime::docker::DockerRuntime;
 //! use std::path::PathBuf;
 //!
 //! # fn example() -> devcon::error::Result<()> {
-//! let config = Devcontainer::try_from(PathBuf::from("/path/to/project"))?;
-//! let driver = ContainerDriver::new(&config);
+//! let config = Config::load()?;
+//! let runtime = Box::new(DockerRuntime::new(DockerRuntimeConfig{}));
+//! let driver = ContainerDriver::new(config, runtime);
+//!
+//! let workspace = Workspace::try_from(PathBuf::from("/path/to/project"))?;
 //!
 //! // Build the container image
-//! driver.build()?;
+//! driver.build(workspace.clone(), &[], None)?;
 //!
 //! // Start the container
-//! driver.start(PathBuf::from("/path/to/project"))?;
+//! driver.start(workspace, &[])?;
 //! # Ok(())
 //! # }
 //! ```
@@ -133,11 +138,11 @@ impl ContainerDriver {
     /// # Examples
     ///
     /// ```no_run
-    /// # use devcon::driver::ContainerDriver;
-    /// # use devcon::config::Config;
-    /// # use devcon::runtime::docker::DockerRuntime;
+    /// # use devcon::driver::container::ContainerDriver;
+    /// # use devcon::config::{Config, DockerRuntimeConfig};
+    /// # use devcon::driver::runtime::docker::DockerRuntime;
     /// let config = Config::load()?;
-    /// let runtime = Box::new(DockerRuntime::new()?);
+    /// let runtime = Box::new(DockerRuntime::new(DockerRuntimeConfig{}));
     /// let driver = ContainerDriver::new(config, runtime);
     /// # Ok::<(), devcon::error::Error>(())
     /// ```
@@ -255,13 +260,18 @@ impl ContainerDriver {
     /// # Examples
     ///
     /// ```no_run
-    /// # use devcon::devcontainer::Devcontainer;
+    /// # use devcon::config::{Config, DockerRuntimeConfig};
+    /// # use devcon::workspace::Workspace;
     /// # use devcon::driver::container::ContainerDriver;
+    /// # use devcon::driver::runtime::docker::DockerRuntime;
     /// # use std::path::PathBuf;
-    /// # fn example() -> Result<()> {
-    /// let config = Devcontainer::try_from(PathBuf::from("/project"))?;
-    /// let driver = ContainerDriver::new(&config);
-    /// driver.build(&[\"NODE_ENV=production\"])?;
+    /// # fn example() -> devcon::error::Result<()> {
+    /// let config = Config::load()?;
+    /// let runtime = Box::new(DockerRuntime::new(DockerRuntimeConfig{}));
+    /// let driver = ContainerDriver::new(config, runtime);
+    /// let workspace = Workspace::try_from(PathBuf::from("/path/to/project"))?;
+    ///
+    /// driver.build(workspace, &["NODE_ENV=production".to_string()], None)?;
     /// # Ok(())
     /// # }
     /// ```
@@ -575,16 +585,19 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
     /// # Examples
     ///
     /// ```no_run
-    /// # use devcon::devcontainer::Devcontainer;
+    /// # use devcon::config::{Config, DockerRuntimeConfig};
+    /// # use devcon::workspace::Workspace;
     /// # use devcon::driver::container::ContainerDriver;
+    /// # use devcon::driver::runtime::docker::DockerRuntime;
     /// # use std::path::PathBuf;
-    /// # fn example() -> Result<()> {
-    /// let config = Devcontainer::try_from(PathBuf::from("/project"))?;
-    /// let driver = ContainerDriver::new(&config);
-    /// driver.build(None, &[])?;
-    /// let handle = driver.start(PathBuf::from("/project"), &["EDITOR=vim".to_string()])?;
-    /// // Wait for the listener (keeps process alive)
-    /// let _ = handle.join();
+    /// # fn example() -> devcon::error::Result<()> {
+    /// let config = Config::load()?;
+    /// let runtime = Box::new(DockerRuntime::new(DockerRuntimeConfig{}));
+    /// let driver = ContainerDriver::new(config, runtime);
+    /// let workspace = Workspace::try_from(PathBuf::from("/project"))?;
+    /// driver.build(workspace.clone(), &[], None)?;
+    /// let _ = driver.start(workspace, &["EDITOR=vim".to_string()])?;
+    ///
     /// # Ok(())
     /// # }
     /// ```
@@ -925,14 +938,18 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
     /// # Examples
     ///
     /// ```no_run
-    /// # use devcon::devcontainer::Devcontainer;
+    /// # use devcon::config::{Config, DockerRuntimeConfig};
+    /// # use devcon::workspace::Workspace;
     /// # use devcon::driver::container::ContainerDriver;
+    /// # use devcon::driver::runtime::docker::DockerRuntime;
     /// # use std::path::PathBuf;
-    /// # fn example() -> Result<()> {
-    /// let config = Devcontainer::try_from(PathBuf::from("/project"))?;
-    /// let driver = ContainerDriver::new(&config);
-    /// driver.build(None, &[])?;
-    /// driver.shell(PathBuf::from("/project"), &["EDITOR=vim".to_string()])?;
+    /// # fn example() -> devcon::error::Result<()> {
+    /// let config = Config::load()?;
+    /// let runtime = Box::new(DockerRuntime::new(DockerRuntimeConfig{}));
+    /// let driver = ContainerDriver::new(config, runtime);
+    /// let workspace = Workspace::try_from(PathBuf::from("/project"))?;
+    /// driver.build(workspace.clone(), &[], None)?;
+    /// driver.shell(workspace)?;
     /// # Ok(())
     /// # }
     /// ```
