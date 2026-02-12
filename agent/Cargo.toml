@@ -5,11 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-devcon-proto = { path = "../proto" }
-prost = "0.14.3"
-bytes = "1.11.1"
-clap = { version = "4.5.57", features = ["derive", "env"] }
-daemonize = "0.5"
+devcon-proto.workspace = true
+prost.workspace = true
+bytes.workspace = true
+clap = { workspace = true, features = ["derive", "env"] }
+daemonize.workspace = true
 
 [[bin]]
 name = "devcon-agent"

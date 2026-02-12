@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use crate::error::{Error, Result};
 use minijinja::Environment;
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::PermissionsExt;
@@ -120,11 +120,14 @@ impl Agent {
     /// Generate the devcontainer feature in a temporary directory
     pub fn generate(&mut self) -> Result<PathBuf> {
         // Create temporary directory
-        let temp_dir = TempDir::new().context("Failed to create temporary directory")?;
+        let temp_dir = TempDir::new().map_err(|e| {
+            Error::new(format!("{}: {}", "Failed to create temporary directory", e))
+        })?;
         let feature_dir = temp_dir.keep().join(&self.config.id);
 
         // Create feature directory
-        std::fs::create_dir_all(&feature_dir).context("Failed to create feature directory")?;
+        std::fs::create_dir_all(&feature_dir)
+            .map_err(|e| Error::new(format!("{}: {}", "Failed to create feature directory", e)))?;
 
         // Generate devcontainer-feature.json
         self.generate_feature_json(&feature_dir, self.config.binary_url.is_none())?;
@@ -167,10 +170,14 @@ impl Agent {
 
         let json_path = feature_dir.join("devcontainer-feature.json");
         let json_content = serde_json::to_string_pretty(&feature_json)
-            .context("Failed to serialize feature JSON")?;
+            .map_err(|e| Error::new(format!("{}: {}", "Failed to serialize feature JSON", e)))?;
 
-        std::fs::write(&json_path, json_content)
-            .context("Failed to write devcontainer-feature.json")?;
+        std::fs::write(&json_path, json_content).map_err(|e| {
+            Error::new(format!(
+                "{}: {}",
+                "Failed to write devcontainer-feature.json", e
+            ))
+        })?;
 
         Ok(())
     }
@@ -179,7 +186,7 @@ impl Agent {
     fn generate_install_script(&self, feature_dir: &Path) -> Result<()> {
         let install_path = feature_dir.join("install.sh");
         std::fs::write(&install_path, &self.config.install_script)
-            .context("Failed to write install.sh")?;
+            .map_err(|e| Error::new(format!("{}: {}", "Failed to write install.sh", e)))?;
 
         // Make install.sh executable on Unix systems
         #[cfg(unix)]

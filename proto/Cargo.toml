@@ -5,8 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-prost = "0.14.3"
-bytes = "1.11.1"
+prost.workspace = true
+bytes.workspace = true
 
 [build-dependencies]
-prost-build = "0.14.3"
+prost-build.workspace = true

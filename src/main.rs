@@ -26,14 +26,7 @@ use tracing::{Level, trace};
 use tracing_indicatif::IndicatifLayer;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::command::*;
-
-mod command;
-mod config;
-mod devcontainer;
-mod driver;
-mod feature;
-mod workspace;
+use devcon::command::*;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -181,7 +174,7 @@ enum Commands {
     },
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> devcon::error::Result<()> {
     let indicatif_layer = IndicatifLayer::new();
     let cli = Cli::parse();
     let level = match cli.debug {

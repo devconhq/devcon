@@ -6,23 +6,9 @@ version = "0.2.7"
 edition = "2024"
 license = "MIT"
 
-[package]
-name = "devcon"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-description = "A blazingly fast TUI application for managing and launching development containers"
-repository = "https://github.com/kreemer/devcon"
-homepage = "https://github.com/kreemer/devcon"
-documentation = "https://github.com/kreemer/devcon"
-readme = "README.md"
-keywords = ["devcontainer", "tui", "development", "container", "cli"]
-categories = ["command-line-utilities", "development-tools"]
-authors = ["DevCon Contributors"]
-
-[dependencies]
-anyhow = "1.0.100"
-clap = { version = "4.5.57", features = ["derive"] }
+[workspace.dependencies]
+thiserror = "2.0.10"
+clap = "4.5.57"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 yaml_serde = "0.10.3"
@@ -38,8 +24,8 @@ tracing = "0.1.44"
 tracing-indicatif = "0.3.14"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 fs_extra = "1.3.0"
-devcon-proto = { path = "proto" }
 prost = "0.14.3"
+prost-build = "0.14.3"
 bytes = "1.11.1"
 console = "0.16.2"
 open = "5.3.3"
@@ -47,7 +33,51 @@ strip-ansi-escapes = "0.2.1"
 sha2 = "0.10.9"
 json-strip-comments = "3.1.0"
 comfy-table = "7.2.2"
+assert_cmd = "2.1.2"
+daemonize = "0.5"
+devcon-proto = { path = "proto" }
+
+[package]
+name = "devcon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A blazingly fast TUI application for managing and launching development containers"
+repository = "https://github.com/kreemer/devcon"
+homepage = "https://github.com/kreemer/devcon"
+documentation = "https://github.com/kreemer/devcon"
+readme = "README.md"
+keywords = ["devcontainer", "tui", "development", "container", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+authors = ["DevCon Contributors"]
+
+[dependencies]
+thiserror.workspace = true
+clap = { workspace = true, features = ["derive"] }
+serde.workspace = true
+serde_json.workspace = true
+yaml_serde.workspace = true
+tempfile.workspace = true
+oci-spec.workspace = true
+reqwest.workspace = true
+flate2.workspace = true
+tar.workspace = true
+dirs.workspace = true
+minijinja.workspace = true
+indicatif.workspace = true
+tracing.workspace = true
+tracing-indicatif.workspace = true
+tracing-subscriber.workspace = true
+fs_extra.workspace = true
+devcon-proto.workspace = true
+prost.workspace = true
+bytes.workspace = true
+console.workspace = true
+open.workspace = true
+strip-ansi-escapes.workspace = true
+sha2.workspace = true
+json-strip-comments.workspace = true
+comfy-table.workspace = true
 
 [dev-dependencies]
-assert_cmd = "2.1.2"
-
+assert_cmd.workspace = true

@@ -29,7 +29,8 @@ use std::{
     process::{Command, Stdio},
 };
 
-use anyhow::bail;
+use crate::error::Error;
+use crate::error::Result;
 use tracing::trace;
 
 use crate::config::DockerRuntimeConfig;
@@ -78,12 +79,7 @@ impl super::ContainerHandle for DockerContainerHandle {
 }
 
 impl ContainerRuntime for DockerRuntime {
-    fn build(
-        &self,
-        dockerfile_path: &Path,
-        context_path: &Path,
-        image_tag: &str,
-    ) -> anyhow::Result<()> {
+    fn build(&self, dockerfile_path: &Path, context_path: &Path, image_tag: &str) -> Result<()> {
         let mut cmd = Command::new("docker");
         cmd.arg("build")
             .arg("-f")
@@ -100,7 +96,7 @@ impl ContainerRuntime for DockerRuntime {
         let result = stream_build_output(child)?;
 
         if !result.success() {
-            bail!("Docker build command failed")
+            return Err(Error::runtime("Docker build command failed"));
         }
 
         Ok(())
@@ -113,7 +109,7 @@ impl ContainerRuntime for DockerRuntime {
         label: &str,
         env_vars: &[String],
         runtime_parameters: RuntimeParameters,
-    ) -> anyhow::Result<Box<dyn super::ContainerHandle>> {
+    ) -> Result<Box<dyn super::ContainerHandle>> {
         trace!("Running Docker container with image: {}", image_tag);
         let mut cmd = Command::new("docker");
         cmd.arg("run")
@@ -190,7 +186,7 @@ impl ContainerRuntime for DockerRuntime {
         let result = cmd.output()?;
 
         if result.status.code() != Some(0) {
-            bail!("Docker run command failed")
+            return Err(Error::runtime("Docker run command failed"));
         }
 
         Ok(Box::new(DockerContainerHandle {
@@ -204,7 +200,7 @@ impl ContainerRuntime for DockerRuntime {
         command: Vec<&str>,
         env_vars: &[String],
         attach_stdin: bool,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         let mut cmd = Command::new("docker");
         cmd.arg("exec").arg("-t");
 
@@ -219,13 +215,13 @@ impl ContainerRuntime for DockerRuntime {
         let result = cmd.arg(container_handle.id()).args(command).status()?;
 
         if result.code() != Some(0) {
-            bail!("Docker exec command failed")
+            return Err(Error::runtime("Docker exec command failed"));
         }
 
         Ok(())
     }
 
-    fn list(&self) -> anyhow::Result<Vec<(String, Box<dyn super::ContainerHandle>)>> {
+    fn list(&self) -> Result<Vec<(String, Box<dyn super::ContainerHandle>)>> {
         let output = Command::new("docker")
             .arg("ps")
             .arg("--filter")
@@ -275,7 +271,7 @@ impl ContainerRuntime for DockerRuntime {
         Ok(result)
     }
 
-    fn images(&self) -> anyhow::Result<Vec<String>> {
+    fn images(&self) -> Result<Vec<String>> {
         let output = Command::new("docker")
             .arg("image")
             .arg("list")

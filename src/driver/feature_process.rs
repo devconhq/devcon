@@ -37,7 +37,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Ok, bail};
+use crate::error::{Error, Result};
 use tempfile::TempDir;
 use tracing::{debug, info};
 
@@ -109,7 +109,7 @@ impl FeatureProcessResult {
 ///
 /// Returns an error if any feature fails to download, extract, or if there are
 /// circular dependencies.
-pub fn process_features(features: &[FeatureRef]) -> anyhow::Result<Vec<FeatureProcessResult>> {
+pub fn process_features(features: &[FeatureRef]) -> Result<Vec<FeatureProcessResult>> {
     println!("Processing features..");
     let mut initial_results: Vec<FeatureProcessResult> = vec![];
 
@@ -123,7 +123,7 @@ pub fn process_features(features: &[FeatureRef]) -> anyhow::Result<Vec<FeaturePr
                 "Processing feature {}",
                 path.canonicalize()?
                     .file_name()
-                    .ok_or_else(|| anyhow::anyhow!("Could not get basename of directory"))?
+                    .ok_or_else(|| Error::new("Could not get basename of directory"))?
                     .to_string_lossy()
             ),
         }
@@ -168,7 +168,7 @@ pub fn process_features(features: &[FeatureRef]) -> anyhow::Result<Vec<FeaturePr
 /// - A dependency reference cannot be parsed
 fn resolve_all_dependencies(
     initial_features: Vec<FeatureProcessResult>,
-) -> anyhow::Result<HashMap<String, FeatureProcessResult>> {
+) -> Result<HashMap<String, FeatureProcessResult>> {
     let mut all_features: HashMap<String, FeatureProcessResult> = HashMap::new();
     let mut to_process: VecDeque<FeatureProcessResult> = VecDeque::new();
     let mut processing: HashSet<String> = HashSet::new();
@@ -284,7 +284,7 @@ fn resolve_all_dependencies(
 /// Returns an error if a circular dependency is detected
 fn topological_sort(
     features: HashMap<String, FeatureProcessResult>,
-) -> anyhow::Result<Vec<FeatureProcessResult>> {
+) -> Result<Vec<FeatureProcessResult>> {
     let mut in_degree: HashMap<String, usize> = HashMap::new();
     let mut adjacency: HashMap<String, Vec<String>> = HashMap::new();
     let mut feature_map = features;
@@ -391,10 +391,10 @@ fn topological_sort(
     // Check for circular dependencies
     if sorted.len() != in_degree.len() {
         let remaining: Vec<String> = feature_map.keys().cloned().collect();
-        bail!(
+        return Err(Error::new(format!(
             "Circular dependency detected among features: {:?}",
             remaining
-        );
+        )));
     }
 
     debug!("Topologically sorted {} features", sorted.len());
@@ -445,7 +445,7 @@ fn topological_sort(
     Ok(sorted)
 }
 
-pub fn process_feature(feature_ref: &FeatureRef) -> anyhow::Result<FeatureProcessResult> {
+pub fn process_feature(feature_ref: &FeatureRef) -> Result<FeatureProcessResult> {
     let relative_path = match &feature_ref.source {
         Registry { registry } => download_feature(registry),
         Local { path } => local_feature(path),
@@ -455,10 +455,10 @@ pub fn process_feature(feature_ref: &FeatureRef) -> anyhow::Result<FeatureProces
     let feature_json_path = relative_path.join("devcontainer-feature.json");
 
     if !feature_json_path.exists() {
-        bail!(
+        return Err(Error::new(format!(
             "Feature definition file not found: {}",
             feature_json_path.display()
-        );
+        )));
     }
 
     let feature_json_content = fs::read_to_string(&feature_json_path)?;
@@ -472,9 +472,9 @@ pub fn process_feature(feature_ref: &FeatureRef) -> anyhow::Result<FeatureProces
 }
 
 /// Get the cache directory for devcontainer features
-fn get_feature_cache_dir() -> anyhow::Result<std::path::PathBuf> {
+fn get_feature_cache_dir() -> Result<std::path::PathBuf> {
     let cache_dir =
-        dirs::cache_dir().ok_or_else(|| anyhow::anyhow!("Could not determine cache directory"))?;
+        dirs::cache_dir().ok_or_else(|| Error::new("Could not determine cache directory"))?;
     let devcon_cache = cache_dir.join("devcon").join("features");
     fs::create_dir_all(&devcon_cache)?;
     Ok(devcon_cache)
@@ -484,7 +484,7 @@ fn get_feature_cache_dir() -> anyhow::Result<std::path::PathBuf> {
 fn get_cached_feature_path(
     registry: &FeatureRegistry,
     layer_sha: &str,
-) -> anyhow::Result<std::path::PathBuf> {
+) -> Result<std::path::PathBuf> {
     let cache_dir = get_feature_cache_dir()?;
     // Create path: cache/owner/repository/name/sha
     // Using SHA ensures automatic invalidation when content changes
@@ -497,13 +497,13 @@ fn get_cached_feature_path(
 }
 
 /// Get local feature path
-fn local_feature(path: &Path) -> anyhow::Result<PathBuf> {
+fn local_feature(path: &Path) -> Result<PathBuf> {
     info!("Using local feature from path: {}", path.display());
-    path.canonicalize().map_err(|e| anyhow::anyhow!(e))
+    path.canonicalize().map_err(|e| Error::new(e.to_string()))
 }
 
 /// Download a feature from registry to cache, or use cached version if available
-fn download_feature(registry: &FeatureRegistry) -> anyhow::Result<PathBuf> {
+fn download_feature(registry: &FeatureRegistry) -> Result<PathBuf> {
     // First, fetch the manifest to get the layer SHA
     let (token, layer_digest) = fetch_manifest_and_layer_digest(registry)?;
 
@@ -539,7 +539,7 @@ fn download_feature(registry: &FeatureRegistry) -> anyhow::Result<PathBuf> {
 }
 
 /// Fetch the manifest and extract the layer digest (SHA)
-fn fetch_manifest_and_layer_digest(registry: &FeatureRegistry) -> anyhow::Result<(String, String)> {
+fn fetch_manifest_and_layer_digest(registry: &FeatureRegistry) -> Result<(String, String)> {
     let token_url = format!(
         "https://{}/token?scope=repository:{}/{}:pull",
         "ghcr.io", registry.owner, registry.repository
@@ -547,13 +547,19 @@ fn fetch_manifest_and_layer_digest(registry: &FeatureRegistry) -> anyhow::Result
 
     let response = reqwest::blocking::get(&token_url)?;
     if !response.status().is_success() {
-        bail!("Failed to get token for feature: {}", registry.name);
+        return Err(Error::new(format!(
+            "Failed to get token for feature: {}",
+            registry.name
+        )));
     }
     let json: serde_json::Value = response.json()?;
     let token = json["token"]
         .as_str()
         .ok_or_else(|| {
-            anyhow::anyhow!("Token not found in response for feature: {}", registry.name)
+            Error::new(format!(
+                "Token not found in response for feature: {}",
+                registry.name
+            ))
         })?
         .to_string();
 
@@ -569,14 +575,20 @@ fn fetch_manifest_and_layer_digest(registry: &FeatureRegistry) -> anyhow::Result
         .send()?;
 
     if !manifest_response.status().is_success() {
-        bail!("Failed to download manifest for feature: {}", registry.name);
+        return Err(Error::new(format!(
+            "Failed to download manifest for feature: {}",
+            registry.name
+        )));
     }
     let manifest_json: serde_json::Value = manifest_response.json()?;
     let manifest_str = serde_json::to_string(&manifest_json)?;
     let reader = std::io::Cursor::new(manifest_str);
     let manifest = oci_spec::image::ImageManifest::from_reader(reader)?;
     let layer = manifest.layers().first().ok_or_else(|| {
-        anyhow::anyhow!("No layers found in manifest for feature: {}", registry.name)
+        Error::new(format!(
+            "No layers found in manifest for feature: {}",
+            registry.name
+        ))
     })?;
 
     Ok((token, layer.digest().to_string()))
@@ -588,7 +600,7 @@ fn download_and_cache_feature(
     cache_path: &std::path::Path,
     token: &str,
     layer_digest: &str,
-) -> anyhow::Result<()> {
+) -> Result<()> {
     let temp_directory = TempDir::new()?;
 
     let layer_url = format!(
@@ -601,7 +613,10 @@ fn download_and_cache_feature(
         .send()?;
 
     if !layer_response.status().is_success() {
-        bail!("Failed to download layer for feature: {}", registry.name);
+        return Err(Error::new(format!(
+            "Failed to download layer for feature: {}",
+            registry.name
+        )));
     }
     let layer_bytes = layer_response.bytes()?;
 
@@ -620,7 +635,10 @@ fn download_and_cache_feature(
     let reader = std::io::Cursor::new(manifest_str);
     let manifest = oci_spec::image::ImageManifest::from_reader(reader)?;
     let layer = manifest.layers().first().ok_or_else(|| {
-        anyhow::anyhow!("No layers found in manifest for feature: {}", registry.name)
+        Error::new(format!(
+            "No layers found in manifest for feature: {}",
+            registry.name
+        ))
     })?;
 
     let extract_path = match layer.media_type() {
@@ -661,19 +679,18 @@ fn download_and_cache_feature(
                 extract_path
             }
             _ => {
-                bail!(
+                return Err(Error::new(format!(
                     "Unsupported layer media type for feature: {}, media type: {}",
-                    registry.name,
-                    str
-                );
+                    registry.name, str
+                )));
             }
         },
 
         _ => {
-            bail!(
+            return Err(Error::new(format!(
                 "Unsupported layer media type for feature: {}",
                 registry.name
-            );
+            )));
         }
     };
 
@@ -696,7 +713,7 @@ fn download_and_cache_feature(
         cache_path.display()
     );
     fs_extra::dir::copy(&extract_path, cache_path, &options)
-        .map_err(|e| anyhow::anyhow!("Failed to copy extracted feature: {}", e))?;
+        .map_err(|e| Error::new(format!("Failed to copy extracted feature: {}", e)))?;
 
     Ok(())
 }
@@ -704,7 +721,7 @@ fn download_and_cache_feature(
 /// Clear the entire feature cache
 /// TODO: Add command which invokes this function
 #[allow(dead_code)]
-pub fn clear_feature_cache() -> anyhow::Result<()> {
+pub fn clear_feature_cache() -> Result<()> {
     let cache_dir = get_feature_cache_dir()?;
     if cache_dir.exists() {
         info!("Clearing feature cache at: {}", cache_dir.display());
@@ -720,7 +737,7 @@ pub fn clear_feature_cache() -> anyhow::Result<()> {
 /// Clear cache for a specific feature
 /// TODO: Add command which invokes this function
 #[allow(dead_code)]
-pub fn clear_feature_cache_for(owner: &str, repository: &str, name: &str) -> anyhow::Result<()> {
+pub fn clear_feature_cache_for(owner: &str, repository: &str, name: &str) -> Result<()> {
     let cache_dir = get_feature_cache_dir()?;
     let feature_cache = cache_dir.join(owner).join(repository).join(name);
 
