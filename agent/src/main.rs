@@ -3,6 +3,7 @@
 //! This agent runs inside the container and communicates with the host control server via TCP.
 
 use clap::{Parser, Subcommand};
+use daemonize::Daemonize;
 use devcon_proto::{AgentMessage, OpenUrl, StartPortForward, StopPortForward, agent_message};
 use prost::Message;
 use std::collections::HashSet;
@@ -505,29 +506,41 @@ fn main() {
             }
         }
         Commands::Daemon { scan_interval } => {
-            // Parse excluded ports from CLI arg or environment variable
-            let mut excluded_ports = HashSet::new();
+            // Daemonize the process
+            let daemonize = Daemonize::new();
 
-            if let Some(ports) = cli.exclude_ports {
-                excluded_ports.extend(ports);
-            } else if let Ok(env_ports) = std::env::var("DEVCON_FORWARDED_PORTS") {
-                for port_str in env_ports.split(',') {
-                    if let Ok(port) = port_str.trim().parse::<u16>() {
-                        excluded_ports.insert(port);
+            match daemonize.start() {
+                Ok(_) => {
+                    // We're now in the child process
+                    // Parse excluded ports from CLI arg or environment variable
+                    let mut excluded_ports = HashSet::new();
+
+                    if let Some(ports) = cli.exclude_ports {
+                        excluded_ports.extend(ports);
+                    } else if let Ok(env_ports) = std::env::var("DEVCON_FORWARDED_PORTS") {
+                        for port_str in env_ports.split(',') {
+                            if let Ok(port) = port_str.trim().parse::<u16>() {
+                                excluded_ports.insert(port);
+                            }
+                        }
                     }
+
+                    if !excluded_ports.is_empty() {
+                        eprintln!("Excluding ports from auto-forwarding: {:?}", excluded_ports);
+                    }
+
+                    run_daemon(
+                        &cli.control_host,
+                        cli.control_port,
+                        scan_interval,
+                        excluded_ports,
+                    )
+                }
+                Err(e) => {
+                    eprintln!("Failed to daemonize: {}", e);
+                    Err(io::Error::new(io::ErrorKind::Other, e))
                 }
             }
-
-            if !excluded_ports.is_empty() {
-                eprintln!("Excluding ports from auto-forwarding: {:?}", excluded_ports);
-            }
-
-            run_daemon(
-                &cli.control_host,
-                cli.control_port,
-                scan_interval,
-                excluded_ports,
-            )
         }
     };
 

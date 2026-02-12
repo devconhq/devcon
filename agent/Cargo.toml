@@ -9,6 +9,7 @@ devcon-proto = { path = "../proto" }
 prost = "0.14.3"
 bytes = "1.11.1"
 clap = { version = "4.5.57", features = ["derive", "env"] }
+daemonize = "0.5"
 
 [[bin]]
 name = "devcon-agent"

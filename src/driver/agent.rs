@@ -147,7 +147,7 @@ impl Agent {
                 "DEVCON_AGENT": "1",
                 "BROWSER": "/usr/local/bin/devcon-browser"
             },
-            "entrypoint": "echo test && nohup /usr/local/bin/devcon-agent daemon 2>&1 >/tmp/devcon-agent.log &",
+            "entrypoint": "/usr/local/bin/devcon-agent daemon",
         });
 
         if compile_needed {
