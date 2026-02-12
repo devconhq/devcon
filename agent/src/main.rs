@@ -538,7 +538,7 @@ fn main() {
                 }
                 Err(e) => {
                     eprintln!("Failed to daemonize: {}", e);
-                    Err(io::Error::new(io::ErrorKind::Other, e))
+                    Err(io::Error::other(e))
                 }
             }
         }
