@@ -25,7 +25,10 @@
 //! This library provides core functionality for the DevCon CLI tool.
 //! Currently serves as a placeholder for potential library exports in the future.
 
+pub mod command;
 pub mod config;
 pub mod devcontainer;
+pub mod driver;
+pub mod error;
 pub mod feature;
 pub mod workspace;

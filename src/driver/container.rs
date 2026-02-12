@@ -39,7 +39,7 @@
 //! use devcon::driver::container::ContainerDriver;
 //! use std::path::PathBuf;
 //!
-//! # fn example() -> anyhow::Result<()> {
+//! # fn example() -> devcon::error::Result<()> {
 //! let config = Devcontainer::try_from(PathBuf::from("/path/to/project"))?;
 //! let driver = ContainerDriver::new(&config);
 //!
@@ -55,7 +55,7 @@
 use std::fs::{self, File};
 use std::path::Path;
 
-use anyhow::bail;
+use crate::error::{Error, Result};
 use minijinja::Environment;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -91,7 +91,7 @@ use std::path::PathBuf;
 fn apply_feature_order_override(
     features: Vec<FeatureProcessResult>,
     override_order: &[String],
-) -> anyhow::Result<Vec<FeatureProcessResult>> {
+) -> Result<Vec<FeatureProcessResult>> {
     let mut ordered = Vec::new();
     let mut remaining = features.clone();
 
@@ -139,7 +139,7 @@ impl ContainerDriver {
     /// let config = Config::load()?;
     /// let runtime = Box::new(DockerRuntime::new()?);
     /// let driver = ContainerDriver::new(config, runtime);
-    /// # Ok::<(), anyhow::Error>(())
+    /// # Ok::<(), devcon::error::Error>(())
     /// ```
     pub fn new(config: Config, runtime: Box<dyn ContainerRuntime>) -> Self {
         Self { config, runtime }
@@ -172,7 +172,7 @@ impl ContainerDriver {
     pub fn prepare_features(
         &self,
         devcontainer_workspace: &Workspace,
-    ) -> anyhow::Result<(Vec<FeatureProcessResult>, Vec<FeatureRef>)> {
+    ) -> Result<(Vec<FeatureProcessResult>, Vec<FeatureRef>)> {
         trace!(
             "Using features of devcontainer: {:?}",
             devcontainer_workspace.devcontainer.features
@@ -258,7 +258,7 @@ impl ContainerDriver {
     /// # use devcon::devcontainer::Devcontainer;
     /// # use devcon::driver::container::ContainerDriver;
     /// # use std::path::PathBuf;
-    /// # fn example() -> anyhow::Result<()> {
+    /// # fn example() -> Result<()> {
     /// let config = Devcontainer::try_from(PathBuf::from("/project"))?;
     /// let driver = ContainerDriver::new(&config);
     /// driver.build(&[\"NODE_ENV=production\"])?;
@@ -270,7 +270,7 @@ impl ContainerDriver {
         devcontainer_workspace: Workspace,
         env_variables: &[String],
         build_path: Option<PathBuf>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         self.build_with_features(devcontainer_workspace, env_variables, None, build_path)
     }
 
@@ -299,7 +299,7 @@ impl ContainerDriver {
         env_variables: &[String],
         processed_features: Option<Vec<FeatureProcessResult>>,
         build_path: Option<PathBuf>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         let directory = match build_path {
             Some(path) => {
                 std::fs::create_dir_all(&path)?;
@@ -492,14 +492,14 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
         &self,
         process: &FeatureProcessResult,
         build_directory: &Path,
-    ) -> anyhow::Result<String> {
+    ) -> Result<String> {
         let feature_dest = build_directory.join(process.directory_name());
 
         let mut options = fs_extra::dir::CopyOptions::new();
         options.overwrite = true;
         options.copy_inside = true;
         fs_extra::dir::copy(&process.path, &feature_dest, &options)
-            .map_err(|e| anyhow::anyhow!("Failed to copy feature directory: {}", e))?;
+            .map_err(|e| Error::new(format!("Failed to copy feature directory: {}", e)))?;
 
         // Create env variable file with merged options (defaults + user overrides)
         let mut feature_options = serde_json::json!({});
@@ -578,7 +578,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
     /// # use devcon::devcontainer::Devcontainer;
     /// # use devcon::driver::container::ContainerDriver;
     /// # use std::path::PathBuf;
-    /// # fn example() -> anyhow::Result<()> {
+    /// # fn example() -> Result<()> {
     /// let config = Devcontainer::try_from(PathBuf::from("/project"))?;
     /// let driver = ContainerDriver::new(&config);
     /// driver.build(None, &[])?;
@@ -588,11 +588,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
     /// # Ok(())
     /// # }
     /// ```
-    pub fn start(
-        &self,
-        devcontainer_workspace: Workspace,
-        env_variables: &[String],
-    ) -> anyhow::Result<()> {
+    pub fn start(&self, devcontainer_workspace: Workspace, env_variables: &[String]) -> Result<()> {
         self.start_with_features(devcontainer_workspace, env_variables, None)
     }
 
@@ -618,7 +614,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
         devcontainer_workspace: Workspace,
         env_variables: &[String],
         processed_features: Option<Vec<FeatureProcessResult>>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         let handles = self.runtime.list()?;
         let existing_handle = handles
             .iter()
@@ -638,7 +634,9 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
         debug!("Image found: {}", already_built);
 
         if !already_built {
-            bail!("Image not found. Run 'devcon build' or 'devcon up' first.");
+            return Err(Error::new(
+                "Image not found. Run 'devcon build' or 'devcon up' first.".to_string(),
+            ));
         }
 
         let volume_mount = format!(
@@ -854,7 +852,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
         // Check if feature has entrypoint script which should start now
         processed_features
             .iter()
-            .try_for_each(|feature_result| -> anyhow::Result<()> {
+            .try_for_each(|feature_result| -> Result<()> {
                 if let Some(entrypoint) = &feature_result.feature.entrypoint {
                     info!(
                         "Executing entrypoint script for feature '{}'",
@@ -930,7 +928,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
     /// # use devcon::devcontainer::Devcontainer;
     /// # use devcon::driver::container::ContainerDriver;
     /// # use std::path::PathBuf;
-    /// # fn example() -> anyhow::Result<()> {
+    /// # fn example() -> Result<()> {
     /// let config = Devcontainer::try_from(PathBuf::from("/project"))?;
     /// let driver = ContainerDriver::new(&config);
     /// driver.build(None, &[])?;
@@ -938,7 +936,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
     /// # Ok(())
     /// # }
     /// ```
-    pub fn shell(&self, devcontainer_workspace: Workspace) -> anyhow::Result<()> {
+    pub fn shell(&self, devcontainer_workspace: Workspace) -> Result<()> {
         let containers = self.runtime.list()?;
 
         let handle = containers
@@ -949,7 +947,9 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
             .map(|(_, id)| id);
 
         if handle.is_none() {
-            bail!("Container not running. Run 'devcon start' or 'devcon up' first.");
+            return Err(Error::new(
+                "Container not running. Run 'devcon start' or 'devcon up' first.".to_string(),
+            ));
         }
 
         // Process environment variables

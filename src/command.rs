@@ -35,6 +35,7 @@
 
 use std::path::PathBuf;
 
+use crate::error::{Error, Result};
 use crate::{
     config::Config,
     driver::{
@@ -44,7 +45,6 @@ use crate::{
     },
     workspace::Workspace,
 };
-use anyhow::Result;
 use comfy_table::{Cell, Color, ContentArrangement, Table, presets::UTF8_FULL};
 use tracing::{debug, trace};
 
@@ -64,7 +64,7 @@ fn get_runtime_specific_config(
             let apple_config = runtime_config.apple.unwrap_or_default();
             Box::new(AppleRuntime::new(apple_config))
         }
-        _ => anyhow::bail!("Unknown runtime: {}", runtime_name),
+        _ => return Err(Error::runtime(format!("Unknown runtime: {}", runtime_name))),
     };
 
     Ok(runtime)
@@ -281,9 +281,9 @@ pub fn handle_config_list(filter: Option<&str>) -> Result<()> {
 ///
 /// let project_path = PathBuf::from("/path/to/project");
 /// handle_build_command(project_path)?;
-/// # Ok::<(), anyhow::Error>(())
+/// # Ok::<(), devcon::error::Error>(())
 /// ```
-pub fn handle_build_command(path: PathBuf, build_path: Option<PathBuf>) -> anyhow::Result<()> {
+pub fn handle_build_command(path: PathBuf, build_path: Option<PathBuf>) -> Result<()> {
     let config = Config::load()?;
 
     trace!("Config loaded {:?}", config);
@@ -302,10 +302,10 @@ pub fn handle_build_command(path: PathBuf, build_path: Option<PathBuf>) -> anyho
     let result = driver.build(devcontainer_workspace, &[], effective_build_path);
 
     if result.is_err() {
-        anyhow::bail!(
+        return Err(Error::new(format!(
             "Failed to build the development container. Error: {:?}",
             result.err()
-        );
+        )));
     }
 
     Ok(())
@@ -340,9 +340,9 @@ pub fn handle_build_command(path: PathBuf, build_path: Option<PathBuf>) -> anyho
 ///
 /// let project_path = PathBuf::from("/path/to/project");
 /// handle_start_command(project_path)?;
-/// # Ok::<(), anyhow::Error>(())
+/// # Ok::<(), devcon::error::Error>(())
 /// ```
-pub fn handle_start_command(path: PathBuf) -> anyhow::Result<()> {
+pub fn handle_start_command(path: PathBuf) -> Result<()> {
     let config = Config::load()?;
     trace!("Config loaded {:?}", config);
     let devcontainer_workspace = Workspace::try_from(path.clone())?;
@@ -370,7 +370,7 @@ pub fn handle_start_command(path: PathBuf) -> anyhow::Result<()> {
 /// # Errors
 ///
 /// Currently always returns `Ok(())` as it's not implemented.
-pub fn handle_shell_command(path: PathBuf, _env: &[String]) -> anyhow::Result<()> {
+pub fn handle_shell_command(path: PathBuf, _env: &[String]) -> Result<()> {
     let config = Config::load()?;
     trace!("Config loaded {:?}", config);
     let devcontainer_workspace = Workspace::try_from(path.clone())?;
@@ -418,9 +418,9 @@ pub fn handle_shell_command(path: PathBuf, _env: &[String]) -> anyhow::Result<()
 ///
 /// let project_path = PathBuf::from("/path/to/project");
 /// handle_up_command(project_path)?;
-/// # Ok::<(), anyhow::Error>(())
+/// # Ok::<(), devcon::error::Error>(())
 /// ```
-pub fn handle_up_command(path: PathBuf, build_path: Option<PathBuf>) -> anyhow::Result<()> {
+pub fn handle_up_command(path: PathBuf, build_path: Option<PathBuf>) -> Result<()> {
     let config = Config::load()?;
     trace!("Config loaded {:?}", config);
     let devcontainer_workspace = Workspace::try_from(path)?;
@@ -472,7 +472,7 @@ pub fn handle_up_command(path: PathBuf, build_path: Option<PathBuf>) -> anyhow::
 /// ```no_run
 /// # use devcon::command::handle_serve_command;
 /// handle_serve_command(15000)?;
-/// # Ok::<(), anyhow::Error>(())
+/// # Ok::<(), devcon::error::Error>(())
 /// ```
 pub fn handle_serve_command(port: u16) -> Result<()> {
     let config = Config::load()?;

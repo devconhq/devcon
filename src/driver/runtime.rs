@@ -35,6 +35,7 @@ use std::{
     time::Duration,
 };
 
+use crate::error::Result;
 use console::Style;
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -56,7 +57,7 @@ pub mod docker;
 /// # Returns
 ///
 /// Returns `Ok(ExitStatus)` if the process completes, `Err` if there's an I/O error
-pub fn stream_build_output(mut child: Child) -> anyhow::Result<std::process::ExitStatus> {
+pub fn stream_build_output(mut child: Child) -> Result<std::process::ExitStatus> {
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
@@ -229,12 +230,7 @@ pub trait ContainerRuntime: Send {
     /// # Errors
     ///
     /// Returns an error if the build command fails.
-    fn build(
-        &self,
-        dockerfile_path: &Path,
-        context_path: &Path,
-        image_tag: &str,
-    ) -> anyhow::Result<()>;
+    fn build(&self, dockerfile_path: &Path, context_path: &Path, image_tag: &str) -> Result<()>;
 
     /// Starts a container instance.
     ///
@@ -256,7 +252,7 @@ pub trait ContainerRuntime: Send {
         label: &str,
         env_vars: &[String],
         runtime_parameters: RuntimeParameters,
-    ) -> anyhow::Result<Box<dyn ContainerHandle>>;
+    ) -> Result<Box<dyn ContainerHandle>>;
 
     /// Executes a command in a running container.
     ///
@@ -275,7 +271,7 @@ pub trait ContainerRuntime: Send {
         command: Vec<&str>,
         env_vars: &[String],
         attach_stdin: bool,
-    ) -> anyhow::Result<()>;
+    ) -> Result<()>;
 
     /// Lists running containers.
     ///
@@ -287,7 +283,7 @@ pub trait ContainerRuntime: Send {
     /// # Errors
     ///
     /// Returns an error if the list command fails or output cannot be parsed.
-    fn list(&self) -> anyhow::Result<Vec<(String, Box<dyn ContainerHandle>)>>;
+    fn list(&self) -> Result<Vec<(String, Box<dyn ContainerHandle>)>>;
 
     /// List images.
     ///
@@ -298,7 +294,7 @@ pub trait ContainerRuntime: Send {
     /// # Errors
     ///
     /// Returns an error if the list images command fails or output cannot be parsed.
-    fn images(&self) -> anyhow::Result<Vec<String>>;
+    fn images(&self) -> Result<Vec<String>>;
 
     /// Get the host address for the runtime.
     ///

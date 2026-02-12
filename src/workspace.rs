@@ -46,7 +46,7 @@ use crate::devcontainer::Devcontainer;
 /// use devcon::workspace::Workspace;
 ///
 /// let workspace = Workspace::try_from(PathBuf::from("/path/to/project"))?;
-/// # Ok::<(), anyhow::Error>(())
+/// # Ok::<(), devcon::error::Error>(())
 /// ```
 #[derive(Clone)]
 pub struct Workspace {
@@ -55,7 +55,7 @@ pub struct Workspace {
 }
 
 impl TryFrom<PathBuf> for Workspace {
-    type Error = anyhow::Error;
+    type Error = crate::error::Error;
 
     fn try_from(path: PathBuf) -> std::result::Result<Self, Self::Error> {
         let canonical_path = fs::canonicalize(&path)?;

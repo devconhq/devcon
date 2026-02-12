@@ -52,7 +52,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-use anyhow::{Context, Result};
+use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 
 /// Property metadata for configuration fields.
@@ -143,7 +143,7 @@ macro_rules! impl_property_registry {
                 let metadata = Self::PROPERTIES
                     .iter()
                     .find(|m| m.path == field_name)
-                    .ok_or_else(|| anyhow::anyhow!("Unknown property: {}", field_name))?;
+                    .ok_or_else(|| Error::unknown_property(field_name))?;
 
                 // Validate the value
                 let validated = validate_property_value(&metadata.validator, &value)?;
@@ -154,7 +154,7 @@ macro_rules! impl_property_registry {
                             self.$field = Some(validated);
                         }
                     )*
-                    _ => anyhow::bail!("Unknown property: {}", field_name),
+                    _ => return Err(Error::unknown_property(field_name)),
                 }
 
                 Ok(())
@@ -167,7 +167,7 @@ macro_rules! impl_property_registry {
                             self.$field = None;
                         }
                     )*
-                    _ => anyhow::bail!("Unknown property: {}", field_name),
+                    _ => return Err(Error::unknown_property(field_name)),
                 }
 
                 Ok(())
@@ -214,7 +214,7 @@ macro_rules! impl_property_registry {
                 let metadata = Self::PROPERTIES
                     .iter()
                     .find(|m| m.path == field_name)
-                    .ok_or_else(|| anyhow::anyhow!("Unknown property: {}", field_name))?;
+                    .ok_or_else(|| Error::unknown_property(field_name))?;
 
                 // Validate the value
                 let validated = validate_property_value(&metadata.validator, &value)?;
@@ -225,7 +225,7 @@ macro_rules! impl_property_registry {
                             self.$field = Some(validated == "true");
                         }
                     )*
-                    _ => anyhow::bail!("Unknown property: {}", field_name),
+                    _ => return Err(Error::unknown_property(field_name)),
                 }
 
                 Ok(())
@@ -238,7 +238,7 @@ macro_rules! impl_property_registry {
                             self.$field = None;
                         }
                     )*
-                    _ => anyhow::bail!("Unknown property: {}", field_name),
+                    _ => return Err(Error::unknown_property(field_name)),
                 }
 
                 Ok(())
@@ -305,7 +305,7 @@ macro_rules! impl_property_registry {
                 let metadata = Self::PROPERTIES
                     .iter()
                     .find(|m| m.path == field_name)
-                    .ok_or_else(|| anyhow::anyhow!("Unknown property: {}", field_name))?;
+                    .ok_or_else(|| Error::unknown_property(field_name))?;
 
                 // Validate the value
                 let validated = validate_property_value(&metadata.validator, &value)?;
@@ -321,7 +321,7 @@ macro_rules! impl_property_registry {
                             self.$bool_field = Some(validated == "true");
                         }
                     )*
-                    _ => anyhow::bail!("Unknown property: {}", field_name),
+                    _ => return Err(Error::unknown_property(field_name)),
                 }
 
                 Ok(())
@@ -339,7 +339,7 @@ macro_rules! impl_property_registry {
                             self.$bool_field = None;
                         }
                     )*
-                    _ => anyhow::bail!("Unknown property: {}", field_name),
+                    _ => return Err(Error::unknown_property(field_name)),
                 }
 
                 Ok(())
@@ -355,14 +355,17 @@ fn validate_property_value(validator: &PropertyValidator, value: &str) -> Result
 
         PropertyValidator::Url => {
             if !value.starts_with("http://") && !value.starts_with("https://") {
-                anyhow::bail!("URL must start with http:// or https://");
+                return Err(Error::new("URL must start with http:// or https://"));
             }
             Ok(value.to_string())
         }
 
         PropertyValidator::Enum(allowed) => {
             if !allowed.contains(&value) {
-                anyhow::bail!("Value must be one of: {}", allowed.join(", "));
+                return Err(Error::invalid_value(
+                    "enum".to_string(),
+                    format!("Value must be one of: {}", allowed.join(", ")),
+                ));
             }
             Ok(value.to_string())
         }
@@ -371,14 +374,16 @@ fn validate_property_value(validator: &PropertyValidator, value: &str) -> Result
 
         PropertyValidator::Cpu => {
             if value.parse::<f64>().is_err() {
-                anyhow::bail!("CPU value must be a number (e.g., '2' or '0.5')");
+                return Err(Error::new(
+                    "CPU value must be a number (e.g., '2' or '0.5')",
+                ));
             }
             Ok(value.to_string())
         }
 
         PropertyValidator::NonEmpty => {
             if value.is_empty() {
-                anyhow::bail!("Value cannot be empty");
+                return Err(Error::new("Value cannot be empty"));
             }
             Ok(value.to_string())
         }
@@ -392,16 +397,16 @@ fn normalize_memory_value(value: &str) -> Result<String> {
     if value_lower.ends_with('k') || value_lower.ends_with('m') || value_lower.ends_with('g') {
         let num_part = &value_lower[..value_lower.len() - 1];
         if num_part.parse::<u64>().is_err() {
-            anyhow::bail!(
-                "Memory value must be a number followed by k, m, or g (e.g., '512m', '4g')"
-            );
+            return Err(Error::new(
+                "Memory value must be a number followed by k, m, or g (e.g., '512m', '4g')",
+            ));
         }
         Ok(value.to_string())
     } else {
         if value.parse::<u64>().is_err() {
-            anyhow::bail!(
-                "Memory value must be a number or a number with unit (e.g., '512' or '512m')"
-            );
+            return Err(Error::new(
+                "Memory value must be a number or a number with unit (e.g., '512' or '512m')",
+            ));
         }
         Ok(format!("{}m", value))
     }
@@ -651,7 +656,7 @@ impl Config {
     /// if let Some(dotfiles) = &config.dotfiles_repository {
     ///     println!("Dotfiles repo: {}", dotfiles);
     /// }
-    /// # Ok::<(), anyhow::Error>(())
+    /// # Ok::<(), devcon::error::Error>(())
     /// ```
     pub fn load() -> Result<Self> {
         let config_path = Self::get_config_path()?;
@@ -660,8 +665,13 @@ impl Config {
             return Ok(Self::default());
         }
 
-        let content = fs::read_to_string(&config_path)
-            .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
+        let content = fs::read_to_string(&config_path).map_err(|e| {
+            Error::config(format!(
+                "Failed to read config file: {}: {}",
+                config_path.display(),
+                e
+            ))
+        })?;
 
         // Check for old config format fields
         if content.contains("agentBinaryUrl")
@@ -669,15 +679,20 @@ impl Config {
             || content.contains("agentGitBranch")
             || content.contains("agentDisable")
         {
-            anyhow::bail!(
+            return Err(Error::config(format!(
                 "Old config format detected in {}. Please manually migrate agent_* fields to the new agents.* hierarchy. \
                 See 'devcon config list' for available properties.",
                 config_path.display()
-            );
+            )));
         }
 
-        let config: Config = yaml_serde::from_str(&content)
-            .with_context(|| format!("Failed to parse config file: {}", config_path.display()))?;
+        let config: Config = yaml_serde::from_str(&content).map_err(|e| {
+            Error::config(format!(
+                "Failed to parse config file: {}: {}",
+                config_path.display(),
+                e
+            ))
+        })?;
 
         Ok(config)
     }
@@ -701,22 +716,32 @@ impl Config {
     /// let mut config = Config::default();
     /// config.dotfiles_repository = Some("https://github.com/user/dotfiles".to_string());
     /// config.save()?;
-    /// # Ok::<(), anyhow::Error>(())
+    /// # Ok::<(), devcon::error::Error>(())
     /// ```
     pub fn save(&self) -> Result<()> {
         let config_path = Self::get_config_path()?;
 
         if let Some(parent) = config_path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("Failed to create config directory: {}", parent.display())
+            fs::create_dir_all(parent).map_err(|e| {
+                Error::config(format!(
+                    "Failed to create config directory: {}: {}",
+                    parent.display(),
+                    e
+                ))
             })?;
         }
 
-        let yaml = yaml_serde::to_string(self)
-            .with_context(|| "Failed to serialize configuration to YAML")?;
+        let yaml = yaml_serde::to_string(self).map_err(|e| {
+            Error::config(format!("Failed to serialize configuration to YAML: {}", e))
+        })?;
 
-        fs::write(&config_path, yaml)
-            .with_context(|| format!("Failed to write config file: {}", config_path.display()))?;
+        fs::write(&config_path, yaml).map_err(|e| {
+            Error::config(format!(
+                "Failed to write config file: {}: {}",
+                config_path.display(),
+                e
+            ))
+        })?;
 
         Ok(())
     }
@@ -731,7 +756,8 @@ impl Config {
     /// Returns an error if the config directory cannot be determined
     /// (e.g., if HOME is not set).
     pub fn get_config_path() -> Result<PathBuf> {
-        let config_dir = dirs::config_dir().context("Failed to determine config directory")?;
+        let config_dir = dirs::config_dir()
+            .ok_or_else(|| Error::config("Failed to determine config directory"))?;
 
         Ok(config_dir.join("devcon").join("config.yaml"))
     }
@@ -789,7 +815,9 @@ impl Config {
             return Ok("apple".to_string());
         }
 
-        anyhow::bail!("No container runtime found. Please install Docker or Apple's container CLI.")
+        Err(Error::runtime(
+            "No container runtime found. Please install Docker or Apple's container CLI.",
+        ))
     }
 
     /// Gets the runtime to use, resolving "auto" to a specific runtime.
@@ -911,7 +939,7 @@ impl Config {
             return apple.set_property(rest, value);
         }
 
-        anyhow::bail!("Unknown config property: {}", property)
+        Err(Error::unknown_property(property))
     }
 
     /// Unsets (removes) the value of a configuration property by path.
@@ -961,7 +989,7 @@ impl Config {
             return Ok(());
         }
 
-        anyhow::bail!("Unknown config property: {}", property)
+        Err(Error::unknown_property(property))
     }
 
     /// Lists all available configuration properties.

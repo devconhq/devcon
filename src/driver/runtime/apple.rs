@@ -30,7 +30,8 @@ use std::{
     time::Duration,
 };
 
-use anyhow::bail;
+use crate::error::Error;
+use crate::error::Result;
 
 use crate::config::AppleRuntimeConfig;
 use crate::driver::runtime::RuntimeParameters;
@@ -78,12 +79,7 @@ impl AppleRuntime {
 }
 
 impl ContainerRuntime for AppleRuntime {
-    fn build(
-        &self,
-        dockerfile_path: &Path,
-        context_path: &Path,
-        image_tag: &str,
-    ) -> anyhow::Result<()> {
+    fn build(&self, dockerfile_path: &Path, context_path: &Path, image_tag: &str) -> Result<()> {
         let mut cmd = Command::new("container");
         cmd.arg("build");
 
@@ -109,7 +105,7 @@ impl ContainerRuntime for AppleRuntime {
         let result = stream_build_output(child)?;
 
         if !result.success() {
-            bail!("Container build command failed")
+            return Err(Error::runtime("Container build command failed"));
         }
 
         Ok(())
@@ -122,7 +118,7 @@ impl ContainerRuntime for AppleRuntime {
         label: &str,
         env_vars: &[String],
         runtime_parameters: RuntimeParameters,
-    ) -> anyhow::Result<Box<dyn super::ContainerHandle>> {
+    ) -> Result<Box<dyn super::ContainerHandle>> {
         let mut cmd = Command::new("container");
         cmd.arg("run")
             .arg("--rm")
@@ -196,7 +192,7 @@ impl ContainerRuntime for AppleRuntime {
         let result = cmd.output()?;
 
         if result.status.code() != Some(0) {
-            bail!("Container start command failed")
+            return Err(Error::runtime("Container start command failed"));
         }
         std::thread::sleep(Duration::from_secs(10));
 
@@ -211,7 +207,7 @@ impl ContainerRuntime for AppleRuntime {
         command: Vec<&str>,
         env_vars: &[String],
         attach_stdin: bool,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         let mut cmd = Command::new("container");
         cmd.arg("exec").arg("-t");
 
@@ -229,13 +225,13 @@ impl ContainerRuntime for AppleRuntime {
         let result = cmd.status()?;
 
         if result.code() != Some(0) {
-            bail!("Container exec command failed")
+            return Err(Error::runtime("Container exec command failed"));
         }
 
         Ok(())
     }
 
-    fn list(&self) -> anyhow::Result<Vec<(String, Box<dyn super::ContainerHandle>)>> {
+    fn list(&self) -> Result<Vec<(String, Box<dyn super::ContainerHandle>)>> {
         let output = Command::new("container")
             .arg("list")
             .arg("--format")
@@ -279,7 +275,7 @@ impl ContainerRuntime for AppleRuntime {
         Ok(result)
     }
 
-    fn images(&self) -> anyhow::Result<Vec<String>> {
+    fn images(&self) -> Result<Vec<String>> {
         let output = Command::new("container")
             .arg("image")
             .arg("list")

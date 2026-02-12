@@ -43,14 +43,14 @@
 //!
 //! let config = Devcontainer::try_from(PathBuf::from("/path/to/project"))?;
 //! println!("Container name: {}", config.name.as_deref().unwrap_or("default"));
-//! # Ok::<(), anyhow::Error>(())
+//! # Ok::<(), devcon::error::Error>(())
 //! ```
 
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
-use anyhow::bail;
+use crate::error::{Error, Result};
 use serde::Deserialize;
 use serde::de;
 use serde_json::Value;
@@ -427,7 +427,7 @@ pub struct Devcontainer {
 
 #[allow(deprecated)]
 impl<'de> Deserialize<'de> for Devcontainer {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
@@ -502,7 +502,7 @@ impl<'de> Deserialize<'de> for Devcontainer {
 
         let helper = DevcontainerHelper::deserialize(deserializer)?;
 
-        let features: Result<Vec<FeatureRef>, D::Error> = helper
+        let features: std::result::Result<Vec<FeatureRef>, D::Error> = helper
             .features
             .into_iter()
             .map(|(url, options)| parse_feature(&url, options))
@@ -572,7 +572,7 @@ impl<'de> Deserialize<'de> for Devcontainer {
 
 fn deserialize_features_map<'de, D>(
     deserializer: D,
-) -> Result<Vec<(String, serde_json::Value)>, D::Error>
+) -> std::result::Result<Vec<(String, serde_json::Value)>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -585,7 +585,7 @@ where
             formatter.write_str("a map of features")
         }
 
-        fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+        fn visit_map<M>(self, mut map: M) -> std::result::Result<Self::Value, M::Error>
         where
             M: serde::de::MapAccess<'de>,
         {
@@ -616,7 +616,7 @@ impl Devcontainer {
     pub fn merge_additional_features(
         &self,
         additional_features: &std::collections::HashMap<String, serde_json::Value>,
-    ) -> anyhow::Result<Vec<FeatureRef>> {
+    ) -> Result<Vec<FeatureRef>> {
         // Get set of existing feature URLs
         let existing_urls: Vec<String> = self
             .features
@@ -635,7 +635,9 @@ impl Devcontainer {
         for (url, options) in additional_features {
             if !existing_urls.contains(url) {
                 let feature = parse_feature::<serde::de::value::Error>(url, options.clone())
-                    .map_err(|e| anyhow::anyhow!("Failed to parse additional feature: {}", e))?;
+                    .map_err(|e| {
+                        Error::feature(format!("Failed to parse additional feature: {}", e))
+                    })?;
                 return_features.push(feature);
             }
         }
@@ -645,7 +647,7 @@ impl Devcontainer {
 }
 
 impl TryFrom<PathBuf> for Devcontainer {
-    type Error = anyhow::Error;
+    type Error = Error;
 
     fn try_from(path: PathBuf) -> std::result::Result<Self, Self::Error> {
         // Check locations in order of precedence per devcontainer spec:
@@ -684,24 +686,26 @@ impl TryFrom<PathBuf> for Devcontainer {
         }
 
         let final_path = final_path.ok_or_else(|| {
-            anyhow::anyhow!(
+            Error::devcontainer(format!(
                 "Devcontainer definition not found in any standard location under {}",
                 path.to_string_lossy()
-            )
+            ))
         })?;
 
         let file_result = fs::read_to_string(&final_path);
 
         if file_result.is_err() {
-            bail!(
+            return Err(Error::devcontainer(format!(
                 "Devcontainer definition cannot be read {}",
                 &final_path.to_string_lossy()
-            )
+            )));
         }
 
         let result = Self::try_from(file_result.unwrap());
         if result.is_err() {
-            bail!("Devcontainer content could not be parsed")
+            return Err(Error::devcontainer(
+                "Devcontainer content could not be parsed",
+            ));
         }
 
         // Fix name of container if not present
@@ -709,7 +713,7 @@ impl TryFrom<PathBuf> for Devcontainer {
         if result.name.is_none() {
             let name = fs::canonicalize(&path)?
                 .file_name()
-                .ok_or_else(|| anyhow::anyhow!("Invalid path for devcontainer"))?
+                .ok_or_else(|| Error::invalid_path(path.clone()))?
                 .to_string_lossy()
                 .to_string();
             result.name = Some(name);
@@ -774,7 +778,7 @@ impl FeatureRef {
 pub fn parse_feature<E: de::Error>(
     url: &str,
     user_options: serde_json::Value,
-) -> Result<FeatureRef, E> {
+) -> std::result::Result<FeatureRef, E> {
     if !url.starts_with("ghcr.io") && url.contains(":") {
         return Err(de::Error::custom("Only ghcr.io features are supported"));
     }
@@ -789,7 +793,7 @@ pub fn parse_feature<E: de::Error>(
 fn parse_local_feature<E: de::Error>(
     url: &str,
     user_options: serde_json::Value,
-) -> Result<FeatureRef, E> {
+) -> std::result::Result<FeatureRef, E> {
     let path = PathBuf::from(url);
     Ok(FeatureRef {
         source: FeatureSource::Local { path },
@@ -800,7 +804,7 @@ fn parse_local_feature<E: de::Error>(
 fn parse_registry_feature<E: de::Error>(
     url: &str,
     user_options: serde_json::Value,
-) -> Result<FeatureRef, E> {
+) -> std::result::Result<FeatureRef, E> {
     let owner = url
         .split("/")
         .nth(1)
@@ -1156,7 +1160,7 @@ mod tests {
         }
         "#;
 
-        let result: Result<Devcontainer, _> = serde_json::from_str(feature_json);
+        let result: std::result::Result<Devcontainer, _> = serde_json::from_str(feature_json);
         assert!(result.is_err());
     }
 
@@ -1172,7 +1176,7 @@ mod tests {
         }
         "#;
 
-        let result: Result<Devcontainer, _> = serde_json::from_str(feature_json);
+        let result: std::result::Result<Devcontainer, _> = serde_json::from_str(feature_json);
         assert!(result.is_err());
     }
 

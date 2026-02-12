@@ -25,7 +25,7 @@
 //! This module implements the TCP control server that accepts connections from
 //! container agents and manages port forwarding requests.
 
-use anyhow::{Context, Result, bail};
+use crate::error::{Error, Result};
 use devcon_proto::AgentMessage;
 use devcon_proto::agent_message::Message as ProtoMessage;
 use prost::Message;
@@ -67,12 +67,15 @@ impl PortForwardManager {
         let mut forwards = self.forwards.lock().unwrap();
 
         if forwards.contains_key(&local_port) {
-            bail!("Port {} is already being forwarded", local_port);
+            return Err(Error::new(format!(
+                "Port {} is already being forwarded",
+                local_port
+            )));
         }
 
         // Start the local listener for this port
         let listener = TcpListener::bind(format!("0.0.0.0:{}", local_port))
-            .context(format!("Failed to bind to port {}", local_port))?;
+            .map_err(|e| Error::new(format!("Failed to bind to port {}: {}", local_port, e)))?;
 
         info!(
             "Listening on 0.0.0.0:{} for connections to forward to container port {}",
@@ -80,8 +83,12 @@ impl PortForwardManager {
         );
 
         // Create dedicated data listener on random port for this forward
-        let data_listener = TcpListener::bind("0.0.0.0:0")
-            .context("Failed to bind data listener on random port")?;
+        let data_listener = TcpListener::bind("0.0.0.0:0").map_err(|e| {
+            Error::new(format!(
+                "{}: {}",
+                "Failed to bind data listener on random port", e
+            ))
+        })?;
         let data_port = data_listener.local_addr()?.port();
 
         info!(
@@ -207,7 +214,10 @@ impl PortForwardManager {
             info!("Stopped forwarding port {}", local_port);
             Ok(())
         } else {
-            bail!("Port {} is not being forwarded", local_port);
+            Err(Error::new(format!(
+                "Port {} is not being forwarded",
+                local_port
+            )))
         }
     }
 }
@@ -277,7 +287,7 @@ fn handle_forwarded_connection(
             // Remove from pending to clean up
             let mut pending = pending_tunnels.lock().unwrap();
             pending.remove(&tunnel_id);
-            bail!("Tunnel establishment timeout");
+            return Err(Error::new("Tunnel establishment timeout".to_string()));
         }
     }
 }
@@ -298,7 +308,8 @@ fn send_message(stream: &mut TcpStream, message: &AgentMessage) -> Result<()> {
 /// Open a URL in the default browser
 fn open_url(url: &str) -> Result<()> {
     info!("Opening URL in browser: {}", url);
-    open::that(url).context("Failed to open URL in browser")?;
+    open::that(url)
+        .map_err(|e| Error::new(format!("{}: {}", "Failed to open URL in browser", e)))?;
     info!("Successfully opened URL");
     Ok(())
 }
@@ -311,7 +322,9 @@ fn read_message(stream: &mut TcpStream) -> Result<AgentMessage> {
     match stream.read_exact(&mut len_buf) {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-            bail!("Connection closed while reading message length");
+            return Err(Error::new(
+                "Connection closed while reading message length".to_string(),
+            ));
         }
         Err(e) => return Err(e.into()),
     }
@@ -320,10 +333,13 @@ fn read_message(stream: &mut TcpStream) -> Result<AgentMessage> {
 
     // Validate message length to prevent excessive memory allocation
     if len == 0 {
-        bail!("Received zero-length message");
+        return Err(Error::new("Received zero-length message".to_string()));
     }
     if len > 10 * 1024 * 1024 {
-        bail!("Message too large: {} bytes (max 10MB)", len);
+        return Err(Error::new(format!(
+            "Message too large: {} bytes (max 10MB)",
+            len
+        )));
     }
 
     let mut buf = vec![0u8; len];
@@ -332,15 +348,16 @@ fn read_message(stream: &mut TcpStream) -> Result<AgentMessage> {
     match stream.read_exact(&mut buf) {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-            bail!(
+            return Err(Error::new(format!(
                 "Connection closed while reading message body (expected {} bytes)",
                 len
-            );
+            )));
         }
         Err(e) => return Err(e.into()),
     }
 
-    let message = AgentMessage::decode(&buf[..]).context("Failed to decode protobuf message")?;
+    let message = AgentMessage::decode(&buf[..])
+        .map_err(|e| Error::new(format!("{}: {}", "Failed to decode protobuf message", e)))?;
     Ok(message)
 }
 
@@ -457,7 +474,7 @@ fn handle_agent_connection(mut stream: TcpStream, manager: PortForwardManager) -
 /// Start the control server on the specified port
 pub fn start_control_server(port: u16) -> Result<()> {
     let listener = TcpListener::bind(format!("0.0.0.0:{}", port))
-        .context(format!("Failed to bind to port {}", port))?;
+        .map_err(|e| Error::new(format!("Failed to bind to port {}: {}", port, e)))?;
 
     info!("Control server listening on 0.0.0.0:{}", port);
 
