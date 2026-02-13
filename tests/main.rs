@@ -1,75 +1,390 @@
-#[cfg(test)]
-#[cfg(target_os = "windows")]
-mod tests {
-    use assert_cmd::cargo::cargo_bin_cmd;
+mod test_utils;
 
-    #[test]
-    fn test_build() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let container_content = r#"
-        {
-            "name": "devcontainer",
-            "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
-            "features": {
-               "ghcr.io/devcontainers/features/node": {}
-            }
-        }
-        "#;
+use assert_cmd::cargo::cargo_bin_cmd;
+use test_utils::*;
 
-        let devcontainer_path = temp_dir.path().join(".devcontainer");
-        std::fs::create_dir_all(&devcontainer_path).unwrap();
-        std::fs::write(
-            devcontainer_path.join("devcontainer.json"),
-            container_content,
-        )
-        .unwrap();
-
-        let mut cmd = cargo_bin_cmd!("devcon");
-        let result = cmd
-            .arg("build")
-            .arg(temp_dir.path().to_str().unwrap())
-            .output();
-        assert!(result.is_ok());
-        let output = result.unwrap();
-        assert!(
-            output.status.success(),
-            "Build command failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+#[test]
+fn test_build_simple() {
+    let runtime = get_runtime();
+    if !is_runtime_available(runtime) {
+        println!("Skipping test: {:?} runtime not available", runtime);
+        return;
     }
 
-    #[test]
-    fn test_build_name() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let container_content = r#"
-        {
-            "name": "Test Devcontainer",
-            "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
-            "features": {
-               "ghcr.io/devcontainers/features/node": {}
-            }
-        }
-        "#;
+    let test_config = create_test_config();
+    let temp_dir = create_test_devcontainer(
+        "test-simple",
+        "mcr.microsoft.com/devcontainers/base:ubuntu",
+        None,
+    );
 
-        let devcontainer_path = temp_dir.path().join(".devcontainer");
-        std::fs::create_dir_all(&devcontainer_path).unwrap();
-        std::fs::write(
-            devcontainer_path.join("devcontainer.json"),
-            container_content,
-        )
-        .unwrap();
+    let mut cmd = cargo_bin_cmd!("devcon");
+    let result = cmd
+        .arg("--config")
+        .arg(&test_config)
+        .arg("build")
+        .arg(temp_dir.path().to_str().unwrap())
+        .output();
 
-        let mut cmd = cargo_bin_cmd!("devcon");
-        let result = cmd
-            .arg("build")
-            .arg(temp_dir.path().to_str().unwrap())
-            .output();
-        assert!(result.is_ok());
-        let output = result.unwrap();
-        assert!(
-            output.status.success(),
-            "Build command failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+    assert!(result.is_ok(), "Failed to execute build command");
+    let output = result.unwrap();
+    assert!(
+        output.status.success(),
+        "Build command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_build_with_features() {
+    let runtime = get_runtime();
+    if !is_runtime_available(runtime) {
+        println!("Skipping test: {:?} runtime not available", runtime);
+        return;
     }
+
+    let test_config = create_test_config();
+    let features = r#"{"ghcr.io/devcontainers/features/node": {"version": "18"}}"#;
+    let temp_dir = create_test_devcontainer(
+        "test-features",
+        "mcr.microsoft.com/devcontainers/base:ubuntu",
+        Some(features),
+    );
+
+    let mut cmd = cargo_bin_cmd!("devcon");
+    let result = cmd
+        .arg("--config")
+        .arg(&test_config)
+        .arg("build")
+        .arg(temp_dir.path().to_str().unwrap())
+        .output();
+
+    assert!(result.is_ok(), "Failed to execute build command");
+    let output = result.unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "Build command failed.\nStdout: {}\nStderr: {}",
+        stdout,
+        stderr
+    );
+
+    // Verify that the feature was processed
+    let combined = format!("{}\n{}", stdout, stderr);
+    assert!(
+        combined.contains("node") || combined.contains("Node"),
+        "Build output does not mention node feature"
+    );
+}
+
+#[test]
+fn test_build_with_name() {
+    let runtime = get_runtime();
+    if !is_runtime_available(runtime) {
+        println!("Skipping test: {:?} runtime not available", runtime);
+        return;
+    }
+
+    let test_config = create_test_config();
+    let temp_dir = create_test_devcontainer(
+        "Test Devcontainer Name",
+        "mcr.microsoft.com/devcontainers/base:ubuntu",
+        None,
+    );
+
+    let mut cmd = cargo_bin_cmd!("devcon");
+    let result = cmd
+        .arg("--config")
+        .arg(&test_config)
+        .arg("build")
+        .arg(temp_dir.path().to_str().unwrap())
+        .output();
+
+    assert!(result.is_ok(), "Failed to execute build command");
+    let output = result.unwrap();
+    assert!(
+        output.status.success(),
+        "Build command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_build_and_verify_image() {
+    let runtime = get_runtime();
+    if !is_runtime_available(runtime) {
+        println!("Skipping test: {:?} runtime not available", runtime);
+        return;
+    }
+    let test_config = create_test_config();
+
+    let temp_dir = create_test_devcontainer(
+        "test-verify",
+        "mcr.microsoft.com/devcontainers/base:ubuntu",
+        None,
+    );
+
+    let mut cmd = cargo_bin_cmd!("devcon");
+    let result = cmd
+        .arg("--config")
+        .arg(&test_config)
+        .arg("build")
+        .arg(temp_dir.path().to_str().unwrap())
+        .output();
+
+    assert!(result.is_ok(), "Failed to execute build command");
+    let output = result.unwrap();
+    assert!(
+        output.status.success(),
+        "Build command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify the image was actually created
+    // The image name should contain the devcontainer name or workspace folder
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{}\n{}", stdout, stderr);
+
+    // Check that build output mentions successful completion
+    assert!(
+        combined.contains("Successfully")
+            || combined.contains("Built")
+            || combined.contains("FINISHED"),
+        "Build output does not indicate success"
+    );
+}
+
+#[test]
+fn test_build_with_dockerfile() {
+    let runtime = get_runtime();
+    if !is_runtime_available(runtime) {
+        println!("Skipping test: {:?} runtime not available", runtime);
+        return;
+    }
+    let test_config = create_test_config();
+
+    let dockerfile_content = r#"FROM mcr.microsoft.com/devcontainers/base:ubuntu
+RUN apt-get update && apt-get install -y curl
+RUN echo "Custom Dockerfile build" > /custom-marker.txt
+"#;
+
+    let temp_dir = create_test_devcontainer_with_dockerfile("test-dockerfile", dockerfile_content);
+
+    let mut cmd = cargo_bin_cmd!("devcon");
+    let result = cmd
+        .arg("--config")
+        .arg(&test_config)
+        .arg("build")
+        .arg(temp_dir.path().to_str().unwrap())
+        .output();
+
+    assert!(result.is_ok(), "Failed to execute build command");
+    let output = result.unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "Build command failed.\nStdout: {}\nStderr: {}",
+        stdout,
+        stderr
+    );
+
+    // Verify Dockerfile was used
+    let combined = format!("{}\n{}", stdout, stderr);
+    assert!(
+        combined.contains("Dockerfile") || combined.contains("FROM"),
+        "Build output does not indicate Dockerfile usage"
+    );
+}
+
+#[test]
+fn test_build_with_lifecycle_hooks() {
+    let runtime = get_runtime();
+    if !is_runtime_available(runtime) {
+        println!("Skipping test: {:?} runtime not available", runtime);
+        return;
+    }
+    let test_config = create_test_config();
+
+    let temp_dir = create_test_devcontainer_with_hooks(
+        "test-hooks",
+        "mcr.microsoft.com/devcontainers/base:ubuntu",
+        Some("echo 'onCreate executed'"),
+        Some("echo 'postCreate executed'"),
+    );
+
+    let mut cmd = cargo_bin_cmd!("devcon");
+    let result = cmd
+        .arg("--config")
+        .arg(&test_config)
+        .arg("build")
+        .arg(temp_dir.path().to_str().unwrap())
+        .output();
+
+    assert!(result.is_ok(), "Failed to execute build command");
+    let output = result.unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "Build command failed.\nStdout: {}\nStderr: {}",
+        stdout,
+        stderr
+    );
+}
+
+#[test]
+fn test_build_multiple_features() {
+    let runtime = get_runtime();
+    if !is_runtime_available(runtime) {
+        println!("Skipping test: {:?} runtime not available", runtime);
+        return;
+    }
+    let test_config = create_test_config();
+
+    let features = r#"{
+        "ghcr.io/devcontainers/features/git": {},
+        "ghcr.io/devcontainers/features/github-cli": {}
+    }"#;
+    let temp_dir = create_test_devcontainer(
+        "test-multi-features",
+        "mcr.microsoft.com/devcontainers/base:ubuntu",
+        Some(features),
+    );
+
+    let mut cmd = cargo_bin_cmd!("devcon");
+    let result = cmd
+        .arg("--config")
+        .arg(&test_config)
+        .arg("build")
+        .arg(temp_dir.path().to_str().unwrap())
+        .output();
+
+    assert!(result.is_ok(), "Failed to execute build command");
+    let output = result.unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "Build command failed.\nStdout: {}\nStderr: {}",
+        stdout,
+        stderr
+    );
+
+    // Verify both features were processed
+    let combined = format!("{}\n{}", stdout, stderr);
+    assert!(
+        combined.contains("git") || combined.contains("Git"),
+        "Build output does not mention git feature"
+    );
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn test_build_apple_runtime() {
+    let runtime = Runtime::Apple;
+    if !is_runtime_available(runtime) {
+        println!("Skipping test: Apple runtime not available");
+        return;
+    }
+
+    unsafe {
+        std::env::set_var("CONTAINER_RUNTIME", "apple");
+    }
+
+    let test_config = create_test_config();
+    let temp_dir = create_test_devcontainer(
+        "test-apple",
+        "mcr.microsoft.com/devcontainers/base:ubuntu",
+        None,
+    );
+
+    // Apple container runtime has a bug with default temp directories
+    // Use home directory as build path
+    let home_dir = std::env::var("HOME").expect("HOME env var not set");
+
+    let mut cmd = cargo_bin_cmd!("devcon");
+    let result = cmd
+        .arg("--config")
+        .arg(&test_config)
+        .arg("build")
+        .arg("--build-path")
+        .arg(&home_dir)
+        .arg(temp_dir.path().to_str().unwrap())
+        .output();
+
+    unsafe {
+        std::env::remove_var("CONTAINER_RUNTIME");
+    }
+
+    assert!(result.is_ok(), "Failed to execute build command");
+    let output = result.unwrap();
+    assert!(
+        output.status.success(),
+        "Build command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn test_build_apple_runtime_with_features() {
+    let runtime = Runtime::Apple;
+    if !is_runtime_available(runtime) {
+        println!("Skipping test: Apple runtime not available");
+        return;
+    }
+    let test_config = create_test_config();
+
+    unsafe {
+        std::env::set_var("CONTAINER_RUNTIME", "apple");
+    }
+
+    let features = r#"{"ghcr.io/devcontainers/features/git": {}}"#;
+    let temp_dir = create_test_devcontainer(
+        "test-apple-features",
+        "mcr.microsoft.com/devcontainers/base:ubuntu",
+        Some(features),
+    );
+
+    // Apple container runtime has a bug with default temp directories
+    // Use home directory as build path
+    let home_dir = std::env::var("HOME").expect("HOME env var not set");
+
+    let mut cmd = cargo_bin_cmd!("devcon");
+    let result = cmd
+        .arg("--config")
+        .arg(&test_config)
+        .arg("build")
+        .arg("--build-path")
+        .arg(&home_dir)
+        .arg(temp_dir.path().to_str().unwrap())
+        .output();
+
+    unsafe {
+        std::env::remove_var("CONTAINER_RUNTIME");
+    }
+
+    assert!(result.is_ok(), "Failed to execute build command");
+    let output = result.unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "Build command failed.\nStdout: {}\nStderr: {}",
+        stdout,
+        stderr
+    );
 }

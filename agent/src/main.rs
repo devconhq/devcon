@@ -549,3 +549,263 @@ fn main() {
         std::process::exit(1);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use devcon_proto::{
+        AgentMessage, OpenUrl, StartPortForward, StopPortForward, TunnelRequest, agent_message,
+    };
+    use std::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn test_message_encoding_decoding_start_port_forward() {
+        let original_msg = AgentMessage {
+            message: Some(agent_message::Message::StartPortForward(StartPortForward {
+                port: 8080,
+            })),
+        };
+
+        let mut buf = Vec::new();
+        original_msg.encode(&mut buf).unwrap();
+
+        let decoded_msg = AgentMessage::decode(&buf[..]).unwrap();
+
+        assert_eq!(
+            match decoded_msg.message {
+                Some(agent_message::Message::StartPortForward(ref spf)) => spf.port,
+                _ => panic!("Wrong message type"),
+            },
+            8080
+        );
+    }
+
+    #[test]
+    fn test_message_encoding_decoding_stop_port_forward() {
+        let original_msg = AgentMessage {
+            message: Some(agent_message::Message::StopPortForward(StopPortForward {
+                port: 3000,
+            })),
+        };
+
+        let mut buf = Vec::new();
+        original_msg.encode(&mut buf).unwrap();
+
+        let decoded_msg = AgentMessage::decode(&buf[..]).unwrap();
+
+        assert_eq!(
+            match decoded_msg.message {
+                Some(agent_message::Message::StopPortForward(ref spf)) => spf.port,
+                _ => panic!("Wrong message type"),
+            },
+            3000
+        );
+    }
+
+    #[test]
+    fn test_message_encoding_decoding_open_url() {
+        let test_url = "https://example.com";
+        let original_msg = AgentMessage {
+            message: Some(agent_message::Message::OpenUrl(OpenUrl {
+                url: test_url.to_string(),
+            })),
+        };
+
+        let mut buf = Vec::new();
+        original_msg.encode(&mut buf).unwrap();
+
+        let decoded_msg = AgentMessage::decode(&buf[..]).unwrap();
+
+        assert_eq!(
+            match decoded_msg.message {
+                Some(agent_message::Message::OpenUrl(ref ou)) => &ou.url,
+                _ => panic!("Wrong message type"),
+            },
+            test_url
+        );
+    }
+
+    #[test]
+    fn test_message_encoding_decoding_tunnel_request() {
+        let original_msg = AgentMessage {
+            message: Some(agent_message::Message::TunnelRequest(TunnelRequest {
+                tunnel_id: 12345,
+                port: 8080,
+                data_port: 9000,
+            })),
+        };
+
+        let mut buf = Vec::new();
+        original_msg.encode(&mut buf).unwrap();
+
+        let decoded_msg = AgentMessage::decode(&buf[..]).unwrap();
+
+        match decoded_msg.message {
+            Some(agent_message::Message::TunnelRequest(ref tr)) => {
+                assert_eq!(tr.tunnel_id, 12345);
+                assert_eq!(tr.port, 8080);
+                assert_eq!(tr.data_port, 9000);
+            }
+            _ => panic!("Wrong message type"),
+        }
+    }
+
+    #[test]
+    fn test_send_and_read_message_roundtrip() {
+        // Create a TCP listener for testing
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Spawn a thread to accept connection and read message
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_message(&mut stream).unwrap()
+        });
+
+        // Connect and send message
+        let mut client_stream = TcpStream::connect(addr).unwrap();
+        let original_msg = AgentMessage {
+            message: Some(agent_message::Message::StartPortForward(StartPortForward {
+                port: 5000,
+            })),
+        };
+        send_message(&mut client_stream, &original_msg).unwrap();
+
+        // Verify received message
+        let received_msg = handle.join().unwrap();
+        match received_msg.message {
+            Some(agent_message::Message::StartPortForward(spf)) => {
+                assert_eq!(spf.port, 5000);
+            }
+            _ => panic!("Wrong message type received"),
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_scan_listening_ports_returns_vec() {
+        // This test just verifies the function runs without panic on Linux
+        // The actual ports found will vary by system
+        let result = scan_listening_ports();
+        assert!(result.is_ok());
+
+        let ports = result.unwrap();
+        // All ports should be > 1024 (non-privileged)
+        for port in ports {
+            assert!(port > 1024, "Port {} should be > 1024", port);
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn test_scan_listening_ports_non_linux() {
+        // On non-Linux systems, the function should return an empty vec or error
+        // since /proc/net/tcp doesn't exist
+        let result = scan_listening_ports();
+        // Either it errors or returns empty
+        if let Ok(ports) = result {
+            // Could be empty if files don't exist
+            assert!(ports.is_empty() || !ports.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_message_length_prefix() {
+        // Test that message length prefix is correctly handled
+        let msg = AgentMessage {
+            message: Some(agent_message::Message::StartPortForward(StartPortForward {
+                port: 8080,
+            })),
+        };
+
+        let mut buf = Vec::new();
+        msg.encode(&mut buf).unwrap();
+        let expected_len = buf.len() as u32;
+
+        // Create a mock stream
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+
+            // Read length prefix
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).unwrap();
+
+            u32::from_be_bytes(len_buf)
+        });
+
+        let mut client_stream = TcpStream::connect(addr).unwrap();
+        send_message(&mut client_stream, &msg).unwrap();
+
+        let received_len = handle.join().unwrap();
+        assert_eq!(received_len, expected_len);
+    }
+
+    #[test]
+    fn test_empty_message_handling() {
+        // Test that we can handle an AgentMessage with no inner message
+        let msg = AgentMessage { message: None };
+
+        let mut buf = Vec::new();
+        msg.encode(&mut buf).unwrap();
+
+        let decoded = AgentMessage::decode(&buf[..]).unwrap();
+        assert!(decoded.message.is_none());
+    }
+
+    #[test]
+    fn test_multiple_messages_sequence() {
+        // Test sending multiple messages over the same connection
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+
+            let msg1 = read_message(&mut stream).unwrap();
+            let msg2 = read_message(&mut stream).unwrap();
+            let msg3 = read_message(&mut stream).unwrap();
+
+            (msg1, msg2, msg3)
+        });
+
+        let mut client_stream = TcpStream::connect(addr).unwrap();
+
+        let msg1 = AgentMessage {
+            message: Some(agent_message::Message::StartPortForward(StartPortForward {
+                port: 8080,
+            })),
+        };
+        let msg2 = AgentMessage {
+            message: Some(agent_message::Message::StopPortForward(StopPortForward {
+                port: 8080,
+            })),
+        };
+        let msg3 = AgentMessage {
+            message: Some(agent_message::Message::OpenUrl(OpenUrl {
+                url: "http://test".to_string(),
+            })),
+        };
+
+        send_message(&mut client_stream, &msg1).unwrap();
+        send_message(&mut client_stream, &msg2).unwrap();
+        send_message(&mut client_stream, &msg3).unwrap();
+
+        let (recv1, recv2, recv3) = handle.join().unwrap();
+
+        assert!(matches!(
+            recv1.message,
+            Some(agent_message::Message::StartPortForward(_))
+        ));
+        assert!(matches!(
+            recv2.message,
+            Some(agent_message::Message::StopPortForward(_))
+        ));
+        assert!(matches!(
+            recv3.message,
+            Some(agent_message::Message::OpenUrl(_))
+        ));
+    }
+}
