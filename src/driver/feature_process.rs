@@ -109,7 +109,10 @@ impl FeatureProcessResult {
 ///
 /// Returns an error if any feature fails to download, extract, or if there are
 /// circular dependencies.
-pub fn process_features(features: &[FeatureRef], silent: bool) -> Result<Vec<FeatureProcessResult>> {
+pub fn process_features(
+    features: &[FeatureRef],
+    silent: bool,
+) -> Result<Vec<FeatureProcessResult>> {
     if !silent {
         println!("Processing features..");
     }

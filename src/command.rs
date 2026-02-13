@@ -830,10 +830,10 @@ pub fn handle_info_command(
         table.add_row(vec![Cell::new("Base Image"), Cell::new(image)]);
     }
 
-    if let Some(ref build) = devcontainer_workspace.devcontainer.build {
-        if let Some(ref dockerfile) = build.dockerfile {
-            table.add_row(vec![Cell::new("Dockerfile"), Cell::new(dockerfile)]);
-        }
+    if let Some(ref build) = devcontainer_workspace.devcontainer.build
+        && let Some(ref dockerfile) = build.dockerfile
+    {
+        table.add_row(vec![Cell::new("Dockerfile"), Cell::new(dockerfile)]);
     }
 
     println!("{}", table);

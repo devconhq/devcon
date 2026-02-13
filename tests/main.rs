@@ -191,8 +191,7 @@ RUN echo "Custom Dockerfile build" > /custom-marker.txt
         .as_str()
         .expect("Output JSON does not contain container_id");
 
-    let container_output =
-        exec_in_container(runtime, &container_id, &["cat", "/custom-marker.txt"]);
+    let container_output = exec_in_container(runtime, container_id, &["cat", "/custom-marker.txt"]);
     assert!(
         container_output.is_ok(),
         "Failed to execute command in container"
