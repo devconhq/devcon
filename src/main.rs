@@ -27,6 +27,7 @@ use tracing_indicatif::IndicatifLayer;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use devcon::command::*;
+use devcon::output::OutputFormat;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -44,6 +45,10 @@ struct Cli {
     /// Custom config file path (overrides default config location)
     #[arg(short, long, global = true, value_name = "FILE")]
     config: Option<PathBuf>,
+
+    /// Output format (text or json)
+    #[arg(short, long, global = true, default_value = "text", value_enum)]
+    output: OutputFormat,
 
     #[command(subcommand)]
     command: Commands,
@@ -219,6 +224,7 @@ fn main() -> devcon::error::Result<()> {
     trace!("Starting devcon with CLI args: {:?}", cli);
 
     let config_path = cli.config.clone();
+    let output = cli.output.clone();
 
     match &cli.command {
         Commands::Build { path, build_path } => {
@@ -226,12 +232,14 @@ fn main() -> devcon::error::Result<()> {
                 path.clone().unwrap_or(PathBuf::from(".").to_path_buf()),
                 build_path.clone(),
                 config_path,
+                output,
             )?;
         }
         Commands::Start { path } => {
             handle_start_command(
                 path.clone().unwrap_or(PathBuf::from(".").to_path_buf()),
                 config_path,
+                output,
             )?;
         }
         Commands::Up { path, build_path } => {
@@ -239,6 +247,7 @@ fn main() -> devcon::error::Result<()> {
                 path.clone().unwrap_or(PathBuf::from(".").to_path_buf()),
                 build_path.clone(),
                 config_path,
+                output,
             )?;
         }
         Commands::Shell { path, env } => {
@@ -252,29 +261,30 @@ fn main() -> devcon::error::Result<()> {
             handle_info_command(
                 path.clone().unwrap_or(PathBuf::from(".").to_path_buf()),
                 config_path,
+                output,
             )?;
         }
         Commands::Config { action } => match action {
             ConfigAction::Show => {
-                handle_config_show(config_path)?;
+                handle_config_show(config_path, output)?;
             }
             ConfigAction::Get { property } => {
-                handle_config_get(property, config_path)?;
+                handle_config_get(property, config_path, output)?;
             }
             ConfigAction::Set { property, value } => {
-                handle_config_set(property, value, config_path)?;
+                handle_config_set(property, value, config_path, output)?;
             }
             ConfigAction::Unset { property } => {
-                handle_config_unset(property, config_path)?;
+                handle_config_unset(property, config_path, output)?;
             }
             ConfigAction::Validate => {
-                handle_config_validate(config_path)?;
+                handle_config_validate(config_path, output)?;
             }
             ConfigAction::Path => {
-                handle_config_path()?;
+                handle_config_path(output)?;
             }
             ConfigAction::List { filter } => {
-                handle_config_list(filter.as_deref())?;
+                handle_config_list(filter.as_deref(), output)?;
             }
         },
         Commands::Serve { port } => {

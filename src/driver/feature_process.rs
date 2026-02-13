@@ -109,40 +109,54 @@ impl FeatureProcessResult {
 ///
 /// Returns an error if any feature fails to download, extract, or if there are
 /// circular dependencies.
-pub fn process_features(features: &[FeatureRef]) -> Result<Vec<FeatureProcessResult>> {
-    println!("Processing features..");
+pub fn process_features(features: &[FeatureRef], silent: bool) -> Result<Vec<FeatureProcessResult>> {
+    if !silent {
+        println!("Processing features..");
+    }
     let mut initial_results: Vec<FeatureProcessResult> = vec![];
 
     // Process initial features
     for feature_ref in features {
         match &feature_ref.source {
             Registry { registry, .. } => {
-                println!("Processing feature {}", registry.name)
+                if !silent {
+                    println!("Processing feature {}", registry.name)
+                }
             }
-            Local { path } => println!(
-                "Processing feature {}",
-                path.canonicalize()?
-                    .file_name()
-                    .ok_or_else(|| Error::new("Could not get basename of directory"))?
-                    .to_string_lossy()
-            ),
+            Local { path } => {
+                if !silent {
+                    println!(
+                        "Processing feature {}",
+                        path.canonicalize()?
+                            .file_name()
+                            .ok_or_else(|| Error::new("Could not get basename of directory"))?
+                            .to_string_lossy()
+                    )
+                }
+            }
         }
         let feature_result = process_feature(feature_ref)?;
         initial_results.push(feature_result);
     }
 
     // Resolve all dependencies (transitive)
-    println!("Resolving feature dependencies..");
-    let all_features = resolve_all_dependencies(initial_results)?;
+    if !silent {
+        println!("Resolving feature dependencies..");
+    }
+    let all_features = resolve_all_dependencies(initial_results, silent)?;
 
     // Sort features topologically
-    println!("Ordering features by dependencies..");
+    if !silent {
+        println!("Ordering features by dependencies..");
+    }
     let sorted_features = topological_sort(all_features)?;
 
-    println!(
-        "Processed {} features (including dependencies)",
-        sorted_features.len()
-    );
+    if !silent {
+        println!(
+            "Processed {} features (including dependencies)",
+            sorted_features.len()
+        );
+    }
 
     Ok(sorted_features)
 }
@@ -168,6 +182,7 @@ pub fn process_features(features: &[FeatureRef]) -> Result<Vec<FeatureProcessRes
 /// - A dependency reference cannot be parsed
 fn resolve_all_dependencies(
     initial_features: Vec<FeatureProcessResult>,
+    silent: bool,
 ) -> Result<HashMap<String, FeatureProcessResult>> {
     let mut all_features: HashMap<String, FeatureProcessResult> = HashMap::new();
     let mut to_process: VecDeque<FeatureProcessResult> = VecDeque::new();
@@ -248,7 +263,9 @@ fn resolve_all_dependencies(
             };
 
             // Process the dependency
-            println!("Downloading dependency feature: {}", dep_id);
+            if !silent {
+                println!("Downloading dependency feature: {}", dep_id);
+            }
             let dep_result = process_feature(&dep_ref)?;
             let dep_feature_id = dep_result.feature.id.clone();
 

@@ -156,7 +156,6 @@ fn test_build_with_dockerfile() {
     let test_config = create_test_config();
 
     let dockerfile_content = r#"FROM mcr.microsoft.com/devcontainers/base:ubuntu
-RUN apt-get update && apt-get install -y curl
 RUN echo "Custom Dockerfile build" > /custom-marker.txt
 "#;
 
@@ -166,7 +165,9 @@ RUN echo "Custom Dockerfile build" > /custom-marker.txt
     let result = cmd
         .arg("--config")
         .arg(&test_config)
-        .arg("build")
+        .arg("--output")
+        .arg("json")
+        .arg("up")
         .arg(temp_dir.path().to_str().unwrap())
         .output();
 
@@ -183,11 +184,15 @@ RUN echo "Custom Dockerfile build" > /custom-marker.txt
         stderr
     );
 
-    let container_output = exec_in_container(
-        runtime,
-        "devcon-test-dockerfile:latest",
-        &["cat", "/custom-marker.txt"],
-    );
+    let output_json =
+        serde_json::from_str::<serde_json::Value>(&stdout).expect("Output is not valid JSON");
+
+    let container_id = output_json["container_id"]
+        .as_str()
+        .expect("Output JSON does not contain container_id");
+
+    let container_output =
+        exec_in_container(runtime, &container_id, &["cat", "/custom-marker.txt"]);
     assert!(
         container_output.is_ok(),
         "Failed to execute command in container"
@@ -197,6 +202,8 @@ RUN echo "Custom Dockerfile build" > /custom-marker.txt
         marker_content.contains("Custom Dockerfile build"),
         "Dockerfile changes not present in container"
     );
+
+    drop(temp_dir);
 }
 
 #[test]

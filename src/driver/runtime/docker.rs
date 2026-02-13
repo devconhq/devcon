@@ -79,7 +79,7 @@ impl super::ContainerHandle for DockerContainerHandle {
 }
 
 impl ContainerRuntime for DockerRuntime {
-    fn build(&self, dockerfile_path: &Path, context_path: &Path, image_tag: &str) -> Result<()> {
+    fn build(&self, dockerfile_path: &Path, context_path: &Path, image_tag: &str, silent: bool) -> Result<()> {
         self.build_with_args(
             dockerfile_path,
             context_path,
@@ -87,6 +87,7 @@ impl ContainerRuntime for DockerRuntime {
             &None,
             &None,
             &None,
+            silent,
         )
     }
 
@@ -98,6 +99,7 @@ impl ContainerRuntime for DockerRuntime {
         args: &Option<std::collections::HashMap<String, String>>,
         target: &Option<String>,
         options: &Option<Vec<String>>,
+        silent: bool,
     ) -> Result<()> {
         let mut cmd = Command::new("docker");
         cmd.arg("build")
@@ -131,7 +133,7 @@ impl ContainerRuntime for DockerRuntime {
 
         let child = cmd.spawn()?;
 
-        let result = stream_build_output(child)?;
+        let result = stream_build_output(child, silent)?;
 
         if !result.success() {
             return Err(Error::runtime("Docker build command failed"));
