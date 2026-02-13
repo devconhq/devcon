@@ -20,16 +20,20 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! # DevCon Library
+//! # Output Format
 //!
-//! This library provides core functionality for the DevCon CLI tool.
-//! Currently serves as a placeholder for potential library exports in the future.
+//! This module defines the output format options for the DevCon CLI.
+//! Commands can render their results as human-readable text (default)
+//! or as structured JSON for programmatic consumption.
 
-pub mod command;
-pub mod config;
-pub mod devcontainer;
-pub mod driver;
-pub mod error;
-pub mod feature;
-pub mod output;
-pub mod workspace;
+use clap::ValueEnum;
+
+/// The output format for CLI commands.
+#[derive(ValueEnum, Clone, Debug, Default, PartialEq, Eq)]
+pub enum OutputFormat {
+    /// Human-readable text output (default)
+    #[default]
+    Text,
+    /// Structured JSON output
+    Json,
+}

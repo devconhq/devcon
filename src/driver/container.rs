@@ -223,6 +223,7 @@ fn apply_feature_order_override(
 pub struct ContainerDriver {
     config: Config,
     pub runtime: Box<dyn ContainerRuntime>,
+    silent: bool,
 }
 
 impl ContainerDriver {
@@ -240,7 +241,24 @@ impl ContainerDriver {
     /// # Ok::<(), devcon::error::Error>(())
     /// ```
     pub fn new(config: Config, runtime: Box<dyn ContainerRuntime>) -> Self {
-        Self { config, runtime }
+        Self {
+            config,
+            runtime,
+            silent: false,
+        }
+    }
+
+    /// Creates a new container driver with silent mode.
+    ///
+    /// When `silent` is true, all progress and status messages to stdout
+    /// are suppressed. This is useful for JSON output mode where only
+    /// structured output should be printed.
+    pub fn new_silent(config: Config, runtime: Box<dyn ContainerRuntime>, silent: bool) -> Self {
+        Self {
+            config,
+            runtime,
+            silent,
+        }
     }
 
     /// Prepares features for building or starting a container.
@@ -300,7 +318,7 @@ impl ContainerDriver {
         debug!("Initial feature list: {:?}", features);
 
         // Process all features including dependency resolution and topological sorting
-        let mut processed_features = process_features(&features)?;
+        let mut processed_features = process_features(&features, self.silent)?;
 
         // Apply override feature install order if specified
         if let Some(ref override_order) = devcontainer_workspace
@@ -569,6 +587,7 @@ fi
                 &build_config.args,
                 &build_config.target,
                 &build_config.options,
+                self.silent,
             )?;
 
             intermediate_tag
@@ -654,6 +673,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
             &dockerfile,
             &directory_path,
             &self.get_image_tag(&devcontainer_workspace),
+            self.silent,
         )?;
 
         Ok(())

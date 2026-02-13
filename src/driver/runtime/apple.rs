@@ -79,7 +79,7 @@ impl AppleRuntime {
 }
 
 impl ContainerRuntime for AppleRuntime {
-    fn build(&self, dockerfile_path: &Path, context_path: &Path, image_tag: &str) -> Result<()> {
+    fn build(&self, dockerfile_path: &Path, context_path: &Path, image_tag: &str, silent: bool) -> Result<()> {
         self.build_with_args(
             dockerfile_path,
             context_path,
@@ -87,6 +87,7 @@ impl ContainerRuntime for AppleRuntime {
             &None,
             &None,
             &None,
+            silent,
         )
     }
 
@@ -98,6 +99,7 @@ impl ContainerRuntime for AppleRuntime {
         args: &Option<std::collections::HashMap<String, String>>,
         target: &Option<String>,
         options: &Option<Vec<String>>,
+        silent: bool,
     ) -> Result<()> {
         let mut cmd = Command::new("container");
         cmd.arg("build");
@@ -138,7 +140,7 @@ impl ContainerRuntime for AppleRuntime {
 
         let child = cmd.spawn()?;
 
-        let result = stream_build_output(child)?;
+        let result = stream_build_output(child, silent)?;
 
         if !result.success() {
             return Err(Error::runtime("Container build command failed"));

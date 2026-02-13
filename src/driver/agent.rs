@@ -81,7 +81,7 @@ echo "DevCon Agent installed successfully."
             .expect("Failed to create template");
 
         let git_repo =
-            git_repository.unwrap_or_else(|| "https://github.com/kreemer/devcon.git".to_string());
+            git_repository.unwrap_or_else(|| "https://github.com/devconhq/devcon.git".to_string());
         let git_br = git_branch.unwrap_or_else(|| "main".to_string());
 
         let contents = template

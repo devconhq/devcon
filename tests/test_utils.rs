@@ -42,7 +42,8 @@ pub fn create_test_config() -> std::path::PathBuf {
     let config_path = temp_dir.path().join("test-config.yaml");
 
     // Create an empty or minimal config
-    std::fs::write(&config_path, "# Test config\n").expect("Failed to write test config");
+    std::fs::write(&config_path, "# Test config\nagents:\n    disable: true")
+        .expect("Failed to write test config");
 
     // We need to leak the temp_dir to keep it alive for the test duration
     // This is acceptable for tests as they're short-lived
@@ -143,16 +144,16 @@ pub fn create_test_devcontainer_with_hooks(
 /// Verify that a container image exists
 pub fn verify_image_exists(runtime: Runtime, image_name: &str) -> bool {
     let cmd = runtime_cmd(runtime);
-    let subcommand = match runtime {
-        Runtime::Docker => "images",
-        Runtime::Apple => "image",
+    let format = match runtime {
+        Runtime::Docker => "{{.Repository}}:{{.Tag}}",
+        Runtime::Apple => "json",
     };
 
     let output = Command::new(cmd)
-        .arg(subcommand)
+        .arg("image")
         .arg("list")
         .arg("--format")
-        .arg("{{.Repository}}:{{.Tag}}")
+        .arg(format)
         .output()
         .expect("Failed to list images");
 

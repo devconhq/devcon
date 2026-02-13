@@ -36,6 +36,7 @@
 use std::path::PathBuf;
 
 use crate::error::{Error, Result};
+use crate::output::OutputFormat;
 use crate::{
     config::Config,
     driver::{
@@ -46,6 +47,7 @@ use crate::{
     workspace::Workspace,
 };
 use comfy_table::{Cell, Color, ContentArrangement, Table, presets::UTF8_FULL};
+use serde::Serialize;
 use tracing::{debug, trace};
 
 /// Helper function to get runtime-specific config
@@ -70,6 +72,107 @@ fn get_runtime_specific_config(
     Ok(runtime)
 }
 
+// ── JSON response structs ──────────────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct ConfigShowResponse {
+    pub config: serde_json::Value,
+}
+
+#[derive(Serialize)]
+pub struct ConfigGetResponse {
+    pub property: String,
+    pub value: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct ConfigSetResponse {
+    pub property: String,
+    pub value: String,
+}
+
+#[derive(Serialize)]
+pub struct ConfigUnsetResponse {
+    pub property: String,
+}
+
+#[derive(Serialize)]
+pub struct ConfigValidateResponse {
+    pub valid: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct ConfigPathResponse {
+    pub path: String,
+}
+
+#[derive(Serialize)]
+pub struct ConfigPropertyEntry {
+    pub property: String,
+    pub r#type: String,
+    pub description: String,
+}
+
+#[derive(Serialize)]
+pub struct ConfigListResponse {
+    pub properties: Vec<ConfigPropertyEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct BuildResponse {
+    pub success: bool,
+}
+
+#[derive(Serialize)]
+pub struct StartResponse {
+    pub container_id: String,
+}
+
+#[derive(Serialize)]
+pub struct UpResponse {
+    pub container_id: String,
+}
+
+#[derive(Serialize)]
+pub struct FeatureEntry {
+    pub name: String,
+    pub id: String,
+    pub version: String,
+}
+
+#[derive(Serialize)]
+pub struct InfoResponse {
+    pub valid: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_image: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dockerfile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub features: Option<Vec<FeatureEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub features_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_exists: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_tag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_running: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_id: Option<String>,
+}
+
 /// Handles the config show command to display current configuration.
 ///
 /// This function loads the current configuration and displays it as YAML
@@ -78,8 +181,15 @@ fn get_runtime_specific_config(
 /// # Errors
 ///
 /// Returns an error if the config cannot be loaded or serialized.
-pub fn handle_config_show(config_path: Option<PathBuf>) -> Result<()> {
+pub fn handle_config_show(config_path: Option<PathBuf>, output: OutputFormat) -> Result<()> {
     let config = Config::load(config_path)?;
+
+    if output == OutputFormat::Json {
+        let json_value = serde_json::to_value(&config)?;
+        let response = ConfigShowResponse { config: json_value };
+        println!("{}", serde_json::to_string_pretty(&response)?);
+        return Ok(());
+    }
 
     let yaml = yaml_serde::to_string(&config)?;
 
@@ -132,10 +242,25 @@ pub fn handle_config_show(config_path: Option<PathBuf>) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if the config cannot be loaded or the property doesn't exist.
-pub fn handle_config_get(property: &str, config_path: Option<PathBuf>) -> Result<()> {
+pub fn handle_config_get(
+    property: &str,
+    config_path: Option<PathBuf>,
+    output: OutputFormat,
+) -> Result<()> {
     let config = Config::load(config_path)?;
 
-    match config.get_value(property) {
+    let value = config.get_value(property);
+
+    if output == OutputFormat::Json {
+        let response = ConfigGetResponse {
+            property: property.to_string(),
+            value: value.clone(),
+        };
+        println!("{}", serde_json::to_string_pretty(&response)?);
+        return Ok(());
+    }
+
+    match value {
         Some(value) => {
             println!("{}", value);
             Ok(())
@@ -153,13 +278,26 @@ pub fn handle_config_get(property: &str, config_path: Option<PathBuf>) -> Result
 ///
 /// Returns an error if the config cannot be loaded, the property is invalid,
 /// or the value fails validation.
-pub fn handle_config_set(property: &str, value: &str, config_path: Option<PathBuf>) -> Result<()> {
+pub fn handle_config_set(
+    property: &str,
+    value: &str,
+    config_path: Option<PathBuf>,
+    output: OutputFormat,
+) -> Result<()> {
     let mut config = Config::load(config_path)?;
 
     config.set_value(property, value.to_string())?;
     config.save()?;
 
-    println!("Set {} = {}", property, value);
+    if output == OutputFormat::Json {
+        let response = ConfigSetResponse {
+            property: property.to_string(),
+            value: value.to_string(),
+        };
+        println!("{}", serde_json::to_string_pretty(&response)?);
+    } else {
+        println!("Set {} = {}", property, value);
+    }
     Ok(())
 }
 
@@ -168,13 +306,24 @@ pub fn handle_config_set(property: &str, value: &str, config_path: Option<PathBu
 /// # Errors
 ///
 /// Returns an error if the config cannot be loaded or saved.
-pub fn handle_config_unset(property: &str, config_path: Option<PathBuf>) -> Result<()> {
+pub fn handle_config_unset(
+    property: &str,
+    config_path: Option<PathBuf>,
+    output: OutputFormat,
+) -> Result<()> {
     let mut config = Config::load(config_path)?;
 
     config.unset_value(property)?;
     config.save()?;
 
-    println!("Unset {}", property);
+    if output == OutputFormat::Json {
+        let response = ConfigUnsetResponse {
+            property: property.to_string(),
+        };
+        println!("{}", serde_json::to_string_pretty(&response)?);
+    } else {
+        println!("Unset {}", property);
+    }
     Ok(())
 }
 
@@ -183,18 +332,35 @@ pub fn handle_config_unset(property: &str, config_path: Option<PathBuf>) -> Resu
 /// # Errors
 ///
 /// Returns an error (with exit code 1) if any configuration values are invalid.
-pub fn handle_config_validate(config_path: Option<PathBuf>) -> Result<()> {
+pub fn handle_config_validate(config_path: Option<PathBuf>, output: OutputFormat) -> Result<()> {
     let config = Config::load(config_path)?;
 
     match config.validate() {
         Ok(()) => {
-            println!("✓ Configuration is valid");
+            if output == OutputFormat::Json {
+                let response = ConfigValidateResponse {
+                    valid: true,
+                    error: None,
+                };
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            } else {
+                println!("✓ Configuration is valid");
+            }
             Ok(())
         }
         Err(e) => {
-            eprintln!("✗ Configuration validation failed:");
-            eprintln!("  {}", e);
-            std::process::exit(1);
+            if output == OutputFormat::Json {
+                let response = ConfigValidateResponse {
+                    valid: false,
+                    error: Some(e.to_string()),
+                };
+                println!("{}", serde_json::to_string_pretty(&response)?);
+                Ok(())
+            } else {
+                eprintln!("✗ Configuration validation failed:");
+                eprintln!("  {}", e);
+                std::process::exit(1);
+            }
         }
     }
 }
@@ -204,9 +370,17 @@ pub fn handle_config_validate(config_path: Option<PathBuf>) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if the config directory cannot be determined.
-pub fn handle_config_path() -> Result<()> {
+pub fn handle_config_path(output: OutputFormat) -> Result<()> {
     let config_path = Config::get_config_path()?;
-    println!("{}", config_path.display());
+
+    if output == OutputFormat::Json {
+        let response = ConfigPathResponse {
+            path: config_path.display().to_string(),
+        };
+        println!("{}", serde_json::to_string_pretty(&response)?);
+    } else {
+        println!("{}", config_path.display());
+    }
     Ok(())
 }
 
@@ -215,8 +389,25 @@ pub fn handle_config_path() -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if the table cannot be created or displayed.
-pub fn handle_config_list(filter: Option<&str>) -> Result<()> {
+pub fn handle_config_list(filter: Option<&str>, output: OutputFormat) -> Result<()> {
     let properties = Config::list_properties(filter);
+
+    if output == OutputFormat::Json {
+        let entries: Vec<ConfigPropertyEntry> = properties
+            .iter()
+            .map(|(property, prop_type, description)| ConfigPropertyEntry {
+                property: property.to_string(),
+                r#type: prop_type.to_string(),
+                description: description.to_string(),
+            })
+            .collect();
+        let response = ConfigListResponse {
+            properties: entries,
+            filter: filter.map(|f| f.to_string()),
+        };
+        println!("{}", serde_json::to_string_pretty(&response)?);
+        return Ok(());
+    }
 
     if properties.is_empty() {
         if let Some(f) = filter {
@@ -286,13 +477,14 @@ pub fn handle_config_list(filter: Option<&str>) -> Result<()> {
 /// # use devcon::command::handle_build_command;
 ///
 /// let project_path = PathBuf::from("/path/to/project");
-/// handle_build_command(project_path, None)?;
+/// handle_build_command(project_path, None, None, devcon::output::OutputFormat::Text)?;
 /// # Ok::<(), devcon::error::Error>(())
 /// ```
 pub fn handle_build_command(
     path: PathBuf,
     build_path: Option<PathBuf>,
     config_path: Option<PathBuf>,
+    output: OutputFormat,
 ) -> Result<()> {
     let config = Config::load(config_path)?;
 
@@ -307,7 +499,7 @@ pub fn handle_build_command(
     debug!("Using runtime {:?}", runtime_name);
     let runtime = get_runtime_specific_config(&config, &runtime_name)?;
 
-    let driver = ContainerDriver::new(config, runtime);
+    let driver = ContainerDriver::new_silent(config, runtime, output == OutputFormat::Json);
 
     let result = driver.build(devcontainer_workspace, &[], effective_build_path);
 
@@ -316,6 +508,11 @@ pub fn handle_build_command(
             "Failed to build the development container. Error: {:?}",
             result.err()
         )));
+    }
+
+    if output == OutputFormat::Json {
+        let response = BuildResponse { success: true };
+        println!("{}", serde_json::to_string_pretty(&response)?);
     }
 
     Ok(())
@@ -349,10 +546,14 @@ pub fn handle_build_command(
 /// # use devcon::command::handle_start_command;
 ///
 /// let project_path = PathBuf::from("/path/to/project");
-/// handle_start_command(project_path)?;
+/// handle_start_command(project_path, None, devcon::output::OutputFormat::Text)?;
 /// # Ok::<(), devcon::error::Error>(())
 /// ```
-pub fn handle_start_command(path: PathBuf, config_path: Option<PathBuf>) -> Result<()> {
+pub fn handle_start_command(
+    path: PathBuf,
+    config_path: Option<PathBuf>,
+    output: OutputFormat,
+) -> Result<()> {
     let config = Config::load(config_path)?;
     trace!("Config loaded {:?}", config);
     let devcontainer_workspace = Workspace::try_from(path.clone())?;
@@ -362,13 +563,18 @@ pub fn handle_start_command(path: PathBuf, config_path: Option<PathBuf>) -> Resu
     debug!("Using runtime {:?}", runtime_name);
     let runtime = get_runtime_specific_config(&config, &runtime_name)?;
 
-    let driver = ContainerDriver::new(config, runtime);
+    let driver = ContainerDriver::new_silent(config, runtime, output == OutputFormat::Json);
     let container_id = driver.start(devcontainer_workspace, &[])?;
 
-    println!(
-        "Container started successfully. Container ID: {}",
-        container_id
-    );
+    if output == OutputFormat::Json {
+        let response = StartResponse { container_id };
+        println!("{}", serde_json::to_string_pretty(&response)?);
+    } else {
+        println!(
+            "Container started successfully. Container ID: {}",
+            container_id
+        );
+    }
 
     Ok(())
 }
@@ -434,13 +640,14 @@ pub fn handle_shell_command(
 /// # use devcon::command::handle_up_command;
 ///
 /// let project_path = PathBuf::from("/path/to/project");
-/// handle_up_command(project_path, None)?;
+/// handle_up_command(project_path, None, None, devcon::output::OutputFormat::Text)?;
 /// # Ok::<(), devcon::error::Error>(())
 /// ```
 pub fn handle_up_command(
     path: PathBuf,
     build_path: Option<PathBuf>,
     config_path: Option<PathBuf>,
+    output: OutputFormat,
 ) -> Result<()> {
     let config = Config::load(config_path)?;
     trace!("Config loaded {:?}", config);
@@ -454,7 +661,7 @@ pub fn handle_up_command(
     debug!("Using runtime {:?}", runtime_name);
     let runtime = get_runtime_specific_config(&config, &runtime_name)?;
 
-    let driver = ContainerDriver::new(config, runtime);
+    let driver = ContainerDriver::new_silent(config, runtime, output == OutputFormat::Json);
 
     // Process features once
     let (processed_features, _) = driver.prepare_features(&devcontainer_workspace)?;
@@ -471,10 +678,15 @@ pub fn handle_up_command(
     let container_id =
         driver.start_with_features(devcontainer_workspace, &[], Some(processed_features))?;
 
-    println!(
-        "Container built and started. Container ID: {}",
-        container_id
-    );
+    if output == OutputFormat::Json {
+        let response = UpResponse { container_id };
+        println!("{}", serde_json::to_string_pretty(&response)?);
+    } else {
+        println!(
+            "Container built and started. Container ID: {}",
+            container_id
+        );
+    }
 
     Ok(())
 }
@@ -496,7 +708,7 @@ pub fn handle_up_command(
 ///
 /// ```no_run
 /// # use devcon::command::handle_serve_command;
-/// handle_serve_command(15000)?;
+/// handle_serve_command(15000, None)?;
 /// # Ok::<(), devcon::error::Error>(())
 /// ```
 pub fn handle_serve_command(port: u16, config_path: Option<PathBuf>) -> Result<()> {
@@ -546,10 +758,14 @@ pub fn handle_serve_command(port: u16, config_path: Option<PathBuf>) -> Result<(
 /// # use devcon::command::handle_info_command;
 ///
 /// let project_path = PathBuf::from("/path/to/project");
-/// handle_info_command(project_path, None)?;
+/// handle_info_command(project_path, None, devcon::output::OutputFormat::Text)?;
 /// # Ok::<(), devcon::error::Error>(())
 /// ```
-pub fn handle_info_command(path: PathBuf, config_path: Option<PathBuf>) -> Result<()> {
+pub fn handle_info_command(
+    path: PathBuf,
+    config_path: Option<PathBuf>,
+    output: OutputFormat,
+) -> Result<()> {
     let config = Config::load(config_path)?;
     trace!("Config loaded {:?}", config);
 
@@ -557,11 +773,34 @@ pub fn handle_info_command(path: PathBuf, config_path: Option<PathBuf>) -> Resul
     let devcontainer_workspace = match Workspace::try_from(path.clone()) {
         Ok(workspace) => workspace,
         Err(e) => {
-            println!("❌ Invalid devcontainer configuration");
-            println!("\nError: {}", e);
+            if output == OutputFormat::Json {
+                let response = InfoResponse {
+                    valid: false,
+                    error: Some(e.to_string()),
+                    name: None,
+                    path: None,
+                    base_image: None,
+                    dockerfile: None,
+                    features: None,
+                    features_error: None,
+                    image_exists: None,
+                    image_tag: None,
+                    container_running: None,
+                    container_name: None,
+                    container_id: None,
+                };
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            } else {
+                println!("❌ Invalid devcontainer configuration");
+                println!("\nError: {}", e);
+            }
             return Ok(());
         }
     };
+
+    if output == OutputFormat::Json {
+        return handle_info_json(&config, &devcontainer_workspace);
+    }
 
     println!("✓ Valid devcontainer configuration");
     println!();
@@ -693,13 +932,90 @@ pub fn handle_info_command(path: PathBuf, config_path: Option<PathBuf>) -> Resul
     Ok(())
 }
 
+/// JSON output helper for the info command.
+/// Collects all information into a single `InfoResponse` and prints it.
+fn handle_info_json(config: &Config, devcontainer_workspace: &Workspace) -> Result<()> {
+    let name = devcontainer_workspace.get_name().to_string();
+    let path = devcontainer_workspace.path.display().to_string();
+    let base_image = devcontainer_workspace.devcontainer.image.clone();
+    let dockerfile = devcontainer_workspace
+        .devcontainer
+        .build
+        .as_ref()
+        .and_then(|b| b.dockerfile.clone());
+
+    // Create runtime based on config
+    let runtime_name = config.resolve_runtime()?;
+    let runtime = get_runtime_specific_config(config, &runtime_name)?;
+    let driver = ContainerDriver::new_silent(config.clone(), runtime, true);
+
+    // Features
+    let (features, features_error) = match driver.prepare_features(devcontainer_workspace) {
+        Ok((processed_features, _)) => {
+            let entries: Vec<FeatureEntry> = processed_features
+                .iter()
+                .map(|f| FeatureEntry {
+                    name: f.name().to_string(),
+                    id: f.feature.id.clone(),
+                    version: f.feature.version.clone(),
+                })
+                .collect();
+            (Some(entries), None)
+        }
+        Err(e) => (None, Some(e.to_string())),
+    };
+
+    // Image check
+    let image_tag = format!(
+        "devcon-{}:latest",
+        devcontainer_workspace.get_sanitized_name()
+    );
+    let image_exists = driver
+        .runtime
+        .images()
+        .ok()
+        .map(|images| images.iter().any(|img| img == &image_tag));
+
+    // Container check
+    let container_name = format!("devcon.{}", devcontainer_workspace.get_sanitized_name());
+    let (container_running, container_id) = match driver.runtime.list() {
+        Ok(containers) => {
+            let found = containers.iter().find(|(name, _)| name == &container_name);
+            match found {
+                Some((_, handle)) => (Some(true), Some(handle.id().to_string())),
+                None => (Some(false), None),
+            }
+        }
+        Err(_) => (None, None),
+    };
+
+    let response = InfoResponse {
+        valid: true,
+        error: None,
+        name: Some(name),
+        path: Some(path),
+        base_image,
+        dockerfile,
+        features,
+        features_error,
+        image_exists,
+        image_tag: Some(image_tag),
+        container_running,
+        container_name: Some(container_name),
+        container_id,
+    };
+
+    println!("{}", serde_json::to_string_pretty(&response)?);
+    Ok(())
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
 
     #[test]
     fn test_handle_config_command() {
-        let result = handle_config_path();
+        let result = handle_config_path(OutputFormat::Text);
         assert!(result.is_ok());
     }
 
@@ -725,7 +1041,12 @@ mod test {
         )
         .unwrap();
 
-        let result = handle_build_command(temp_dir.path().to_path_buf());
+        let result = handle_build_command(
+            temp_dir.path().to_path_buf(),
+            None,
+            None,
+            OutputFormat::Text,
+        );
         assert!(result.is_ok(), "Build command failed: {:?}", result.err());
     }
 }

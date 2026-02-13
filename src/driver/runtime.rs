@@ -57,11 +57,13 @@ pub mod docker;
 /// # Returns
 ///
 /// Returns `Ok(ExitStatus)` if the process completes, `Err` if there's an I/O error
-pub fn stream_build_output(mut child: Child) -> Result<std::process::ExitStatus> {
+pub fn stream_build_output(mut child: Child, silent: bool) -> Result<std::process::ExitStatus> {
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
-    println!("Building Image..");
+    if !silent {
+        println!("Building Image..");
+    }
 
     // Buffer for last 10 lines (rolling window)
     let rolling_buffer: Arc<Mutex<VecDeque<String>>> =
@@ -188,7 +190,9 @@ pub fn stream_build_output(mut child: Child) -> Result<std::process::ExitStatus>
         }
         eprintln!("=== End of output ===\n");
     } else {
-        println!("Building image complete");
+        if !silent {
+            println!("Building image complete");
+        }
     }
 
     Ok(result)
@@ -226,11 +230,12 @@ pub trait ContainerRuntime: Send {
     /// * `dockerfile_path` - Path to the Dockerfile
     /// * `context_path` - Build context directory path
     /// * `image_tag` - Tag to apply to the built image
+    /// * `silent` - If true, suppress progress output to stdout
     ///
     /// # Errors
     ///
     /// Returns an error if the build command fails.
-    fn build(&self, dockerfile_path: &Path, context_path: &Path, image_tag: &str) -> Result<()>;
+    fn build(&self, dockerfile_path: &Path, context_path: &Path, image_tag: &str, silent: bool) -> Result<()>;
 
     /// Builds a container image from a Dockerfile with additional build arguments.
     ///
@@ -245,6 +250,7 @@ pub trait ContainerRuntime: Send {
     /// * `args` - Build arguments (--build-arg KEY=VALUE)
     /// * `target` - Target build stage (--target STAGE)
     /// * `options` - Additional build options to pass to the build command
+    /// * `silent` - If true, suppress progress output to stdout
     ///
     /// # Errors
     ///
@@ -257,6 +263,7 @@ pub trait ContainerRuntime: Send {
         args: &Option<std::collections::HashMap<String, String>>,
         target: &Option<String>,
         options: &Option<Vec<String>>,
+        silent: bool,
     ) -> Result<()>;
 
     /// Starts a container instance.
