@@ -143,19 +143,7 @@ fn test_build_and_verify_image() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Verify the image was actually created
-    // The image name should contain the devcontainer name or workspace folder
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{}\n{}", stdout, stderr);
-
-    // Check that build output mentions successful completion
-    assert!(
-        combined.contains("Successfully")
-            || combined.contains("Built")
-            || combined.contains("FINISHED"),
-        "Build output does not indicate success"
-    );
+    assert!(verify_image_exists(runtime, "devcon-test-verify:latest"));
 }
 
 #[test]
@@ -195,11 +183,19 @@ RUN echo "Custom Dockerfile build" > /custom-marker.txt
         stderr
     );
 
-    // Verify Dockerfile was used
-    let combined = format!("{}\n{}", stdout, stderr);
+    let container_output = exec_in_container(
+        runtime,
+        "devcon-test-dockerfile:latest",
+        &["cat", "/custom-marker.txt"],
+    );
     assert!(
-        combined.contains("Dockerfile") || combined.contains("FROM"),
-        "Build output does not indicate Dockerfile usage"
+        container_output.is_ok(),
+        "Failed to execute command in container"
+    );
+    let marker_content = &container_output.unwrap();
+    assert!(
+        marker_content.contains("Custom Dockerfile build"),
+        "Dockerfile changes not present in container"
     );
 }
 
