@@ -48,7 +48,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use serde::Deserialize;
@@ -719,6 +719,9 @@ impl TryFrom<PathBuf> for Devcontainer {
             result.name = Some(name);
         }
 
+        // Validate image/build configuration
+        result.validate(&final_path)?;
+
         Ok(result)
     }
 }
@@ -732,6 +735,92 @@ impl TryFrom<String> for Devcontainer {
 
         serde_json::from_str(&data)
     }
+}
+
+impl Devcontainer {
+    /// Validates the devcontainer configuration.
+    ///
+    /// Ensures that either `image` or `build.dockerfile` is specified, but not both.
+    /// The devcontainer spec requires image and build to be mutually exclusive.
+    ///
+    /// # Arguments
+    ///
+    /// * `devcontainer_path` - Path to the devcontainer.json file for resolving relative paths
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Neither `image` nor `build.dockerfile` is specified
+    /// - Both `image` and `build` are specified
+    /// - Dockerfile path doesn't exist
+    pub fn validate(&self, devcontainer_path: &Path) -> Result<()> {
+        let has_image = self.image.is_some();
+        let has_build = self.build.is_some();
+
+        // Check mutual exclusivity
+        if has_image && has_build {
+            return Err(Error::MutuallyExclusiveImageBuild);
+        }
+
+        // Check at least one is specified
+        if !has_image && !has_build {
+            return Err(Error::MissingImageOrBuild);
+        }
+
+        // If build is specified, validate dockerfile exists
+        if let Some(build) = &self
+            .build
+            .as_ref()
+            .filter(|b| b.dockerfile.is_some() || b.context.is_some())
+        {
+            let devcontainer_dir = devcontainer_path
+                .parent()
+                .ok_or_else(|| Error::invalid_path(devcontainer_path))?;
+            let dockerfile_path = resolve_dockerfile_path(build, devcontainer_dir);
+            if !fs::exists(&dockerfile_path).unwrap_or(false) {
+                return Err(Error::DockerfileNotFound(dockerfile_path));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Resolves the Dockerfile path relative to devcontainer.json location.
+///
+/// # Arguments
+///
+/// * `build` - Build configuration containing dockerfile and context paths
+/// * `devcontainer_dir` - Directory containing devcontainer.json
+///
+/// # Returns
+///
+/// Absolute path to the Dockerfile
+pub fn resolve_dockerfile_path(build: &BuildConfig, devcontainer_dir: &Path) -> PathBuf {
+    let dockerfile = build.dockerfile.as_deref().unwrap_or("Dockerfile");
+    if let Some(context) = &build.context {
+        devcontainer_dir.join(context).join(dockerfile)
+    } else {
+        devcontainer_dir.join(dockerfile)
+    }
+}
+
+/// Resolves the build context path relative to devcontainer.json location.
+///
+/// # Arguments
+///
+/// * `build` - Build configuration containing context path
+/// * `devcontainer_dir` - Directory containing devcontainer.json
+///
+/// # Returns
+///
+/// Absolute path to the build context directory
+pub fn resolve_context_path(build: &BuildConfig, devcontainer_dir: &Path) -> PathBuf {
+    build
+        .context
+        .as_ref()
+        .map(|c| devcontainer_dir.join(c))
+        .unwrap_or_else(|| devcontainer_dir.to_path_buf())
 }
 
 /// Defines the source location of a feature.

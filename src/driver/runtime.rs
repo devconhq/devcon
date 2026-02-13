@@ -232,6 +232,33 @@ pub trait ContainerRuntime: Send {
     /// Returns an error if the build command fails.
     fn build(&self, dockerfile_path: &Path, context_path: &Path, image_tag: &str) -> Result<()>;
 
+    /// Builds a container image from a Dockerfile with additional build arguments.
+    ///
+    /// This method supports the full range of build options from the devcontainer spec,
+    /// including build arguments, target stages, and custom Docker build options.
+    ///
+    /// # Arguments
+    ///
+    /// * `dockerfile_path` - Path to the Dockerfile
+    /// * `context_path` - Build context directory path
+    /// * `image_tag` - Tag to apply to the built image
+    /// * `args` - Build arguments (--build-arg KEY=VALUE)
+    /// * `target` - Target build stage (--target STAGE)
+    /// * `options` - Additional build options to pass to the build command
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the build command fails.
+    fn build_with_args(
+        &self,
+        dockerfile_path: &Path,
+        context_path: &Path,
+        image_tag: &str,
+        args: &Option<std::collections::HashMap<String, String>>,
+        target: &Option<String>,
+        options: &Option<Vec<String>>,
+    ) -> Result<()>;
+
     /// Starts a container instance.
     ///
     /// # Arguments

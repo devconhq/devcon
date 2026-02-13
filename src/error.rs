@@ -134,6 +134,20 @@ pub enum Error {
     /// Generic error with custom message
     #[error("{0}")]
     Generic(String),
+
+    /// Missing required image or build configuration
+    #[error("Either 'image' or 'build.dockerfile' must be specified in devcontainer.json")]
+    MissingImageOrBuild,
+
+    /// Both image and build specified (mutually exclusive)
+    #[error(
+        "Cannot specify both 'image' and 'build' in devcontainer.json - they are mutually exclusive"
+    )]
+    MutuallyExclusiveImageBuild,
+
+    /// Dockerfile not found at specified path
+    #[error("Dockerfile not found at path: {0}")]
+    DockerfileNotFound(PathBuf),
 }
 
 /// A specialized `Result` type for DevCon operations.
