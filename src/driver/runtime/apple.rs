@@ -80,6 +80,25 @@ impl AppleRuntime {
 
 impl ContainerRuntime for AppleRuntime {
     fn build(&self, dockerfile_path: &Path, context_path: &Path, image_tag: &str) -> Result<()> {
+        self.build_with_args(
+            dockerfile_path,
+            context_path,
+            image_tag,
+            &None,
+            &None,
+            &None,
+        )
+    }
+
+    fn build_with_args(
+        &self,
+        dockerfile_path: &Path,
+        context_path: &Path,
+        image_tag: &str,
+        args: &Option<std::collections::HashMap<String, String>>,
+        target: &Option<String>,
+        options: &Option<Vec<String>>,
+    ) -> Result<()> {
         let mut cmd = Command::new("container");
         cmd.arg("build");
 
@@ -92,11 +111,28 @@ impl ContainerRuntime for AppleRuntime {
             cmd.arg("--cpus").arg(cpu);
         }
 
-        cmd.arg("-f")
-            .arg(dockerfile_path)
-            .arg("-t")
-            .arg(image_tag)
-            .arg(context_path)
+        cmd.arg("-f").arg(dockerfile_path).arg("-t").arg(image_tag);
+
+        // Add build arguments
+        if let Some(build_args) = args {
+            for (key, value) in build_args {
+                cmd.arg("--build-arg").arg(format!("{}={}", key, value));
+            }
+        }
+
+        // Add target stage if specified
+        if let Some(target_stage) = target {
+            cmd.arg("--target").arg(target_stage);
+        }
+
+        // Add additional options
+        if let Some(opts) = options {
+            for opt in opts {
+                cmd.arg(opt);
+            }
+        }
+
+        cmd.arg(context_path)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 

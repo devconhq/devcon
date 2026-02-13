@@ -66,7 +66,9 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tracing::{Level, debug, info, trace, warn};
 
-use crate::devcontainer::{FeatureRef, FeatureSource};
+use crate::devcontainer::{
+    FeatureRef, FeatureSource, resolve_context_path, resolve_dockerfile_path,
+};
 use crate::driver::agent::{self, AgentConfig};
 use crate::driver::feature_process::FeatureProcessResult;
 use crate::driver::runtime::RuntimeParameters;
@@ -515,6 +517,74 @@ fi
         let dockerfile = directory_path.join("Dockerfile");
         File::create(&dockerfile)?;
 
+        // Phase 1: Build user's Dockerfile if specified (otherwise use image)
+        let base_image = if let Some(build_config) = &devcontainer_workspace.devcontainer.build {
+            // Resolve paths relative to devcontainer.json location
+            let devcontainer_path = devcontainer_workspace
+                .path
+                .join(".devcontainer")
+                .join("devcontainer.json");
+            let devcontainer_dir = if devcontainer_path.exists() {
+                devcontainer_path.parent().unwrap().to_path_buf()
+            } else {
+                let alt_path = devcontainer_workspace.path.join("devcontainer.json");
+                if alt_path.exists() {
+                    alt_path.parent().unwrap().to_path_buf()
+                } else {
+                    // Check .devcontainer subfolders
+                    let devcontainer_parent = devcontainer_workspace.path.join(".devcontainer");
+                    if let Ok(entries) = fs::read_dir(&devcontainer_parent) {
+                        let mut found_dir = None;
+                        for entry in entries.flatten() {
+                            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                                let candidate = entry.path().join("devcontainer.json");
+                                if fs::exists(&candidate).unwrap_or(false) {
+                                    found_dir = candidate.parent().map(|p| p.to_path_buf());
+                                    break;
+                                }
+                            }
+                        }
+                        found_dir.unwrap_or_else(|| devcontainer_workspace.path.clone())
+                    } else {
+                        devcontainer_workspace.path.clone()
+                    }
+                }
+            };
+
+            let user_dockerfile = resolve_dockerfile_path(build_config, &devcontainer_dir);
+            let context = resolve_context_path(build_config, &devcontainer_dir);
+            let intermediate_tag = format!("{}-base", self.get_image_tag(&devcontainer_workspace));
+
+            info!(
+                "Building user Dockerfile from {} with context {}",
+                user_dockerfile.display(),
+                context.display()
+            );
+
+            // Build user's Dockerfile to intermediate image
+            self.runtime.build_with_args(
+                &user_dockerfile,
+                &context,
+                &intermediate_tag,
+                &build_config.args,
+                &build_config.target,
+                &build_config.options,
+            )?;
+
+            intermediate_tag
+        } else {
+            // Use image field as base
+            devcontainer_workspace
+                .devcontainer
+                .image
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::devcontainer("Neither 'image' nor 'build' configuration found")
+                })?
+                .clone()
+        };
+
+        // Phase 2: Build features Dockerfile using base_image
         let env = Environment::new();
         let template = env.template_from_str(
             r#"
@@ -566,7 +636,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
         };
 
         let contents = template.render(minijinja::context! {
-            image => &devcontainer_workspace.devcontainer.image,
+            image => &base_image,
             remote_user => remote_user_val,
             container_user => container_user_val,
             remote_user_home => remote_user_home,
