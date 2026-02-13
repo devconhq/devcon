@@ -110,6 +110,12 @@ pub fn handle_config_show() -> Result<()> {
 #   apple.buildMemory: Memory limit for Apple builds (default: 4g)
 #   apple.buildCpu: CPU limit for Apple builds (e.g., 2, 0.5)
 #
+# Agent Forwarding Settings (under 'agentForwarding'):
+#   sshEnabled: Enable SSH agent forwarding (true/false)
+#   gpgEnabled: Enable GPG agent forwarding (true/false)
+#   sshSocketPath: Override SSH agent socket path (auto-detected if unset)
+#   gpgSocketPath: Override GPG agent socket path (auto-detected if unset)
+#
 # Current Configuration:
 
 {}
