@@ -136,6 +136,37 @@ fn detect_gpg_socket() -> Option<PathBuf> {
     }
 }
 
+/// Detects the GitHub CLI configuration directory path.
+///
+/// Attempts to find the GitHub CLI config directory at `~/.config/gh`.
+/// Validates that the directory exists and contains a `hosts.yml` file.
+///
+/// # Returns
+///
+/// Returns `Some(PathBuf)` with the config directory path if found and valid, `None` otherwise.
+fn detect_gh_config() -> Option<PathBuf> {
+    let home_dir = std::env::var("HOME").ok()?;
+    let gh_config_dir = PathBuf::from(home_dir).join(".config").join("gh");
+
+    if !gh_config_dir.exists() {
+        debug!(
+            "GitHub CLI config directory not found at {:?}",
+            gh_config_dir
+        );
+        return None;
+    }
+
+    // Check if hosts.yml exists (this is where auth tokens are stored)
+    let hosts_file = gh_config_dir.join("hosts.yml");
+    if !hosts_file.exists() {
+        debug!("GitHub CLI hosts.yml not found, may not be authenticated");
+        return None;
+    }
+
+    debug!("Detected GitHub CLI config at: {:?}", gh_config_dir);
+    Some(gh_config_dir)
+}
+
 /// Applies a manual override to the feature installation order.
 ///
 /// Reorders features according to the specified feature IDs, keeping any
@@ -865,6 +896,41 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                     gpg_agent_mounted = true;
                 } else {
                     info!("GPG agent forwarding enabled but no socket found");
+                }
+            }
+
+            // GitHub CLI configuration forwarding
+            if agent_fwd.gh_enabled.unwrap_or(false) {
+                let gh_config = if let Some(ref override_path) = agent_fwd.gh_config_path {
+                    let path = PathBuf::from(override_path);
+                    if path.exists() {
+                        Some(path)
+                    } else {
+                        warn!(
+                            "GitHub CLI config override path '{}' does not exist",
+                            override_path
+                        );
+                        None
+                    }
+                } else {
+                    detect_gh_config()
+                };
+
+                if let Some(config_dir) = gh_config {
+                    info!("Forwarding GitHub CLI configuration into container");
+                    // Get the remote user from devcontainer or use default
+                    let remote_user = devcontainer_workspace
+                        .devcontainer
+                        .remote_user
+                        .as_deref()
+                        .unwrap_or("vscode");
+                    all_mounts.push(crate::devcontainer::Mount::String(format!(
+                        "{}:/home/{}/.config/gh",
+                        config_dir.display(),
+                        remote_user
+                    )));
+                } else {
+                    info!("GitHub CLI forwarding enabled but no configuration found");
                 }
             }
         }
