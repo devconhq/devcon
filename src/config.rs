@@ -537,6 +537,67 @@ pub struct RuntimeConfig {
     pub apple: Option<AppleRuntimeConfig>,
 }
 
+/// Agent forwarding configuration.
+///
+/// Controls whether SSH and/or GPG agent sockets are forwarded into containers.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentForwardingConfig {
+    /// Enable SSH agent forwarding.
+    ///
+    /// When enabled, the SSH_AUTH_SOCK socket will be mounted into the container.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_enabled: Option<bool>,
+
+    /// Enable GPG agent forwarding.
+    ///
+    /// When enabled, the GPG agent socket will be mounted into the container.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpg_enabled: Option<bool>,
+
+    /// Override SSH agent socket path.
+    ///
+    /// If not set, will auto-detect from SSH_AUTH_SOCK environment variable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_socket_path: Option<String>,
+
+    /// Override GPG agent socket path.
+    ///
+    /// If not set, will auto-detect using gpgconf.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpg_socket_path: Option<String>,
+}
+
+impl_property_registry! {
+    @mixed AgentForwardingConfig {
+        ssh_socket_path: Option<String> => {
+            path: "sshSocketPath",
+            property_type: PropertyType::String,
+            description: "Override SSH agent socket path (auto-detected if unset)",
+            validator: PropertyValidator::None,
+        },
+        gpg_socket_path: Option<String> => {
+            path: "gpgSocketPath",
+            property_type: PropertyType::String,
+            description: "Override GPG agent socket path (auto-detected if unset)",
+            validator: PropertyValidator::None,
+        }
+        ---
+        ssh_enabled: Option<bool> => {
+            path: "sshEnabled",
+            property_type: PropertyType::Boolean,
+            description: "Enable SSH agent forwarding into containers",
+            validator: PropertyValidator::None,
+        },
+        gpg_enabled: Option<bool> => {
+            path: "gpgEnabled",
+            property_type: PropertyType::Boolean,
+            description: "Enable GPG agent forwarding into containers",
+            validator: PropertyValidator::None,
+        }
+    }
+}
+
 /// Main configuration structure for DevCon.
 ///
 /// This structure holds user preferences and defaults that are applied
@@ -606,6 +667,12 @@ pub struct Config {
     /// Contains runtime-specific options for Docker and Apple container runtimes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_config: Option<RuntimeConfig>,
+
+    /// Agent forwarding configuration.
+    ///
+    /// Controls SSH and GPG agent socket forwarding into containers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_forwarding: Option<AgentForwardingConfig>,
 }
 
 fn default_runtime() -> String {
@@ -628,6 +695,7 @@ impl Default for Config {
             build_path: None,
             agents: None,
             runtime_config: None,
+            agent_forwarding: None,
         }
     }
 }
@@ -886,6 +954,11 @@ impl Config {
                 .get_property(rest);
         }
 
+        // Handle nested agentForwarding properties
+        if let Some(rest) = property.strip_prefix("agentForwarding.") {
+            return self.agent_forwarding.as_ref()?.get_property(rest);
+        }
+
         None
     }
 
@@ -939,6 +1012,12 @@ impl Config {
             return apple.set_property(rest, value);
         }
 
+        // Handle nested agentForwarding properties
+        if let Some(rest) = property.strip_prefix("agentForwarding.") {
+            let agent_forwarding = self.agent_forwarding.get_or_insert_with(Default::default);
+            return agent_forwarding.set_property(rest, value);
+        }
+
         Err(Error::unknown_property(property))
     }
 
@@ -985,6 +1064,14 @@ impl Config {
         {
             if let Some(apple) = runtime_config.apple.as_mut() {
                 return apple.unset_property(rest);
+            }
+            return Ok(());
+        }
+
+        // Handle nested agentForwarding properties
+        if let Some(rest) = property.strip_prefix("agentForwarding.") {
+            if let Some(agent_forwarding) = self.agent_forwarding.as_mut() {
+                return agent_forwarding.unset_property(rest);
             }
             return Ok(());
         }
@@ -1042,6 +1129,18 @@ impl Config {
         for meta in AppleRuntimeConfig::PROPERTIES {
             all_properties.push((
                 format!("runtimeConfig.apple.{}", meta.path),
+                match meta.property_type {
+                    PropertyType::String => "string".to_string(),
+                    PropertyType::Boolean => "boolean".to_string(),
+                },
+                meta.description.to_string(),
+            ));
+        }
+
+        // Add agentForwarding properties with prefix
+        for meta in AgentForwardingConfig::PROPERTIES {
+            all_properties.push((
+                format!("agentForwarding.{}", meta.path),
                 match meta.property_type {
                     PropertyType::String => "string".to_string(),
                     PropertyType::Boolean => "boolean".to_string(),

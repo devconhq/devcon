@@ -76,6 +76,66 @@ use crate::{
 };
 use std::path::PathBuf;
 
+/// Detects the SSH agent socket path from the environment.
+///
+/// Attempts to find the SSH agent socket using the SSH_AUTH_SOCK environment variable.
+/// Validates that the socket file exists on the filesystem.
+///
+/// # Returns
+///
+/// Returns `Some(PathBuf)` with the socket path if found and valid, `None` otherwise.
+fn detect_ssh_socket() -> Option<PathBuf> {
+    let socket_path = std::env::var("SSH_AUTH_SOCK").ok()?;
+    let path = PathBuf::from(&socket_path);
+
+    if path.exists() {
+        debug!("Detected SSH agent socket at: {}", socket_path);
+        Some(path)
+    } else {
+        warn!(
+            "SSH_AUTH_SOCK is set to '{}' but socket does not exist",
+            socket_path
+        );
+        None
+    }
+}
+
+/// Detects the GPG agent socket path using gpgconf.
+///
+/// Attempts to find the GPG agent socket by running `gpgconf --list-dir agent-socket`.
+/// Validates that the socket file exists on the filesystem.
+///
+/// # Returns
+///
+/// Returns `Some(PathBuf)` with the socket path if found and valid, `None` otherwise.
+fn detect_gpg_socket() -> Option<PathBuf> {
+    let output = std::process::Command::new("gpgconf")
+        .arg("--list-dir")
+        .arg("agent-socket")
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        debug!("gpgconf command failed, GPG agent socket not detected");
+        return None;
+    }
+
+    let socket_path = String::from_utf8(output.stdout).ok()?;
+    let socket_path = socket_path.trim();
+    let path = PathBuf::from(socket_path);
+
+    if path.exists() {
+        debug!("Detected GPG agent socket at: {}", socket_path);
+        Some(path)
+    } else {
+        warn!(
+            "gpgconf returned '{}' but socket does not exist",
+            socket_path
+        );
+        None
+    }
+}
+
 /// Applies a manual override to the feature installation order.
 ///
 /// Reorders features according to the specified feature IDs, keeping any
@@ -737,6 +797,78 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
             }
         }
 
+        // Track whether agent forwarding mounts were added (for environment variables later)
+        let mut ssh_agent_mounted = false;
+        let mut gpg_agent_mounted = false;
+
+        // Add agent forwarding mounts if configured
+        if let Some(ref agent_fwd) = self.config.agent_forwarding {
+            // SSH agent forwarding
+            if agent_fwd.ssh_enabled.unwrap_or(false) {
+                let ssh_socket = if let Some(ref override_path) = agent_fwd.ssh_socket_path {
+                    let path = PathBuf::from(override_path);
+                    if path.exists() {
+                        Some(path)
+                    } else {
+                        warn!(
+                            "SSH socket override path '{}' does not exist",
+                            override_path
+                        );
+                        None
+                    }
+                } else {
+                    detect_ssh_socket()
+                };
+
+                if let Some(socket) = ssh_socket {
+                    info!("Forwarding SSH agent socket into container");
+                    all_mounts.push(crate::devcontainer::Mount::String(format!(
+                        "{}:/ssh-agent",
+                        socket.display()
+                    )));
+                    ssh_agent_mounted = true;
+                } else {
+                    info!("SSH agent forwarding enabled but no socket found");
+                }
+            }
+
+            // GPG agent forwarding
+            if agent_fwd.gpg_enabled.unwrap_or(false) {
+                let gpg_socket = if let Some(ref override_path) = agent_fwd.gpg_socket_path {
+                    let path = PathBuf::from(override_path);
+                    if path.exists() {
+                        Some(path)
+                    } else {
+                        warn!(
+                            "GPG socket override path '{}' does not exist",
+                            override_path
+                        );
+                        None
+                    }
+                } else {
+                    detect_gpg_socket()
+                };
+
+                if let Some(socket) = gpg_socket {
+                    info!("Forwarding GPG agent socket into container");
+                    // Get the remote user from devcontainer or use default
+                    let remote_user = devcontainer_workspace
+                        .devcontainer
+                        .remote_user
+                        .as_deref()
+                        .unwrap_or("vscode");
+                    all_mounts.push(crate::devcontainer::Mount::String(format!(
+                        "{}:/home/{}/.gnupg/S.gpg-agent",
+                        socket.display(),
+                        remote_user
+                    )));
+                    gpg_agent_mounted = true;
+                } else {
+                    info!("GPG agent forwarding enabled but no socket found");
+                }
+            }
+        }
+
         // Check if container needs to run in privileged mode
         let requires_privileged = processed_features
             .iter()
@@ -753,6 +885,14 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                 let host_value = std::env::var(env_var).unwrap_or_default();
                 processed_env_vars.push(format!("{}={}", env_var, host_value));
             }
+        }
+
+        // Add environment variables for agent forwarding
+        if ssh_agent_mounted {
+            processed_env_vars.push("SSH_AUTH_SOCK=/ssh-agent".to_string());
+        }
+        if gpg_agent_mounted {
+            processed_env_vars.push("GPG_TTY=$(tty)".to_string());
         }
 
         // Handle port forward requests
