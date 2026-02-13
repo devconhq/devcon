@@ -158,6 +158,16 @@ enum Commands {
         )]
         env: Vec<String>,
     },
+    /// Display information about a devcontainer
+    #[command(about = "Display devcontainer status and configuration details")]
+    Info {
+        /// Path to the project directory containing .devcontainer configuration
+        #[arg(
+            help = "Path to the project directory. If not provided, uses current directory.",
+            value_name = "PATH"
+        )]
+        path: Option<PathBuf>,
+    },
     /// Prints the config file location path
     #[command(about = "Manage DevCon configuration")]
     Config {
@@ -235,6 +245,12 @@ fn main() -> devcon::error::Result<()> {
             handle_shell_command(
                 path.clone().unwrap_or(PathBuf::from(".").to_path_buf()),
                 env,
+                config_path,
+            )?;
+        }
+        Commands::Info { path } => {
+            handle_info_command(
+                path.clone().unwrap_or(PathBuf::from(".").to_path_buf()),
                 config_path,
             )?;
         }
