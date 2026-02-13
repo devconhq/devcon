@@ -37,7 +37,6 @@ pub fn is_runtime_available(runtime: Runtime) -> bool {
 
 /// Create an empty test config file in a temp directory
 /// Returns the path to the config file
-#[allow(unused)]
 pub fn create_test_config() -> std::path::PathBuf {
     let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
     let config_path = temp_dir.path().join("test-config.yaml");
@@ -78,7 +77,6 @@ pub fn create_test_devcontainer(name: &str, image: &str, features: Option<&str>)
 }
 
 /// Create a test devcontainer with a Dockerfile
-#[allow(dead_code)]
 pub fn create_test_devcontainer_with_dockerfile(name: &str, dockerfile_content: &str) -> TempDir {
     let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
     let devcontainer_path = temp_dir.path().join(".devcontainer");
@@ -107,7 +105,6 @@ pub fn create_test_devcontainer_with_dockerfile(name: &str, dockerfile_content: 
 }
 
 /// Create a test devcontainer with lifecycle hooks
-#[allow(dead_code)]
 pub fn create_test_devcontainer_with_hooks(
     name: &str,
     image: &str,
@@ -144,7 +141,6 @@ pub fn create_test_devcontainer_with_hooks(
 }
 
 /// Verify that a container image exists
-#[allow(dead_code)]
 pub fn verify_image_exists(runtime: Runtime, image_name: &str) -> bool {
     let cmd = runtime_cmd(runtime);
     let subcommand = match runtime {
@@ -213,7 +209,6 @@ pub fn cleanup_image(runtime: Runtime, image_name: &str) {
 }
 
 /// Execute a command inside a running container
-#[allow(dead_code)]
 pub fn exec_in_container(
     runtime: Runtime,
     container_name: &str,
