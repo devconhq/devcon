@@ -80,7 +80,7 @@ jobs:
           RUST_BACKTRACE: full
 
   integration-tests:
-    name: Integration Tests (${{ matrix.os }} - ${{ matrix.runtime }})
+    name: Integration Tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     needs: unit-tests
     timeout-minutes: 30
@@ -89,30 +89,13 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            runtime: docker
           - os: macos-latest
-            runtime: docker
-          - os: macos-latest
-            runtime: apple
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Docker (Linux)
-        if: matrix.os == 'ubuntu-latest'
+      - name: Set up Docker (Linux & macOS)
         uses: docker/setup-docker-action@v4
-
-      - name: Set up Docker (macOS)
-        if: matrix.os == 'macos-latest' && matrix.runtime == 'docker'
-        run: |
-          brew install docker
-          colima start
-
-      - name: Set up Apple Container Runtime (macOS)
-        if: matrix.os == 'macos-latest' && matrix.runtime == 'apple'
-        run: |
-          brew install container
-          container system start
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -140,18 +123,13 @@ jobs:
         run: cargo test --test main --verbose
         env:
           RUST_BACKTRACE: full
-          CONTAINER_RUNTIME: ${{ matrix.runtime }}
+          CONTAINER_RUNTIME: "docker"
 
       - name: Cleanup test containers
         if: always()
         run: |
-          if [ "${{ matrix.runtime }}" = "docker" ]; then
-            docker ps -a --filter "name=devcon-test" -q | xargs -r docker rm -f || true
-            docker images --filter "reference=devcon-test-*" -q | xargs -r docker rmi -f || true
-          elif [ "${{ matrix.runtime }}" = "apple" ]; then
-            container ps -a --filter "name=devcon-test" -q | xargs -r container rm -f || true
-            container image list --filter "reference=devcon-test-*" -q | xargs -r container image rm -f || true
-          fi
+          docker ps -a --filter "name=devcon-test" -q | xargs -r docker rm -f || true
+          docker images --filter "reference=devcon-test-*" -q | xargs -r docker rmi -f || true
         shell: bash
 
   lint:
