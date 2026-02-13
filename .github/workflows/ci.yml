@@ -32,8 +32,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
-    name: Test Suite
+  unit-tests:
+    name: Unit Tests
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -44,10 +44,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Set up Docker
-        id: docker-setup
-        uses: docker/setup-docker-action@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -73,17 +69,90 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Run tests
-        run: cargo test --verbose
+      - name: Run unit tests
+        run: cargo test --lib --bins --verbose
         env:
           RUST_BACKTRACE: full
-          DOCKER_SOCKET: ${{ steps.docker-setup.outputs.sock }}
 
-      - name: Run tests with all features
-        run: cargo test --all-features --verbose
+      - name: Run unit tests with all features
+        run: cargo test --lib --bins --all-features --verbose
         env:
           RUST_BACKTRACE: full
-          DOCKER_SOCKET: ${{ steps.docker-setup.outputs.sock }}
+
+  integration-tests:
+    name: Integration Tests (${{ matrix.os }} - ${{ matrix.runtime }})
+    runs-on: ${{ matrix.os }}
+    needs: unit-tests
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            runtime: docker
+          - os: macos-latest
+            runtime: docker
+          - os: macos-latest
+            runtime: apple
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        uses: docker/setup-docker-action@v4
+
+      - name: Set up Docker (macOS)
+        if: matrix.os == 'macos-latest' && matrix.runtime == 'docker'
+        run: |
+          brew install docker
+          colima start
+
+      - name: Set up Apple Container Runtime (macOS)
+        if: matrix.os == 'macos-latest' && matrix.runtime == 'apple'
+        run: |
+          brew install container
+          container system start
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "33.2"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Run integration tests
+        run: cargo test --test main --verbose
+        env:
+          RUST_BACKTRACE: full
+          CONTAINER_RUNTIME: ${{ matrix.runtime }}
+
+      - name: Cleanup test containers
+        if: always()
+        run: |
+          if [ "${{ matrix.runtime }}" = "docker" ]; then
+            docker ps -a --filter "name=devcon-test" -q | xargs -r docker rm -f || true
+            docker images --filter "reference=devcon-test-*" -q | xargs -r docker rmi -f || true
+          elif [ "${{ matrix.runtime }}" = "apple" ]; then
+            container ps -a --filter "name=devcon-test" -q | xargs -r container rm -f || true
+            container image list --filter "reference=devcon-test-*" -q | xargs -r container image rm -f || true
+          fi
+        shell: bash
 
   lint:
     name: Lint

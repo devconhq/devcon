@@ -78,8 +78,8 @@ fn get_runtime_specific_config(
 /// # Errors
 ///
 /// Returns an error if the config cannot be loaded or serialized.
-pub fn handle_config_show() -> Result<()> {
-    let config = Config::load()?;
+pub fn handle_config_show(config_path: Option<PathBuf>) -> Result<()> {
+    let config = Config::load(config_path)?;
 
     let yaml = yaml_serde::to_string(&config)?;
 
@@ -132,8 +132,8 @@ pub fn handle_config_show() -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if the config cannot be loaded or the property doesn't exist.
-pub fn handle_config_get(property: &str) -> Result<()> {
-    let config = Config::load()?;
+pub fn handle_config_get(property: &str, config_path: Option<PathBuf>) -> Result<()> {
+    let config = Config::load(config_path)?;
 
     match config.get_value(property) {
         Some(value) => {
@@ -153,8 +153,8 @@ pub fn handle_config_get(property: &str) -> Result<()> {
 ///
 /// Returns an error if the config cannot be loaded, the property is invalid,
 /// or the value fails validation.
-pub fn handle_config_set(property: &str, value: &str) -> Result<()> {
-    let mut config = Config::load()?;
+pub fn handle_config_set(property: &str, value: &str, config_path: Option<PathBuf>) -> Result<()> {
+    let mut config = Config::load(config_path)?;
 
     config.set_value(property, value.to_string())?;
     config.save()?;
@@ -168,8 +168,8 @@ pub fn handle_config_set(property: &str, value: &str) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if the config cannot be loaded or saved.
-pub fn handle_config_unset(property: &str) -> Result<()> {
-    let mut config = Config::load()?;
+pub fn handle_config_unset(property: &str, config_path: Option<PathBuf>) -> Result<()> {
+    let mut config = Config::load(config_path)?;
 
     config.unset_value(property)?;
     config.save()?;
@@ -183,8 +183,8 @@ pub fn handle_config_unset(property: &str) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error (with exit code 1) if any configuration values are invalid.
-pub fn handle_config_validate() -> Result<()> {
-    let config = Config::load()?;
+pub fn handle_config_validate(config_path: Option<PathBuf>) -> Result<()> {
+    let config = Config::load(config_path)?;
 
     match config.validate() {
         Ok(()) => {
@@ -289,8 +289,12 @@ pub fn handle_config_list(filter: Option<&str>) -> Result<()> {
 /// handle_build_command(project_path, None)?;
 /// # Ok::<(), devcon::error::Error>(())
 /// ```
-pub fn handle_build_command(path: PathBuf, build_path: Option<PathBuf>) -> Result<()> {
-    let config = Config::load()?;
+pub fn handle_build_command(
+    path: PathBuf,
+    build_path: Option<PathBuf>,
+    config_path: Option<PathBuf>,
+) -> Result<()> {
+    let config = Config::load(config_path)?;
 
     trace!("Config loaded {:?}", config);
     let devcontainer_workspace = Workspace::try_from(path)?;
@@ -348,8 +352,8 @@ pub fn handle_build_command(path: PathBuf, build_path: Option<PathBuf>) -> Resul
 /// handle_start_command(project_path)?;
 /// # Ok::<(), devcon::error::Error>(())
 /// ```
-pub fn handle_start_command(path: PathBuf) -> Result<()> {
-    let config = Config::load()?;
+pub fn handle_start_command(path: PathBuf, config_path: Option<PathBuf>) -> Result<()> {
+    let config = Config::load(config_path)?;
     trace!("Config loaded {:?}", config);
     let devcontainer_workspace = Workspace::try_from(path.clone())?;
 
@@ -376,8 +380,12 @@ pub fn handle_start_command(path: PathBuf) -> Result<()> {
 /// # Errors
 ///
 /// Currently always returns `Ok(())` as it's not implemented.
-pub fn handle_shell_command(path: PathBuf, _env: &[String]) -> Result<()> {
-    let config = Config::load()?;
+pub fn handle_shell_command(
+    path: PathBuf,
+    _env: &[String],
+    config_path: Option<PathBuf>,
+) -> Result<()> {
+    let config = Config::load(config_path)?;
     trace!("Config loaded {:?}", config);
     let devcontainer_workspace = Workspace::try_from(path.clone())?;
 
@@ -426,8 +434,12 @@ pub fn handle_shell_command(path: PathBuf, _env: &[String]) -> Result<()> {
 /// handle_up_command(project_path, None)?;
 /// # Ok::<(), devcon::error::Error>(())
 /// ```
-pub fn handle_up_command(path: PathBuf, build_path: Option<PathBuf>) -> Result<()> {
-    let config = Config::load()?;
+pub fn handle_up_command(
+    path: PathBuf,
+    build_path: Option<PathBuf>,
+    config_path: Option<PathBuf>,
+) -> Result<()> {
+    let config = Config::load(config_path)?;
     trace!("Config loaded {:?}", config);
     let devcontainer_workspace = Workspace::try_from(path)?;
 
@@ -480,8 +492,8 @@ pub fn handle_up_command(path: PathBuf, build_path: Option<PathBuf>) -> Result<(
 /// handle_serve_command(15000)?;
 /// # Ok::<(), devcon::error::Error>(())
 /// ```
-pub fn handle_serve_command(port: u16) -> Result<()> {
-    let config = Config::load()?;
+pub fn handle_serve_command(port: u16, config_path: Option<PathBuf>) -> Result<()> {
+    let config = Config::load(config_path)?;
     trace!("Config loaded {:?}", config);
 
     // Create runtime based on config

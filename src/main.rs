@@ -41,6 +41,10 @@ struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count)]
     debug: u8,
 
+    /// Custom config file path (overrides default config location)
+    #[arg(short, long, global = true, value_name = "FILE")]
+    config: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -204,43 +208,51 @@ fn main() -> devcon::error::Result<()> {
 
     trace!("Starting devcon with CLI args: {:?}", cli);
 
+    let config_path = cli.config.clone();
+
     match &cli.command {
         Commands::Build { path, build_path } => {
             handle_build_command(
                 path.clone().unwrap_or(PathBuf::from(".").to_path_buf()),
                 build_path.clone(),
+                config_path,
             )?;
         }
         Commands::Start { path } => {
-            handle_start_command(path.clone().unwrap_or(PathBuf::from(".").to_path_buf()))?;
+            handle_start_command(
+                path.clone().unwrap_or(PathBuf::from(".").to_path_buf()),
+                config_path,
+            )?;
         }
         Commands::Up { path, build_path } => {
             handle_up_command(
                 path.clone().unwrap_or(PathBuf::from(".").to_path_buf()),
                 build_path.clone(),
+                config_path,
             )?;
         }
         Commands::Shell { path, env } => {
             handle_shell_command(
                 path.clone().unwrap_or(PathBuf::from(".").to_path_buf()),
                 env,
+                config_path,
             )?;
         }
         Commands::Config { action } => match action {
             ConfigAction::Show => {
-                handle_config_show()?;
+                handle_config_show(config_path)?;
             }
             ConfigAction::Get { property } => {
-                handle_config_get(property)?;
+                handle_config_get(property, config_path)?;
             }
             ConfigAction::Set { property, value } => {
-                handle_config_set(property, value)?;
+                handle_config_set(property, value, config_path)?;
             }
             ConfigAction::Unset { property } => {
-                handle_config_unset(property)?;
+                handle_config_unset(property, config_path)?;
             }
             ConfigAction::Validate => {
-                handle_config_validate()?;
+                handle_config_validate(config_path)?;
             }
             ConfigAction::Path => {
                 handle_config_path()?;
@@ -250,7 +262,7 @@ fn main() -> devcon::error::Result<()> {
             }
         },
         Commands::Serve { port } => {
-            handle_serve_command(*port)?;
+            handle_serve_command(*port, config_path)?;
         }
     }
 

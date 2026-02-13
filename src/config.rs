@@ -725,14 +725,20 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Loads the configuration from the XDG config directory.
+    /// Loads the configuration from the XDG config directory or a custom path.
     ///
     /// This method looks for the config file at:
+    /// - The provided custom path (if `config_path` is Some)
     /// - `$XDG_CONFIG_HOME/devcon/config.yaml` (if XDG_CONFIG_HOME is set)
     /// - `~/.config/devcon/config.yaml` (default on Linux/macOS)
     /// - `%APPDATA%/devcon/config.yaml` (on Windows)
     ///
     /// If no config file exists, returns a default empty configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `config_path` - Optional custom path to config file. If provided, this path
+    ///   will be used instead of the default XDG config location.
     ///
     /// # Errors
     ///
@@ -744,14 +750,19 @@ impl Config {
     ///
     /// ```no_run
     /// # use devcon::config::Config;
-    /// let config = Config::load()?;
-    /// if let Some(dotfiles) = &config.dotfiles_repository {
-    ///     println!("Dotfiles repo: {}", dotfiles);
-    /// }
+    /// # use std::path::PathBuf;
+    /// // Load from default location
+    /// let config = Config::load(None)?;
+    ///
+    /// // Load from custom location
+    /// let custom_config = Config::load(Some(PathBuf::from("/tmp/test-config.yaml")))?;
     /// # Ok::<(), devcon::error::Error>(())
     /// ```
-    pub fn load() -> Result<Self> {
-        let config_path = Self::get_config_path()?;
+    pub fn load(config_path: Option<PathBuf>) -> Result<Self> {
+        let config_path = match config_path {
+            Some(path) => path,
+            None => Self::get_config_path()?,
+        };
 
         if !config_path.exists() {
             return Ok(Self::default());
