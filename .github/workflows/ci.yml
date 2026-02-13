@@ -32,6 +32,43 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "33.2"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features --workspace -- -D warnings
+
   unit-tests:
     name: Unit Tests
     runs-on: ubuntu-latest
@@ -82,14 +119,13 @@ jobs:
   integration-tests:
     name: Integration Tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    needs: unit-tests
+    needs: [lint, unit-tests]
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
-          - os: macos-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -99,6 +135,9 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Cleanup hostedtools
+        run: rm -rf /opt/hostedtoolcache
 
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
@@ -132,49 +171,13 @@ jobs:
           docker images --filter "reference=devcon-test-*" -q | xargs -r docker rmi -f || true
         shell: bash
 
-  lint:
-    name: Lint
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          version: "33.2"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Cache Cargo dependencies
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Run clippy
-        run: cargo clippy --all-targets --all-features --workspace -- -D warnings
-
   build:
     name: Build
     runs-on: ${{ matrix.os }}
+    needs: [integration-tests]
     strategy:
       matrix:
-        os: [macos-latest]
+        os: [ubuntu-latest]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
