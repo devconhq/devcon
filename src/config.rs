@@ -539,7 +539,7 @@ pub struct RuntimeConfig {
 
 /// Agent forwarding configuration.
 ///
-/// Controls whether SSH and/or GPG agent sockets are forwarded into containers.
+/// Controls whether SSH, GPG, and GitHub CLI credentials are forwarded into containers.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentForwardingConfig {
@@ -555,6 +555,12 @@ pub struct AgentForwardingConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gpg_enabled: Option<bool>,
 
+    /// Enable GitHub CLI (gh) authentication forwarding.
+    ///
+    /// When enabled, the GitHub CLI configuration directory will be mounted into the container.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gh_enabled: Option<bool>,
+
     /// Override SSH agent socket path.
     ///
     /// If not set, will auto-detect from SSH_AUTH_SOCK environment variable.
@@ -566,6 +572,12 @@ pub struct AgentForwardingConfig {
     /// If not set, will auto-detect using gpgconf.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gpg_socket_path: Option<String>,
+
+    /// Override GitHub CLI configuration directory path.
+    ///
+    /// If not set, will auto-detect from ~/.config/gh.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gh_config_path: Option<String>,
 }
 
 impl_property_registry! {
@@ -581,6 +593,12 @@ impl_property_registry! {
             property_type: PropertyType::String,
             description: "Override GPG agent socket path (auto-detected if unset)",
             validator: PropertyValidator::None,
+        },
+        gh_config_path: Option<String> => {
+            path: "ghConfigPath",
+            property_type: PropertyType::String,
+            description: "Override GitHub CLI config directory path (auto-detected if unset)",
+            validator: PropertyValidator::None,
         }
         ---
         ssh_enabled: Option<bool> => {
@@ -593,6 +611,12 @@ impl_property_registry! {
             path: "gpgEnabled",
             property_type: PropertyType::Boolean,
             description: "Enable GPG agent forwarding into containers",
+            validator: PropertyValidator::None,
+        },
+        gh_enabled: Option<bool> => {
+            path: "ghEnabled",
+            property_type: PropertyType::Boolean,
+            description: "Enable GitHub CLI authentication forwarding into containers",
             validator: PropertyValidator::None,
         }
     }
