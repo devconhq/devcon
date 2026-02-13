@@ -79,7 +79,13 @@ impl super::ContainerHandle for DockerContainerHandle {
 }
 
 impl ContainerRuntime for DockerRuntime {
-    fn build(&self, dockerfile_path: &Path, context_path: &Path, image_tag: &str, silent: bool) -> Result<()> {
+    fn build(
+        &self,
+        dockerfile_path: &Path,
+        context_path: &Path,
+        image_tag: &str,
+        silent: bool,
+    ) -> Result<()> {
         self.build_with_args(
             dockerfile_path,
             context_path,

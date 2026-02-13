@@ -189,10 +189,8 @@ pub fn stream_build_output(mut child: Child, silent: bool) -> Result<std::proces
             eprintln!("{}", line);
         }
         eprintln!("=== End of output ===\n");
-    } else {
-        if !silent {
-            println!("Building image complete");
-        }
+    } else if !silent {
+        println!("Building image complete");
     }
 
     Ok(result)
@@ -235,7 +233,13 @@ pub trait ContainerRuntime: Send {
     /// # Errors
     ///
     /// Returns an error if the build command fails.
-    fn build(&self, dockerfile_path: &Path, context_path: &Path, image_tag: &str, silent: bool) -> Result<()>;
+    fn build(
+        &self,
+        dockerfile_path: &Path,
+        context_path: &Path,
+        image_tag: &str,
+        silent: bool,
+    ) -> Result<()>;
 
     /// Builds a container image from a Dockerfile with additional build arguments.
     ///
@@ -255,6 +259,7 @@ pub trait ContainerRuntime: Send {
     /// # Errors
     ///
     /// Returns an error if the build command fails.
+    #[allow(clippy::too_many_arguments)]
     fn build_with_args(
         &self,
         dockerfile_path: &Path,
