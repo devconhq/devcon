@@ -222,7 +222,7 @@ fn apply_feature_order_override(
 /// and starting container instances based on devcontainer configurations.
 pub struct ContainerDriver {
     config: Config,
-    runtime: Box<dyn ContainerRuntime>,
+    pub runtime: Box<dyn ContainerRuntime>,
 }
 
 impl ContainerDriver {
@@ -762,7 +762,11 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
     /// # Ok(())
     /// # }
     /// ```
-    pub fn start(&self, devcontainer_workspace: Workspace, env_variables: &[String]) -> Result<()> {
+    pub fn start(
+        &self,
+        devcontainer_workspace: Workspace,
+        env_variables: &[String],
+    ) -> Result<String> {
         self.start_with_features(devcontainer_workspace, env_variables, None)
     }
 
@@ -788,15 +792,15 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
         devcontainer_workspace: Workspace,
         env_variables: &[String],
         processed_features: Option<Vec<FeatureProcessResult>>,
-    ) -> Result<()> {
+    ) -> Result<String> {
         let handles = self.runtime.list()?;
         let existing_handle = handles
             .iter()
             .find(|(name, _)| name == &self.get_container_name(&devcontainer_workspace));
 
-        if let Some((_, _)) = existing_handle {
+        if let Some((_, handle)) = existing_handle {
             info!("Container already running");
-            return Ok(());
+            return Ok(handle.id().to_string());
         }
 
         debug!("Checking for existing images");
@@ -1191,7 +1195,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
             None => { /* No onCreateCommand specified */ }
         };
 
-        Ok(())
+        Ok(handle.id().to_string())
     }
 
     /// Shells into a started container.

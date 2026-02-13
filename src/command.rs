@@ -363,9 +363,12 @@ pub fn handle_start_command(path: PathBuf, config_path: Option<PathBuf>) -> Resu
     let runtime = get_runtime_specific_config(&config, &runtime_name)?;
 
     let driver = ContainerDriver::new(config, runtime);
-    driver.start(devcontainer_workspace, &[])?;
+    let container_id = driver.start(devcontainer_workspace, &[])?;
 
-    println!("Container started. Agent listener running. Press Ctrl+C to stop.");
+    println!(
+        "Container started successfully. Container ID: {}",
+        container_id
+    );
 
     Ok(())
 }
@@ -465,9 +468,13 @@ pub fn handle_up_command(
     )?;
 
     // Start the container with pre-processed features
-    driver.start_with_features(devcontainer_workspace, &[], Some(processed_features))?;
+    let container_id =
+        driver.start_with_features(devcontainer_workspace, &[], Some(processed_features))?;
 
-    println!("Container built and started. Agent listener running. Press Ctrl+C to stop.");
+    println!(
+        "Container built and started. Container ID: {}",
+        container_id
+    );
 
     Ok(())
 }
@@ -513,6 +520,177 @@ pub fn handle_serve_command(port: u16, config_path: Option<PathBuf>) -> Result<(
         );
     }
     control_server::start_control_server(port)
+}
+
+/// Handles the info command to display devcontainer information.
+///
+/// This function displays:
+/// - Devcontainer configuration validation status
+/// - Features that will be installed
+/// - Whether a container image exists for this project
+/// - Whether a container is currently running for this project
+///
+/// # Arguments
+///
+/// * `path` - The path to the project directory containing `.devcontainer/devcontainer.json`
+/// * `config_path` - Optional path to the config file
+///
+/// # Errors
+///
+/// Returns an error if the devcontainer configuration cannot be loaded or parsed.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::path::PathBuf;
+/// # use devcon::command::handle_info_command;
+///
+/// let project_path = PathBuf::from("/path/to/project");
+/// handle_info_command(project_path, None)?;
+/// # Ok::<(), devcon::error::Error>(())
+/// ```
+pub fn handle_info_command(path: PathBuf, config_path: Option<PathBuf>) -> Result<()> {
+    let config = Config::load(config_path)?;
+    trace!("Config loaded {:?}", config);
+
+    // Try to load the devcontainer configuration
+    let devcontainer_workspace = match Workspace::try_from(path.clone()) {
+        Ok(workspace) => workspace,
+        Err(e) => {
+            println!("❌ Invalid devcontainer configuration");
+            println!("\nError: {}", e);
+            return Ok(());
+        }
+    };
+
+    println!("✓ Valid devcontainer configuration");
+    println!();
+
+    // Display basic information
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .set_content_arrangement(ContentArrangement::Dynamic);
+
+    table.set_header(vec![
+        Cell::new("Property").fg(Color::Green),
+        Cell::new("Value").fg(Color::Green),
+    ]);
+
+    table.add_row(vec![
+        Cell::new("Name"),
+        Cell::new(devcontainer_workspace.get_name()),
+    ]);
+
+    table.add_row(vec![
+        Cell::new("Path"),
+        Cell::new(devcontainer_workspace.path.display().to_string()),
+    ]);
+
+    if let Some(ref image) = devcontainer_workspace.devcontainer.image {
+        table.add_row(vec![Cell::new("Base Image"), Cell::new(image)]);
+    }
+
+    if let Some(ref build) = devcontainer_workspace.devcontainer.build {
+        if let Some(ref dockerfile) = build.dockerfile {
+            table.add_row(vec![Cell::new("Dockerfile"), Cell::new(dockerfile)]);
+        }
+    }
+
+    println!("{}", table);
+    println!();
+
+    // Display features
+    println!("Features to be installed:");
+    println!();
+
+    // Create runtime based on config
+    let runtime_name = config.resolve_runtime()?;
+    debug!("Using runtime {:?}", runtime_name);
+    let runtime = get_runtime_specific_config(&config, &runtime_name)?;
+
+    let driver = ContainerDriver::new(config, runtime);
+
+    match driver.prepare_features(&devcontainer_workspace) {
+        Ok((processed_features, _)) => {
+            if processed_features.is_empty() {
+                println!("  No features configured");
+            } else {
+                let mut features_table = Table::new();
+                features_table
+                    .load_preset(UTF8_FULL)
+                    .set_content_arrangement(ContentArrangement::Dynamic);
+
+                features_table.set_header(vec![
+                    Cell::new("#").fg(Color::Green),
+                    Cell::new("Feature").fg(Color::Green),
+                    Cell::new("ID").fg(Color::Green),
+                    Cell::new("Version").fg(Color::Green),
+                ]);
+
+                for (idx, feature) in processed_features.iter().enumerate() {
+                    features_table.add_row(vec![
+                        Cell::new((idx + 1).to_string()),
+                        Cell::new(feature.name()),
+                        Cell::new(&feature.feature.id),
+                        Cell::new(&feature.feature.version),
+                    ]);
+                }
+
+                println!("{}", features_table);
+            }
+        }
+        Err(e) => {
+            println!("  ⚠️  Failed to process features: {}", e);
+        }
+    }
+
+    println!();
+
+    // Check for existing image
+    let image_tag = format!(
+        "devcon-{}:latest",
+        devcontainer_workspace.get_sanitized_name()
+    );
+
+    match driver.runtime.images() {
+        Ok(images) => {
+            let image_exists = images.iter().any(|img| img == &image_tag);
+            if image_exists {
+                println!("✓ Container image exists: {}", image_tag);
+            } else {
+                println!("❌ Container image not found: {}", image_tag);
+                println!("   Run 'devcon build' to create the image");
+            }
+        }
+        Err(e) => {
+            println!("⚠️  Failed to check for images: {}", e);
+        }
+    }
+
+    // Check for running container
+    let container_name = format!("devcon.{}", devcontainer_workspace.get_sanitized_name());
+
+    match driver.runtime.list() {
+        Ok(containers) => {
+            let running_container = containers.iter().find(|(name, _)| name == &container_name);
+            if let Some((_, handle)) = running_container {
+                println!(
+                    "✓ Container is running: {} (ID: {})",
+                    container_name,
+                    handle.id()
+                );
+            } else {
+                println!("❌ No running container found");
+                println!("   Run 'devcon start' or 'devcon up' to start the container");
+            }
+        }
+        Err(e) => {
+            println!("⚠️  Failed to check for running containers: {}", e);
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
