@@ -307,6 +307,7 @@ impl ContainerDriver {
         // The agent's dependencies will be resolved along with all other features
         if !self.config.is_agent_disabled() {
             let agent_config = AgentConfig::new(
+                self.config.get_agent_use_binary(),
                 self.config.get_agent_binary_url().cloned(),
                 self.config.get_agent_git_repository().cloned(),
                 self.config.get_agent_git_branch().cloned(),
