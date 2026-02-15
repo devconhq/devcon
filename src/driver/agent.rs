@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
+use tracing::warn;
 
 /// Configuration for generating a devcontainer feature
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,13 +31,14 @@ pub struct AgentConfig {
 
 impl Default for AgentConfig {
     fn default() -> Self {
-        Self::new(None, None, None)
+        Self::new(true, None, None, None)
     }
 }
 
 impl AgentConfig {
     /// Create a new AgentConfig with optional binary URL and git settings
     pub fn new(
+        use_binary: bool,
         binary_url: Option<String>,
         git_repository: Option<String>,
         git_branch: Option<String>,
@@ -50,8 +52,10 @@ impl AgentConfig {
 set -e
 echo "Installing DevCon Agent..."
 
-{% if binary_url %}
+{% if use_binary %}
 # Download precompiled binary
+
+
 echo "Downloading precompiled agent from {{ binary_url }}..."
 curl -L -o /usr/local/bin/devcon-agent "{{ binary_url }}"
 chmod +x /usr/local/bin/devcon-agent
@@ -80,13 +84,47 @@ echo "DevCon Agent installed successfully."
             )
             .expect("Failed to create template");
 
-        let git_repo =
-            git_repository.unwrap_or_else(|| "https://github.com/devconhq/devcon.git".to_string());
-        let git_br = git_branch.unwrap_or_else(|| "main".to_string());
+        let git_repo = match use_binary {
+            false => Some(
+                git_repository
+                    .unwrap_or_else(|| "https://github.com/devconhq/devcon.git".to_string()),
+            ),
+            true => None,
+        };
+
+        let git_br = match use_binary {
+            false => Some(git_branch.unwrap_or_else(|| "main".to_string())),
+            true => None,
+        };
+
+        let enumerated_binary_url = match use_binary {
+            true => Some(binary_url.unwrap_or_else(|| {
+                    let arch = match std::env::consts::ARCH {
+                        "x86_64" => "x86_64",
+                        "aarch64" => "arm64",
+                        other => other,
+                    };
+                    reqwest::blocking::get("https://api.github.com/repos/devconhq/devcon/releases/latest")
+                        .and_then(|resp| resp.json::<serde_json::Value>())
+                        .ok()
+                        .and_then(|json| json.get("assets")?.as_array()?.iter().find_map(|asset| {
+                            let name = asset.get("name")?.as_str()?;
+                            if name.contains("devcon-agent") && name.ends_with(".tar.gz")&& name.contains(arch) && (name.contains("linux") || name.contains("ubuntu"))  {
+                                asset.get("browser_download_url")?.as_str().map(|s| s.to_string())
+                            } else {
+                                warn!("Failed to fetch latest release or find suitable asset, falling back to empty binary URL");
+                                None
+                            }
+                        }))
+                        .unwrap_or_default()
+                })),
+            false => None,
+        };
 
         let contents = template
             .render(minijinja::context! {
-                binary_url => binary_url,
+                use_binary => use_binary,
+                binary_url => enumerated_binary_url,
                 git_repository => git_repo,
                 git_branch => git_br,
             })
@@ -99,9 +137,9 @@ echo "DevCon Agent installed successfully."
             description: Some("DevCon Agent for managing devcontainer features".to_string()),
             install_script: contents,
             options: None,
-            binary_url,
-            git_repository: Some(git_repo),
-            git_branch: Some(git_br),
+            binary_url: enumerated_binary_url,
+            git_repository: git_repo,
+            git_branch: git_br,
         }
     }
 }
@@ -229,6 +267,7 @@ mod tests {
     #[test]
     fn test_agent_with_binary_url() {
         let config = AgentConfig::new(
+            true,
             Some("https://example.com/devcon-agent".to_string()),
             None,
             None,
@@ -246,6 +285,7 @@ mod tests {
     #[test]
     fn test_agent_with_git_repository() {
         let config = AgentConfig::new(
+            false,
             None,
             Some("https://github.com/custom/repo.git".to_string()),
             Some("develop".to_string()),
@@ -265,15 +305,16 @@ mod tests {
     fn test_agent_default_values() {
         let config = AgentConfig::default();
 
-        assert_eq!(config.binary_url, None);
-        assert!(config.git_repository.is_some());
-        assert!(config.git_branch.is_some());
-        assert!(config.install_script.contains("git clone"));
+        assert!(config.binary_url.is_some());
+        assert!(config.git_repository.is_none());
+        assert!(config.git_branch.is_none());
+        assert!(config.install_script.contains("curl"));
     }
 
     #[test]
     fn test_agent_with_binary_url_wont_install_dependencies() {
         let config = AgentConfig::new(
+            true,
             Some("https://example.com/devcon-agent".to_string()),
             None,
             None,
@@ -291,7 +332,7 @@ mod tests {
 
     #[test]
     fn test_agent_with_agent_compile_will_install_dependencies() {
-        let config = AgentConfig::new(None, None, None);
+        let config = AgentConfig::new(false, None, None, None);
 
         assert!(config.binary_url.is_none());
         let mut agent = Agent::new(config);

@@ -418,6 +418,13 @@ fn normalize_memory_value(value: &str) -> Result<String> {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentConfig {
+    /// Use Agent binary instead of compiling from source.
+    ///
+    /// If true, the agent will be downloaded from `binaryUrl`. If false, it will be compiled from `gitRepository`.
+    /// If not set, defaults to true
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub use_agent_binary: Option<bool>,
+
     /// Agent binary URL for precompiled agent.
     ///
     /// If set, the agent will be downloaded from this URL instead of being compiled.
@@ -467,6 +474,12 @@ impl_property_registry! {
             validator: PropertyValidator::None,
         }
         ---
+        use_agent_binary: Option<bool> => {
+            path: "useAgentBinary",
+            property_type: PropertyType::Boolean,
+            description: "Whether to use a precompiled agent binary (true) or compile from source (false)",
+            validator: PropertyValidator::None,
+        },
         disable: Option<bool> => {
             path: "disable",
             property_type: PropertyType::Boolean,
@@ -930,6 +943,13 @@ impl Config {
         } else {
             Ok(self.runtime.clone())
         }
+    }
+
+    pub fn get_agent_use_binary(&self) -> bool {
+        self.agents
+            .as_ref()
+            .and_then(|a| a.use_agent_binary)
+            .unwrap_or(true)
     }
 
     /// Gets the agent binary URL if configured.
