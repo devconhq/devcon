@@ -251,9 +251,14 @@ impl ContainerRuntime for AppleRuntime {
         command: Vec<&str>,
         env_vars: &[String],
         attach_stdin: bool,
+        attach_stdout: bool,
     ) -> Result<()> {
         let mut cmd = Command::new("container");
-        cmd.arg("exec").arg("-t");
+        cmd.arg("exec");
+
+        if attach_stdout {
+            cmd.arg("-t");
+        }
 
         if attach_stdin {
             cmd.arg("-i");

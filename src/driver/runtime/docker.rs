@@ -246,9 +246,14 @@ impl ContainerRuntime for DockerRuntime {
         command: Vec<&str>,
         env_vars: &[String],
         attach_stdin: bool,
+        attach_stdout: bool,
     ) -> Result<()> {
         let mut cmd = Command::new("docker");
-        cmd.arg("exec").arg("-t");
+        cmd.arg("exec");
+
+        if attach_stdout {
+            cmd.arg("-t");
+        }
 
         if attach_stdin {
             cmd.arg("-i");
@@ -258,9 +263,25 @@ impl ContainerRuntime for DockerRuntime {
             cmd.arg("-e").arg(env_var);
         }
 
-        let result = cmd.arg(container_handle.id()).args(command).status()?;
+        cmd.stdout(if attach_stdout {
+            Stdio::inherit()
+        } else {
+            Stdio::piped()
+        })
+        .stderr(if attach_stdout {
+            Stdio::inherit()
+        } else {
+            Stdio::piped()
+        })
+        .stdin(if attach_stdin {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        });
 
-        if result.code() != Some(0) {
+        let result = cmd.arg(container_handle.id()).args(command).output()?;
+
+        if result.status.code() != Some(0) {
             return Err(Error::runtime("Docker exec command failed"));
         }
 
