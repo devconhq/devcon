@@ -926,6 +926,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
         // Track whether agent forwarding mounts were added (for environment variables later)
         let mut ssh_agent_mounted = false;
         let mut gpg_agent_mounted = false;
+        let mut gpg_public_keyring_path: Option<PathBuf> = None;
 
         // Add agent forwarding mounts if configured
         if let Some(ref agent_fwd) = self.config.agent_forwarding {
@@ -988,6 +989,39 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                         socket.display(),
                         remote_user
                     )));
+
+                    // Export public keyring
+                    info!("Exporting GPG public keyring");
+                    let temp_dir = TempDir::new()?;
+                    let keyring_file = temp_dir.path().join("gpg-public-keys.asc");
+
+                    let export_output = std::process::Command::new("gpg")
+                        .arg("--export")
+                        .arg("--armor")
+                        .output()
+                        .map_err(|e| {
+                            Error::Generic(format!("Failed to export GPG public keys: {}", e))
+                        })?;
+
+                    if !export_output.status.success() {
+                        warn!(
+                            "Failed to export GPG public keys: {}",
+                            String::from_utf8_lossy(&export_output.stderr)
+                        );
+                    } else {
+                        fs::write(&keyring_file, export_output.stdout)?;
+                        debug!("GPG public keyring exported to: {:?}", keyring_file);
+
+                        // Mount the exported keyring into the container
+                        all_mounts.push(crate::devcontainer::Mount::String(format!(
+                            "{}:/tmp/gpg-public-keys.asc",
+                            keyring_file.display()
+                        )));
+
+                        // Keep track of the temp directory to prevent cleanup
+                        gpg_public_keyring_path = Some(temp_dir.keep());
+                    }
+
                     gpg_agent_mounted = true;
                 } else {
                     info!("GPG agent forwarding enabled but no socket found");
@@ -1108,6 +1142,56 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
             })?,
             None => { /* No onCreateCommand specified */ }
         };
+
+        // Fix file permissions on gpg agent socket
+        if gpg_agent_mounted {
+            debug!("Setting permissions on GPG agent socket inside container");
+            let remote_user = devcontainer_workspace
+                .devcontainer
+                .remote_user
+                .as_deref()
+                .unwrap_or("vscode");
+            self.runtime.exec(
+                handle.as_ref(),
+                vec![
+                    "bash",
+                    "-c",
+                    &format!("sudo chmod -R 0700 /home/{}/.gnupg && sudo chown -R $(id -u):$(id -g) /home/{}/.gnupg", remote_user, remote_user),
+                ],
+                &[],
+                false,
+            )?;
+
+            // Import GPG public keyring if it was exported
+            if gpg_public_keyring_path.is_some() {
+                info!("Importing GPG public keyring into container");
+                self.runtime.exec(
+                    handle.as_ref(),
+                    vec![
+                        "bash",
+                        "-c",
+                        "gpg --import /tmp/gpg-public-keys.asc 2>&1 || true",
+                    ],
+                    &[],
+                    false,
+                )?;
+            }
+        }
+
+        // Fix file permissions on ssh agent socket
+        if ssh_agent_mounted {
+            debug!("Setting permissions on SSH agent socket inside container");
+            self.runtime.exec(
+                handle.as_ref(),
+                vec![
+                    "bash",
+                    "-c",
+                    "sudo chmod 600 /ssh-agent && sudo chown $(id -u):$(id -g) /ssh-agent",
+                ],
+                &[],
+                false,
+            )?;
+        }
 
         // Add dotfiles setup if repository is provided
         if let Some(repo) = self.config.dotfiles_repository.as_deref() {
