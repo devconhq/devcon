@@ -57,6 +57,7 @@
 //! # }
 //! ```
 
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::path::Path;
 
@@ -1119,6 +1120,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                     vec!["bash", "-c", "-i", &wrapped_cmd],
                     &[],
                     false,
+                    true,
                 )?
             }
             Some(LifecycleCommand::Array(cmds)) => cmds.iter().try_for_each(|c| {
@@ -1128,6 +1130,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                     vec!["bash", "-c", "-i", &wrapped_cmd],
                     &[],
                     false,
+                    true,
                 )
             })?,
             Some(LifecycleCommand::Object(map)) => map.values().try_for_each(|cmd| {
@@ -1138,6 +1141,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                     vec!["bash", "-c", "-i", &wrapped_cmd],
                     &[],
                     false,
+                    true,
                 )
             })?,
             None => { /* No onCreateCommand specified */ }
@@ -1160,6 +1164,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                 ],
                 &[],
                 false,
+                    false,
             )?;
 
             // Import GPG public keyring if it was exported
@@ -1173,6 +1178,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                         "gpg --import /tmp/gpg-public-keys.asc 2>&1 || true",
                     ],
                     &[],
+                    false,
                     false,
                 )?;
             }
@@ -1189,6 +1195,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                     "sudo chmod 600 /ssh-agent && sudo chown $(id -u):$(id -g) /ssh-agent",
                 ],
                 &[],
+                false,
                 false,
             )?;
         }
@@ -1212,8 +1219,68 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                 ],
                 &[],
                 false,
+                false,
             )?;
         };
+
+        // Add gh token to environment if GitHub CLI forwarding enabled and token is available
+        if self
+            .config
+            .agent_forwarding
+            .as_ref()
+            .and_then(|a| a.gh_enabled)
+            .unwrap_or(false)
+        {
+            let output = std::process::Command::new("gh")
+                .args(["auth", "status", "--json", "hosts", "--show-token"])
+                .output()?;
+
+            if output.status.success() {
+                trace!(
+                    "GitHub CLI auth status: {}",
+                    String::from_utf8_lossy(&output.stdout)
+                );
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let auth_status: serde_json::Value = serde_json::from_str(&stdout)?;
+                let hosts = auth_status["hosts"]
+                    .as_object()
+                    .ok_or_else(|| Error::new("Unexpected auth status format".to_string()))?;
+
+                let mut tokens = HashMap::new();
+                for (_, info) in hosts {
+                    trace!(
+                        "Host: {}, Active: {}, Info: {:?}",
+                        info[0]["host"], info[0]["active"], info
+                    );
+                    if info[0]["active"].as_bool().unwrap_or(false) {
+                        tokens.insert(
+                            info[0]["host"].as_str().unwrap_or("").to_string(),
+                            info[0]["token"].as_str().unwrap_or("").to_string(),
+                        );
+                    }
+                }
+
+                for (host, token) in &tokens {
+                    debug!("Active GH host: {}, token: {}", host, token);
+                    self.runtime.exec(
+                        handle.as_ref(),
+                        vec![
+                            "bash",
+                            "-c",
+                            &format!(
+                                "gh auth login --hostname {} --with-token < <(echo {})",
+                                host, token
+                            ),
+                        ],
+                        &[],
+                        false,
+                        false,
+                    )?;
+                }
+            } else {
+                warn!("Failed to retrieve GitHub CLI auth token for forwarding");
+            }
+        }
 
         match &devcontainer_workspace.devcontainer.post_create_command {
             Some(LifecycleCommand::String(cmd)) => {
@@ -1223,6 +1290,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                     vec!["bash", "-c", "-i", &wrapped_cmd],
                     &[],
                     false,
+                    true,
                 )?
             }
             Some(LifecycleCommand::Array(cmds)) => cmds.iter().try_for_each(|c| {
@@ -1232,6 +1300,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                     vec!["bash", "-c", "-i", &wrapped_cmd],
                     &[],
                     false,
+                    true,
                 )
             })?,
             Some(LifecycleCommand::Object(map)) => map.values().try_for_each(|cmd| {
@@ -1242,6 +1311,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                     vec!["bash", "-c", "-i", &wrapped_cmd],
                     &[],
                     false,
+                    true,
                 )
             })?,
             None => { /* No onCreateCommand specified */ }
@@ -1263,6 +1333,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                         vec!["bash", "-c", "-i", &wrapped_cmd],
                         &[],
                         false,
+                        true,
                     )?;
                 }
                 Ok(())
@@ -1276,6 +1347,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                     vec!["bash", "-c", "-i", &wrapped_cmd],
                     &[],
                     false,
+                    true,
                 )?
             }
             Some(LifecycleCommand::Array(cmds)) => cmds.iter().try_for_each(|c| {
@@ -1285,6 +1357,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                     vec!["bash", "-c", "-i", &wrapped_cmd],
                     &[],
                     false,
+                    true,
                 )
             })?,
             Some(LifecycleCommand::Object(map)) => map.values().try_for_each(|cmd| {
@@ -1295,6 +1368,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                     vec!["bash", "-c", "-i", &wrapped_cmd],
                     &[],
                     false,
+                    true,
                 )
             })?,
             None => { /* No onCreateCommand specified */ }
@@ -1374,6 +1448,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                     vec!["bash", "-c", "-i", &wrapped_cmd],
                     &[],
                     false,
+                    true,
                 )?
             }
             Some(LifecycleCommand::Array(cmds)) => cmds.iter().try_for_each(|c| {
@@ -1383,6 +1458,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                     vec!["bash", "-c", "-i", &wrapped_cmd],
                     &[],
                     false,
+                    true,
                 )
             })?,
             Some(LifecycleCommand::Object(map)) => map.values().try_for_each(|cmd| {
@@ -1393,6 +1469,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                     vec!["bash", "-c", "-i", &wrapped_cmd],
                     &[],
                     false,
+                    true,
                 )
             })?,
             None => { /* No onCreateCommand specified */ }
@@ -1402,6 +1479,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
             handle.as_ref().unwrap().as_ref(),
             vec![&self.config.default_shell.as_deref().unwrap_or("zsh")],
             &processed_env_vars,
+            true,
             true,
         )?;
 

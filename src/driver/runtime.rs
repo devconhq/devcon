@@ -310,6 +310,7 @@ pub trait ContainerRuntime: Send {
         command: Vec<&str>,
         env_vars: &[String],
         attach_stdin: bool,
+        attach_stdout: bool,
     ) -> Result<()>;
 
     /// Lists running containers.
