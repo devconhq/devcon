@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
-use tracing::warn;
+use tracing::debug;
 
 /// Configuration for generating a devcontainer feature
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,25 +99,22 @@ echo "DevCon Agent installed successfully."
 
         let enumerated_binary_url = match use_binary {
             true => Some(binary_url.unwrap_or_else(|| {
-                    let arch = match std::env::consts::ARCH {
-                        "x86_64" => "x86_64",
-                        "aarch64" => "arm64",
-                        other => other,
-                    };
-                    reqwest::blocking::get("https://api.github.com/repos/devconhq/devcon/releases/latest")
-                        .and_then(|resp| resp.json::<serde_json::Value>())
-                        .ok()
-                        .and_then(|json| json.get("assets")?.as_array()?.iter().find_map(|asset| {
-                            let name = asset.get("name")?.as_str()?;
-                            if name.contains("devcon-agent") && name.ends_with(".tar.gz")&& name.contains(arch) && (name.contains("linux") || name.contains("ubuntu"))  {
-                                asset.get("browser_download_url")?.as_str().map(|s| s.to_string())
-                            } else {
-                                warn!("Failed to fetch latest release or find suitable asset, falling back to empty binary URL");
-                                None
-                            }
-                        }))
-                        .unwrap_or_default()
-                })),
+                debug!(
+                    "No binary URL provided, attempting to find latest release from this version"
+                );
+                let arch = match std::env::consts::ARCH {
+                    "x86_64" => "x86_64",
+                    "aarch64" => "arm64",
+                    other => other,
+                };
+
+                let version = env!("CARGO_PKG_VERSION");
+
+                format!(
+                    "https://github.com/devconhq/devcon/releases/download/v{}/devcon-agent-{}-{}.tar.gz",
+                    version, "linux", arch
+                )
+            })),
             false => None,
         };
 
