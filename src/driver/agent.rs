@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
-use tracing::debug;
 
 /// Configuration for generating a devcontainer feature
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,9 +54,27 @@ echo "Installing DevCon Agent..."
 {% if use_binary %}
 # Download precompiled binary
 
-
+{% if binary_url %}
 echo "Downloading precompiled agent from {{ binary_url }}..."
 curl -L -o /usr/local/bin/devcon-agent "{{ binary_url }}"
+{% else %}
+echo "No binary URL provided, using default release from GitHub..."
+arch=$(uname -m)
+if [[ $arch == x86_64* ]]; then
+    echo "X64 Architecture"
+    enumerated_arch="x86_64"
+elif [[ $arch == aarch64* ]] || [[ $arch == arm* ]]; then
+    echo "ARM Architecture"
+    enumerated_arch="arm64"
+else
+    echo "Unsupported architecture: $arch"
+    exit 1
+fi
+
+curl -L -o /usr/local/bin/devcon-agent \
+    "https://github.com/devconhq/devcon/releases/latest/download/devcon-agent-linux-${enumerated_arch}"
+
+{% endif %}
 chmod +x /usr/local/bin/devcon-agent
 {% else %}
 # Compile from source
@@ -97,31 +114,10 @@ echo "DevCon Agent installed successfully."
             true => None,
         };
 
-        let enumerated_binary_url = match use_binary {
-            true => Some(binary_url.unwrap_or_else(|| {
-                debug!(
-                    "No binary URL provided, attempting to find latest release from this version"
-                );
-                let arch = match std::env::consts::ARCH {
-                    "x86_64" => "x86_64",
-                    "aarch64" => "arm64",
-                    other => other,
-                };
-
-                let version = env!("CARGO_PKG_VERSION");
-
-                format!(
-                    "https://github.com/devconhq/devcon/releases/download/v{}/devcon-agent-{}-{}.tar.gz",
-                    version, "linux", arch
-                )
-            })),
-            false => None,
-        };
-
         let contents = template
             .render(minijinja::context! {
                 use_binary => use_binary,
-                binary_url => enumerated_binary_url,
+                binary_url => binary_url,
                 git_repository => git_repo,
                 git_branch => git_br,
             })
@@ -134,7 +130,7 @@ echo "DevCon Agent installed successfully."
             description: Some("DevCon Agent for managing devcontainer features".to_string()),
             install_script: contents,
             options: None,
-            binary_url: enumerated_binary_url,
+            binary_url: binary_url,
             git_repository: git_repo,
             git_branch: git_br,
         }
