@@ -45,8 +45,7 @@ impl AgentConfig {
         let env = Environment::new();
         let template = env
             .template_from_str(
-                r###"
-#!/bin/bash
+                r###"#!/usr/bin/env bash
 
 set -e
 echo "Installing DevCon Agent..."
@@ -130,7 +129,7 @@ echo "DevCon Agent installed successfully."
             description: Some("DevCon Agent for managing devcontainer features".to_string()),
             install_script: contents,
             options: None,
-            binary_url: binary_url,
+            binary_url,
             git_repository: git_repo,
             git_branch: git_br,
         }
@@ -298,7 +297,7 @@ mod tests {
     fn test_agent_default_values() {
         let config = AgentConfig::default();
 
-        assert!(config.binary_url.is_some());
+        assert!(config.binary_url.is_none());
         assert!(config.git_repository.is_none());
         assert!(config.git_branch.is_none());
         assert!(config.install_script.contains("curl"));
