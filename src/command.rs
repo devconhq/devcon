@@ -49,7 +49,7 @@ use crate::{
 use comfy_table::{Cell, Color, ContentArrangement, Table, presets::UTF8_FULL};
 use pidlock::Pidlock;
 use serde::Serialize;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace};
 
 /// Helper function to get runtime-specific config
 fn get_runtime_specific_config(
@@ -89,12 +89,10 @@ fn warn_if_serve_not_running() {
     };
     let running = lock.exists() && lock.is_active().unwrap_or(false);
     if !running {
-        warn!(
-            "The devcon control server is not running. Start it with 'devcon serve' to enable agent connections."
-        );
+        info!("The devcon control server is not running.");
         eprintln!(
             "⚠️  Warning: The devcon control server is not running. \
-             Start it with 'devcon serve' to enable agent connections and port forwarding."
+             Start it with 'devcon serve' in a seperate terminal to enable agent connections and port forwarding."
         );
         eprint!("Press Enter to continue...");
         let mut input = String::new();
