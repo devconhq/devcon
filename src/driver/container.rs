@@ -1236,10 +1236,6 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                 .output()?;
 
             if output.status.success() {
-                trace!(
-                    "GitHub CLI auth status: {}",
-                    String::from_utf8_lossy(&output.stdout)
-                );
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let auth_status: serde_json::Value = serde_json::from_str(&stdout)?;
                 let hosts = auth_status["hosts"]
@@ -1248,10 +1244,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
 
                 let mut tokens = HashMap::new();
                 for (_, info) in hosts {
-                    trace!(
-                        "Host: {}, Active: {}, Info: {:?}",
-                        info[0]["host"], info[0]["active"], info
-                    );
+                    trace!("Host: {}, Active: {}", info[0]["host"], info[0]["active"]);
                     if info[0]["active"].as_bool().unwrap_or(false) {
                         tokens.insert(
                             info[0]["host"].as_str().unwrap_or("").to_string(),
@@ -1261,7 +1254,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                 }
 
                 for (host, token) in &tokens {
-                    debug!("Active GH host: {}, token: {}", host, token);
+                    debug!("Active GH host: {}", host);
                     self.runtime.exec(
                         handle.as_ref(),
                         vec![
