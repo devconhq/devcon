@@ -1145,7 +1145,11 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
 
         match &devcontainer_workspace.devcontainer.on_create_command {
             Some(LifecycleCommand::String(cmd)) => {
-                let wrapped_cmd = self.wrap_once_lifecycle_command(&devcontainer_workspace, cmd, "onCreateCommand");
+                let wrapped_cmd = self.wrap_once_lifecycle_command(
+                    &devcontainer_workspace,
+                    cmd,
+                    "onCreateCommand",
+                );
                 self.runtime.exec(
                     handle.as_ref(),
                     vec!["bash", "-c", "-i", &wrapped_cmd],
@@ -1155,7 +1159,8 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                 )?
             }
             Some(LifecycleCommand::Array(cmds)) => cmds.iter().try_for_each(|c| {
-                let wrapped_cmd = self.wrap_once_lifecycle_command(&devcontainer_workspace, c, "onCreateCommand");
+                let wrapped_cmd =
+                    self.wrap_once_lifecycle_command(&devcontainer_workspace, c, "onCreateCommand");
                 self.runtime.exec(
                     handle.as_ref(),
                     vec!["bash", "-c", "-i", &wrapped_cmd],
@@ -1166,7 +1171,11 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
             })?,
             Some(LifecycleCommand::Object(map)) => map.values().try_for_each(|cmd| {
                 let cmd_str = cmd.to_command_string();
-                let wrapped_cmd = self.wrap_once_lifecycle_command(&devcontainer_workspace, &cmd_str, "onCreateCommand");
+                let wrapped_cmd = self.wrap_once_lifecycle_command(
+                    &devcontainer_workspace,
+                    &cmd_str,
+                    "onCreateCommand",
+                );
                 self.runtime.exec(
                     handle.as_ref(),
                     vec!["bash", "-c", "-i", &wrapped_cmd],
@@ -1296,7 +1305,11 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
 
         match &devcontainer_workspace.devcontainer.post_create_command {
             Some(LifecycleCommand::String(cmd)) => {
-                let wrapped_cmd = self.wrap_once_lifecycle_command(&devcontainer_workspace, cmd, "postCreateCommand");
+                let wrapped_cmd = self.wrap_once_lifecycle_command(
+                    &devcontainer_workspace,
+                    cmd,
+                    "postCreateCommand",
+                );
                 self.runtime.exec(
                     handle.as_ref(),
                     vec!["bash", "-c", "-i", &wrapped_cmd],
@@ -1306,7 +1319,11 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                 )?
             }
             Some(LifecycleCommand::Array(cmds)) => cmds.iter().try_for_each(|c| {
-                let wrapped_cmd = self.wrap_once_lifecycle_command(&devcontainer_workspace, c, "postCreateCommand");
+                let wrapped_cmd = self.wrap_once_lifecycle_command(
+                    &devcontainer_workspace,
+                    c,
+                    "postCreateCommand",
+                );
                 self.runtime.exec(
                     handle.as_ref(),
                     vec!["bash", "-c", "-i", &wrapped_cmd],
@@ -1317,7 +1334,11 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
             })?,
             Some(LifecycleCommand::Object(map)) => map.values().try_for_each(|cmd| {
                 let cmd_str = cmd.to_command_string();
-                let wrapped_cmd = self.wrap_once_lifecycle_command(&devcontainer_workspace, &cmd_str, "postCreateCommand");
+                let wrapped_cmd = self.wrap_once_lifecycle_command(
+                    &devcontainer_workspace,
+                    &cmd_str,
+                    "postCreateCommand",
+                );
                 self.runtime.exec(
                     handle.as_ref(),
                     vec!["bash", "-c", "-i", &wrapped_cmd],
@@ -1973,7 +1994,8 @@ mod tests {
             Box::new(DockerRuntime::new(DockerRuntimeConfig::default())),
         );
 
-        let result = driver.wrap_once_lifecycle_command(&workspace, "npm install", "onCreateCommand");
+        let result =
+            driver.wrap_once_lifecycle_command(&workspace, "npm install", "onCreateCommand");
 
         assert!(
             result.contains("/var/lib/devcon/lifecycle-markers/onCreateCommand"),
@@ -1981,7 +2003,10 @@ mod tests {
         );
         assert!(result.contains("if [ ! -f"), "missing if guard: {result}");
         assert!(result.contains("touch"), "missing touch: {result}");
-        assert!(result.contains("npm install"), "inner command missing: {result}");
+        assert!(
+            result.contains("npm install"),
+            "inner command missing: {result}"
+        );
     }
 
     #[test]
@@ -2005,7 +2030,8 @@ mod tests {
         );
 
         let oncreate = driver.wrap_once_lifecycle_command(&workspace, "echo hi", "onCreateCommand");
-        let postcreate = driver.wrap_once_lifecycle_command(&workspace, "echo hi", "postCreateCommand");
+        let postcreate =
+            driver.wrap_once_lifecycle_command(&workspace, "echo hi", "postCreateCommand");
 
         assert!(
             oncreate.contains("lifecycle-markers/onCreateCommand"),
@@ -2043,7 +2069,9 @@ mod tests {
 
         // The touch must come after && so it only runs when the command succeeds
         let touch_pos = result.find("touch").expect("touch not found");
-        let and_pos = result[..touch_pos].rfind("&&").expect("&& before touch not found");
+        let and_pos = result[..touch_pos]
+            .rfind("&&")
+            .expect("&& before touch not found");
         assert!(and_pos < touch_pos, "&& must precede touch");
     }
 
@@ -2056,7 +2084,10 @@ mod tests {
         );
         assert!(result.contains("if [ ! -f"), "missing if guard: {result}");
         assert!(result.contains("touch"), "missing touch: {result}");
-        assert!(result.contains("echo hello"), "inner command missing: {result}");
+        assert!(
+            result.contains("echo hello"),
+            "inner command missing: {result}"
+        );
     }
 
     #[test]
@@ -2086,7 +2117,9 @@ mod tests {
     fn test_guard_with_marker_touch_after_success() {
         let result = ContainerDriver::guard_with_marker("false", "someMarker");
         let touch_pos = result.find("touch").expect("touch not found");
-        let and_pos = result[..touch_pos].rfind("&&").expect("&& before touch not found");
+        let and_pos = result[..touch_pos]
+            .rfind("&&")
+            .expect("&& before touch not found");
         assert!(and_pos < touch_pos, "&& must precede touch");
     }
 }
