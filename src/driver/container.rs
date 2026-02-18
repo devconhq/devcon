@@ -1186,45 +1186,32 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                 .remote_user
                 .as_deref()
                 .unwrap_or("vscode");
-            self.runtime.exec(
-                handle.as_ref(),
-                vec![
-                    "bash",
-                    "-c",
-                    &format!("sudo chmod -R 0700 /home/{}/.gnupg && sudo chown -R $(id -u):$(id -g) /home/{}/.gnupg", remote_user, remote_user),
-                ],
-                &[],
-                false,
-                    false,
-            )?;
-
-            // Import GPG public keyring if it was exported
+            let mut gpg_cmd = format!(
+                "sudo chmod -R 0700 /home/{user}/.gnupg && sudo chown -R $(id -u):$(id -g) /home/{user}/.gnupg",
+                user = remote_user
+            );
             if gpg_public_keyring_path.is_some() {
                 info!("Importing GPG public keyring into container");
-                self.runtime.exec(
-                    handle.as_ref(),
-                    vec![
-                        "bash",
-                        "-c",
-                        "gpg --import /tmp/gpg-public-keys.asc 2>&1 || true",
-                    ],
-                    &[],
-                    false,
-                    false,
-                )?;
+                gpg_cmd.push_str(" && gpg --import /tmp/gpg-public-keys.asc 2>&1 || true");
             }
+            let guarded = Self::guard_with_marker(&gpg_cmd, "gpgAgentSetup");
+            self.runtime.exec(
+                handle.as_ref(),
+                vec!["bash", "-c", &guarded],
+                &[],
+                false,
+                false,
+            )?;
         }
 
         // Fix file permissions on ssh agent socket
         if ssh_agent_mounted {
             debug!("Setting permissions on SSH agent socket inside container");
+            let cmd = "sudo chmod 600 /ssh-agent && sudo chown $(id -u):$(id -g) /ssh-agent";
+            let guarded = Self::guard_with_marker(cmd, "sshAgentSetup");
             self.runtime.exec(
                 handle.as_ref(),
-                vec![
-                    "bash",
-                    "-c",
-                    "sudo chmod 600 /ssh-agent && sudo chown $(id -u):$(id -g) /ssh-agent",
-                ],
+                vec!["bash", "-c", &guarded],
                 &[],
                 false,
                 false,
@@ -1233,21 +1220,18 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
 
         // Add dotfiles setup if repository is provided
         if let Some(repo) = self.config.dotfiles_repository.as_deref() {
+            let dotfiles_cmd = format!(
+                "/dotfiles_helper.sh {} {}",
+                repo,
+                self.config
+                    .dotfiles_install_command
+                    .as_deref()
+                    .unwrap_or("")
+            );
+            let guarded = Self::guard_with_marker(dotfiles_cmd.trim(), "dotfilesSetup");
             self.runtime.exec(
                 handle.as_ref(),
-                vec![
-                    "/bin/sh",
-                    "-c",
-                    &format!(
-                        "/dotfiles_helper.sh {} {}",
-                        repo,
-                        self.config
-                            .dotfiles_install_command
-                            .as_deref()
-                            .unwrap_or("")
-                    )
-                    .trim(),
-                ],
+                vec!["bash", "-c", &guarded],
                 &[],
                 false,
                 false,
@@ -1284,18 +1268,22 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                     }
                 }
 
-                for (host, token) in &tokens {
-                    debug!("Active GH host: {}", host);
-                    self.runtime.exec(
-                        handle.as_ref(),
-                        vec![
-                            "bash",
-                            "-c",
-                            &format!(
+                if !tokens.is_empty() {
+                    let login_cmds: Vec<String> = tokens
+                        .iter()
+                        .map(|(host, token)| {
+                            debug!("Active GH host: {}", host);
+                            format!(
                                 "gh auth login --hostname {} --with-token < <(echo {})",
                                 host, token
-                            ),
-                        ],
+                            )
+                        })
+                        .collect();
+                    let combined = login_cmds.join(" && ");
+                    let guarded = Self::guard_with_marker(&combined, "ghForwarding");
+                    self.runtime.exec(
+                        handle.as_ref(),
+                        vec!["bash", "-c", &guarded],
                         &[],
                         false,
                         false,
@@ -1669,13 +1657,25 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
         cmd.to_string()
     }
 
-    /// Wraps a lifecycle command so it runs at most once, guarded by a marker file
-    /// inside the container at `/var/lib/devcon/lifecycle-markers/{hook_name}`.
+    /// Wraps a shell command string so it runs at most once inside the container,
+    /// guarded by a marker file at `/var/lib/devcon/lifecycle-markers/{marker_name}`.
     ///
-    /// The marker is created only when the command succeeds. With `--rm` (current
-    /// default) the container filesystem is discarded on stop, so the guard has no
-    /// effect today. Once containers are persisted across stop/start cycles the
-    /// marker will prevent once-only hooks from re-running on subsequent starts.
+    /// The marker is created only when the command succeeds (`&&`). With `--rm`
+    /// (current default) the container filesystem is discarded on stop, so the guard
+    /// has no effect today. Once containers are persisted across stop/start cycles the
+    /// marker will survive and prevent the command from re-running on subsequent starts.
+    fn guard_with_marker(cmd: &str, marker_name: &str) -> String {
+        let marker = format!("/var/lib/devcon/lifecycle-markers/{}", marker_name);
+        format!(
+            "MARKER='{}'; if [ ! -f \"$MARKER\" ]; then {}; mkdir -p \"$(dirname \"$MARKER\")\" && touch \"$MARKER\"; fi",
+            marker, cmd
+        )
+    }
+
+    /// Wraps a lifecycle command with environment setup and a once-only marker guard.
+    ///
+    /// Combines `wrap_lifecycle_command` (environment/cwd) with `guard_with_marker`
+    /// (run-once semantics).
     fn wrap_once_lifecycle_command(
         &self,
         devcontainer_workspace: &Workspace,
@@ -1683,11 +1683,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
         hook_name: &str,
     ) -> String {
         let inner = self.wrap_lifecycle_command(devcontainer_workspace, cmd);
-        let marker = format!("/var/lib/devcon/lifecycle-markers/{}", hook_name);
-        format!(
-            "MARKER='{}'; if [ ! -f \"$MARKER\" ]; then {}; mkdir -p \"$(dirname \"$MARKER\")\" && touch \"$MARKER\"; fi",
-            marker, inner
-        )
+        Self::guard_with_marker(&inner, hook_name)
     }
 }
 
@@ -2046,6 +2042,49 @@ mod tests {
         let result = driver.wrap_once_lifecycle_command(&workspace, "false", "onCreateCommand");
 
         // The touch must come after && so it only runs when the command succeeds
+        let touch_pos = result.find("touch").expect("touch not found");
+        let and_pos = result[..touch_pos].rfind("&&").expect("&& before touch not found");
+        assert!(and_pos < touch_pos, "&& must precede touch");
+    }
+
+    #[test]
+    fn test_guard_with_marker_contains_marker_path() {
+        let result = ContainerDriver::guard_with_marker("echo hello", "sshAgentSetup");
+        assert!(
+            result.contains("/var/lib/devcon/lifecycle-markers/sshAgentSetup"),
+            "marker path missing: {result}"
+        );
+        assert!(result.contains("if [ ! -f"), "missing if guard: {result}");
+        assert!(result.contains("touch"), "missing touch: {result}");
+        assert!(result.contains("echo hello"), "inner command missing: {result}");
+    }
+
+    #[test]
+    fn test_guard_with_marker_distinct_names() {
+        let ssh = ContainerDriver::guard_with_marker("chmod /ssh-agent", "sshAgentSetup");
+        let gpg = ContainerDriver::guard_with_marker("chmod .gnupg", "gpgAgentSetup");
+        let dots = ContainerDriver::guard_with_marker("/dotfiles_helper.sh", "dotfilesSetup");
+        let gh = ContainerDriver::guard_with_marker("gh auth login", "ghForwarding");
+
+        assert!(ssh.contains("lifecycle-markers/sshAgentSetup"));
+        assert!(gpg.contains("lifecycle-markers/gpgAgentSetup"));
+        assert!(dots.contains("lifecycle-markers/dotfilesSetup"));
+        assert!(gh.contains("lifecycle-markers/ghForwarding"));
+
+        // All four must be distinct
+        let all = [&ssh, &gpg, &dots, &gh];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "markers {i} and {j} must differ");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_guard_with_marker_touch_after_success() {
+        let result = ContainerDriver::guard_with_marker("false", "someMarker");
         let touch_pos = result.find("touch").expect("touch not found");
         let and_pos = result[..touch_pos].rfind("&&").expect("&& before touch not found");
         assert!(and_pos < touch_pos, "&& must precede touch");
