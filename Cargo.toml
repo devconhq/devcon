@@ -35,6 +35,7 @@ json-strip-comments = "3.1.0"
 comfy-table = "7.2.2"
 assert_cmd = "2.1.2"
 daemonize = "0.5"
+pidlock = "0.2.2"
 devcon-proto = { path = "proto" }
 
 [package]
@@ -78,6 +79,7 @@ strip-ansi-escapes.workspace = true
 sha2.workspace = true
 json-strip-comments.workspace = true
 comfy-table.workspace = true
+pidlock.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true
