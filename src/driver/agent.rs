@@ -20,6 +20,8 @@ pub struct AgentConfig {
     pub install_script: String,
     /// Additional options for the feature
     pub options: Option<serde_json::Value>,
+    /// Use binary or compile it
+    pub use_binary: bool,
     /// URL to download precompiled agent binary
     pub binary_url: Option<String>,
     /// Git repository URL for agent source
@@ -129,6 +131,7 @@ echo "DevCon Agent installed successfully."
             description: Some("DevCon Agent for managing devcontainer features".to_string()),
             install_script: contents,
             options: None,
+            use_binary,
             binary_url,
             git_repository: git_repo,
             git_branch: git_br,
@@ -160,7 +163,7 @@ impl Agent {
             .map_err(|e| Error::new(format!("{}: {}", "Failed to create feature directory", e)))?;
 
         // Generate devcontainer-feature.json
-        self.generate_feature_json(&feature_dir, self.config.binary_url.is_none())?;
+        self.generate_feature_json(&feature_dir, !self.config.use_binary)?;
 
         // Generate install.sh
         self.generate_install_script(&feature_dir)?;
@@ -243,6 +246,7 @@ mod tests {
             description: Some("A test feature".to_string()),
             install_script: "#!/bin/bash\necho 'Installing...'".to_string(),
             options: None,
+            use_binary: false,
             binary_url: None,
             git_repository: None,
             git_branch: None,
