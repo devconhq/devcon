@@ -47,8 +47,9 @@ use crate::{
     workspace::Workspace,
 };
 use comfy_table::{Cell, Color, ContentArrangement, Table, presets::UTF8_FULL};
+use pidlock::Pidlock;
 use serde::Serialize;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 /// Helper function to get runtime-specific config
 fn get_runtime_specific_config(
@@ -70,6 +71,35 @@ fn get_runtime_specific_config(
     };
 
     Ok(runtime)
+}
+
+/// Returns the path to the devcon serve PID file.
+fn get_pid_file_path() -> std::path::PathBuf {
+    dirs::runtime_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("devcon.pid")
+}
+
+/// Checks if the serve control server is running and warns the user if not.
+fn warn_if_serve_not_running() {
+    let pid_path = get_pid_file_path();
+    let lock = match Pidlock::new_validated(&pid_path) {
+        Ok(l) => l,
+        Err(_) => return,
+    };
+    let running = lock.exists() && lock.is_active().unwrap_or(false);
+    if !running {
+        warn!(
+            "The devcon control server is not running. Start it with 'devcon serve' to enable agent connections."
+        );
+        eprintln!(
+            "⚠️  Warning: The devcon control server is not running. \
+             Start it with 'devcon serve' to enable agent connections and port forwarding."
+        );
+        eprint!("Press Enter to continue...");
+        let mut input = String::new();
+        let _ = std::io::stdin().read_line(&mut input);
+    }
 }
 
 // ── JSON response structs ──────────────────────────────────────────────────
@@ -554,6 +584,7 @@ pub fn handle_start_command(
     config_path: Option<PathBuf>,
     output: OutputFormat,
 ) -> Result<()> {
+    warn_if_serve_not_running();
     let config = Config::load(config_path)?;
     trace!("Config loaded {:?}", config);
     let devcontainer_workspace = Workspace::try_from(path.clone())?;
@@ -649,6 +680,7 @@ pub fn handle_up_command(
     config_path: Option<PathBuf>,
     output: OutputFormat,
 ) -> Result<()> {
+    warn_if_serve_not_running();
     let config = Config::load(config_path)?;
     trace!("Config loaded {:?}", config);
     let devcontainer_workspace = Workspace::try_from(path)?;
@@ -714,6 +746,15 @@ pub fn handle_up_command(
 pub fn handle_serve_command(port: u16, config_path: Option<PathBuf>) -> Result<()> {
     let config = Config::load(config_path)?;
     trace!("Config loaded {:?}", config);
+
+    let pid_path = get_pid_file_path();
+    let mut pid_lock = Pidlock::new_validated(&pid_path)
+        .map_err(|e| Error::runtime(format!("Failed to create PID file: {e}")))?;
+    pid_lock.acquire().map_err(|e| {
+        Error::runtime(format!(
+            "Failed to acquire PID lock (is serve already running?): {e}"
+        ))
+    })?;
 
     // Create runtime based on config
     let runtime_name = config.resolve_runtime()?;
