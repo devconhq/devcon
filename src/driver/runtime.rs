@@ -317,13 +317,15 @@ pub trait ContainerRuntime: Send {
     ///
     /// # Returns
     ///
-    /// A vector of tuples containing (container_name, container_id) pairs.
+    /// A vector of tuples containing (container_name, image_tag, handle) triples.
     /// The container_name is extracted from the "devcon" label.
+    /// The image_tag is the image reference the container is running.
     ///
     /// # Errors
     ///
     /// Returns an error if the list command fails or output cannot be parsed.
-    fn list(&self) -> Result<Vec<(String, Box<dyn ContainerHandle>)>>;
+    #[allow(clippy::type_complexity)]
+    fn list(&self) -> Result<Vec<(String, String, Box<dyn ContainerHandle>)>>;
 
     /// List images.
     ///
@@ -335,6 +337,21 @@ pub trait ContainerRuntime: Send {
     ///
     /// Returns an error if the list images command fails or output cannot be parsed.
     fn images(&self) -> Result<Vec<String>>;
+
+    /// Get the image ID (digest) for a given image tag.
+    ///
+    /// # Arguments
+    ///
+    /// * `image_tag` - The image tag to look up (e.g. "devcon-myproject:latest")
+    ///
+    /// # Returns
+    ///
+    /// `Ok(Some(id))` if the image exists, `Ok(None)` if not found.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the inspect command fails unexpectedly.
+    fn image_id(&self, image_tag: &str) -> Result<Option<String>>;
 
     /// Get the host address for the runtime.
     ///

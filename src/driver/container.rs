@@ -62,6 +62,8 @@ use std::fs::{self, File};
 use std::path::Path;
 
 use crate::error::{Error, Result};
+use dialoguer::Select;
+use dialoguer::theme::ColorfulTheme;
 use minijinja::Environment;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -671,12 +673,23 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
 
         fs::write(&dockerfile, contents)?;
 
-        self.runtime.build(
-            &dockerfile,
-            &directory_path,
-            &self.get_image_tag(&devcontainer_workspace),
-            self.silent,
-        )?;
+        let base_tag = self.get_image_tag(&devcontainer_workspace);
+        let latest_tag = format!("{}:latest", base_tag);
+
+        // Generate a timestamp-based build tag so each build gets a unique identifier
+        let build_tag = {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            format!("{}:build-{}", base_tag, now.as_secs())
+        };
+
+        self.runtime
+            .build(&dockerfile, &directory_path, &latest_tag, self.silent)?;
+
+        // Also tag with the build timestamp so we can detect stale running containers
+        self.runtime
+            .build(&dockerfile, &directory_path, &build_tag, true)?;
 
         Ok(())
     }
@@ -816,21 +829,39 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
         processed_features: Option<Vec<FeatureProcessResult>>,
     ) -> Result<String> {
         let handles = self.runtime.list()?;
-        let existing_handle = handles
-            .iter()
-            .find(|(name, _)| name == &self.get_container_name(&devcontainer_workspace));
+        let container_name = self.get_container_name(&devcontainer_workspace);
+        let latest_tag = format!("{}:latest", self.get_image_tag(&devcontainer_workspace));
 
-        if let Some((_, handle)) = existing_handle {
-            info!("Container already running");
-            return Ok(handle.id().to_string());
+        let existing_handle = handles.iter().find(|(name, _, _)| name == &container_name);
+
+        if let Some((_, running_image, handle)) = existing_handle {
+            // Check whether the running container is using the current latest image
+            let latest_id = self.runtime.image_id(&latest_tag).unwrap_or(None);
+            let running_id = self.runtime.image_id(running_image).unwrap_or(None);
+
+            let is_current = match (&latest_id, &running_id) {
+                (Some(l), Some(r)) => l == r,
+                _ => {
+                    // Fall back to comparing the tag string directly
+                    running_image == &latest_tag
+                }
+            };
+
+            if is_current {
+                info!("Container already running with latest image");
+                return Ok(handle.id().to_string());
+            }
+
+            info!(
+                "Running container uses a stale image ({}), starting new container with latest",
+                running_image
+            );
         }
 
         debug!("Checking for existing images");
         let images = self.runtime.images()?;
         trace!("Images found: {:?}", images);
-        let already_built = images.iter().any(|image| {
-            image == &format!("{}:latest", self.get_image_tag(&devcontainer_workspace))
-        });
+        let already_built = images.iter().any(|image| image == &latest_tag);
         debug!("Image found: {}", already_built);
 
         if !already_built {
@@ -1101,7 +1132,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
         debug!("Starting container with ports: {:?}", ports);
 
         let handle = self.runtime.run(
-            &self.get_image_tag(&devcontainer_workspace),
+            &format!("{}:latest", self.get_image_tag(&devcontainer_workspace)),
             &volume_mount,
             &label,
             &processed_env_vars,
@@ -1407,19 +1438,53 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
     /// ```
     pub fn shell(&self, devcontainer_workspace: Workspace) -> Result<()> {
         let containers = self.runtime.list()?;
+        let container_name = self.get_container_name(&devcontainer_workspace);
 
-        let handle = containers
+        let matching: Vec<_> = containers
             .iter()
-            .find(|(container_name, _)| {
-                container_name == &self.get_container_name(&devcontainer_workspace)
-            })
-            .map(|(_, id)| id);
+            .filter(|(name, _, _)| name == &container_name)
+            .collect();
 
-        if handle.is_none() {
+        if matching.is_empty() {
             return Err(Error::new(
                 "Container not running. Run 'devcon start' or 'devcon up' first.".to_string(),
             ));
         }
+
+        let handle: &dyn crate::driver::runtime::ContainerHandle = if matching.len() == 1 {
+            matching[0].2.as_ref()
+        } else {
+            // Multiple containers running — let the user pick one
+            let latest_tag = format!("{}:latest", self.get_image_tag(&devcontainer_workspace));
+            let latest_id = self.runtime.image_id(&latest_tag).unwrap_or(None);
+
+            let items: Vec<String> = matching
+                .iter()
+                .map(|(_, img, h)| {
+                    let is_latest = latest_id
+                        .as_ref()
+                        .and_then(|lid| {
+                            self.runtime
+                                .image_id(img)
+                                .ok()
+                                .flatten()
+                                .map(|rid| lid == &rid)
+                        })
+                        .unwrap_or(img == &latest_tag);
+                    let marker = if is_latest { " [latest]" } else { " [stale]" };
+                    format!("{} ({}{})", h.id(), img, marker)
+                })
+                .collect();
+
+            let selection = Select::with_theme(&ColorfulTheme::default())
+                .with_prompt("Multiple containers running — select one to shell into")
+                .items(&items)
+                .default(0)
+                .interact()
+                .map_err(|e| Error::new(format!("Selection cancelled: {e}")))?;
+
+            matching[selection].2.as_ref()
+        };
 
         // Process environment variables
         let mut processed_env_vars = Vec::new();
@@ -1437,7 +1502,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
             Some(LifecycleCommand::String(cmd)) => {
                 let wrapped_cmd = self.wrap_lifecycle_command(&devcontainer_workspace, cmd);
                 self.runtime.exec(
-                    handle.as_ref().unwrap().as_ref(),
+                    handle,
                     vec!["bash", "-c", "-i", &wrapped_cmd],
                     &[],
                     false,
@@ -1447,7 +1512,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
             Some(LifecycleCommand::Array(cmds)) => cmds.iter().try_for_each(|c| {
                 let wrapped_cmd = self.wrap_lifecycle_command(&devcontainer_workspace, c);
                 self.runtime.exec(
-                    handle.as_ref().unwrap().as_ref(),
+                    handle,
                     vec!["bash", "-c", "-i", &wrapped_cmd],
                     &[],
                     false,
@@ -1458,18 +1523,18 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                 let cmd_str = cmd.to_command_string();
                 let wrapped_cmd = self.wrap_lifecycle_command(&devcontainer_workspace, &cmd_str);
                 self.runtime.exec(
-                    handle.as_ref().unwrap().as_ref(),
+                    handle,
                     vec!["bash", "-c", "-i", &wrapped_cmd],
                     &[],
                     false,
                     true,
                 )
             })?,
-            None => { /* No onCreateCommand specified */ }
+            None => { /* No postAttachCommand specified */ }
         };
 
         self.runtime.exec(
-            handle.as_ref().unwrap().as_ref(),
+            handle,
             vec![&self.config.default_shell.as_deref().unwrap_or("zsh")],
             &processed_env_vars,
             true,

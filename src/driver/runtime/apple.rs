@@ -280,7 +280,7 @@ impl ContainerRuntime for AppleRuntime {
         Ok(())
     }
 
-    fn list(&self) -> Result<Vec<(String, Box<dyn super::ContainerHandle>)>> {
+    fn list(&self) -> Result<Vec<(String, String, Box<dyn super::ContainerHandle>)>> {
         let output = Command::new("container")
             .arg("list")
             .arg("--format")
@@ -291,7 +291,7 @@ impl ContainerRuntime for AppleRuntime {
 
         let containers: Vec<serde_json::Value> = serde_json::from_str(&stdout)?;
 
-        let result: Vec<(String, Box<dyn super::ContainerHandle>)> = containers
+        let result: Vec<(String, String, Box<dyn super::ContainerHandle>)> = containers
             .iter()
             .filter_map(|container| {
                 trace!("Inspecting container: {}", container);
@@ -312,10 +312,17 @@ impl ContainerRuntime for AppleRuntime {
 
                 debug!("Found container with ID: {}", id);
 
+                let image_tag = container["configuration"]["image"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+
                 let container_name = format!("devcon.{}", project_name);
                 let handle = AppleContainerHandle { id };
                 Some((
                     container_name,
+                    image_tag,
                     Box::new(handle) as Box<dyn super::ContainerHandle>,
                 ))
             })
@@ -354,6 +361,30 @@ impl ContainerRuntime for AppleRuntime {
             .collect();
 
         Ok(result)
+    }
+
+    fn image_id(&self, image_tag: &str) -> Result<Option<String>> {
+        let output = Command::new("container")
+            .arg("image")
+            .arg("inspect")
+            .arg("--format")
+            .arg("json")
+            .arg(image_tag)
+            .output()?;
+
+        if !output.status.success() {
+            return Ok(None);
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let image: serde_json::Value =
+            serde_json::from_str(&stdout).unwrap_or(serde_json::Value::Null);
+        let id = image["digest"].as_str().unwrap_or("").trim().to_string();
+        if id.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(id))
+        }
     }
 
     fn get_host_address(&self) -> String {
