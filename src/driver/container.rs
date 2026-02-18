@@ -1145,7 +1145,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
 
         match &devcontainer_workspace.devcontainer.on_create_command {
             Some(LifecycleCommand::String(cmd)) => {
-                let wrapped_cmd = self.wrap_lifecycle_command(&devcontainer_workspace, cmd);
+                let wrapped_cmd = self.wrap_once_lifecycle_command(&devcontainer_workspace, cmd, "onCreateCommand");
                 self.runtime.exec(
                     handle.as_ref(),
                     vec!["bash", "-c", "-i", &wrapped_cmd],
@@ -1155,7 +1155,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                 )?
             }
             Some(LifecycleCommand::Array(cmds)) => cmds.iter().try_for_each(|c| {
-                let wrapped_cmd = self.wrap_lifecycle_command(&devcontainer_workspace, c);
+                let wrapped_cmd = self.wrap_once_lifecycle_command(&devcontainer_workspace, c, "onCreateCommand");
                 self.runtime.exec(
                     handle.as_ref(),
                     vec!["bash", "-c", "-i", &wrapped_cmd],
@@ -1166,7 +1166,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
             })?,
             Some(LifecycleCommand::Object(map)) => map.values().try_for_each(|cmd| {
                 let cmd_str = cmd.to_command_string();
-                let wrapped_cmd = self.wrap_lifecycle_command(&devcontainer_workspace, &cmd_str);
+                let wrapped_cmd = self.wrap_once_lifecycle_command(&devcontainer_workspace, &cmd_str, "onCreateCommand");
                 self.runtime.exec(
                     handle.as_ref(),
                     vec!["bash", "-c", "-i", &wrapped_cmd],
@@ -1308,7 +1308,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
 
         match &devcontainer_workspace.devcontainer.post_create_command {
             Some(LifecycleCommand::String(cmd)) => {
-                let wrapped_cmd = self.wrap_lifecycle_command(&devcontainer_workspace, cmd);
+                let wrapped_cmd = self.wrap_once_lifecycle_command(&devcontainer_workspace, cmd, "postCreateCommand");
                 self.runtime.exec(
                     handle.as_ref(),
                     vec!["bash", "-c", "-i", &wrapped_cmd],
@@ -1318,7 +1318,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                 )?
             }
             Some(LifecycleCommand::Array(cmds)) => cmds.iter().try_for_each(|c| {
-                let wrapped_cmd = self.wrap_lifecycle_command(&devcontainer_workspace, c);
+                let wrapped_cmd = self.wrap_once_lifecycle_command(&devcontainer_workspace, c, "postCreateCommand");
                 self.runtime.exec(
                     handle.as_ref(),
                     vec!["bash", "-c", "-i", &wrapped_cmd],
@@ -1329,7 +1329,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
             })?,
             Some(LifecycleCommand::Object(map)) => map.values().try_for_each(|cmd| {
                 let cmd_str = cmd.to_command_string();
-                let wrapped_cmd = self.wrap_lifecycle_command(&devcontainer_workspace, &cmd_str);
+                let wrapped_cmd = self.wrap_once_lifecycle_command(&devcontainer_workspace, &cmd_str, "postCreateCommand");
                 self.runtime.exec(
                     handle.as_ref(),
                     vec!["bash", "-c", "-i", &wrapped_cmd],
@@ -1668,6 +1668,27 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
     fn wrap_lifecycle_command(&self, _devcontainer_workspace: &Workspace, cmd: &str) -> String {
         cmd.to_string()
     }
+
+    /// Wraps a lifecycle command so it runs at most once, guarded by a marker file
+    /// inside the container at `/var/lib/devcon/lifecycle-markers/{hook_name}`.
+    ///
+    /// The marker is created only when the command succeeds. With `--rm` (current
+    /// default) the container filesystem is discarded on stop, so the guard has no
+    /// effect today. Once containers are persisted across stop/start cycles the
+    /// marker will prevent once-only hooks from re-running on subsequent starts.
+    fn wrap_once_lifecycle_command(
+        &self,
+        devcontainer_workspace: &Workspace,
+        cmd: &str,
+        hook_name: &str,
+    ) -> String {
+        let inner = self.wrap_lifecycle_command(devcontainer_workspace, cmd);
+        let marker = format!("/var/lib/devcon/lifecycle-markers/{}", hook_name);
+        format!(
+            "MARKER='{}'; if [ ! -f \"$MARKER\" ]; then {}; mkdir -p \"$(dirname \"$MARKER\")\" && touch \"$MARKER\"; fi",
+            marker, inner
+        )
+    }
 }
 
 #[cfg(test)]
@@ -1934,5 +1955,99 @@ mod tests {
         assert!(result.contains(&workspace.path.to_string_lossy().to_string()));
         assert!(result.contains(&devcontainer_id));
         assert!(!result.contains("${"));
+    }
+
+    #[test]
+    fn test_wrap_once_lifecycle_command_contains_marker_path() {
+        use crate::config::Config;
+        use crate::driver::runtime::docker::DockerRuntime;
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        fs::create_dir(temp_dir.path().join(".devcontainer")).unwrap();
+        fs::write(
+            temp_dir.path().join(".devcontainer/devcontainer.json"),
+            r#"{"image": "ubuntu:22.04"}"#,
+        )
+        .unwrap();
+        let workspace = Workspace::try_from(temp_dir.path().to_path_buf()).unwrap();
+        let driver = ContainerDriver::new(
+            Config::default(),
+            Box::new(DockerRuntime::new(DockerRuntimeConfig::default())),
+        );
+
+        let result = driver.wrap_once_lifecycle_command(&workspace, "npm install", "onCreateCommand");
+
+        assert!(
+            result.contains("/var/lib/devcon/lifecycle-markers/onCreateCommand"),
+            "marker path missing: {result}"
+        );
+        assert!(result.contains("if [ ! -f"), "missing if guard: {result}");
+        assert!(result.contains("touch"), "missing touch: {result}");
+        assert!(result.contains("npm install"), "inner command missing: {result}");
+    }
+
+    #[test]
+    fn test_wrap_once_lifecycle_command_hook_name_in_marker() {
+        use crate::config::Config;
+        use crate::driver::runtime::docker::DockerRuntime;
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        fs::create_dir(temp_dir.path().join(".devcontainer")).unwrap();
+        fs::write(
+            temp_dir.path().join(".devcontainer/devcontainer.json"),
+            r#"{"image": "ubuntu:22.04"}"#,
+        )
+        .unwrap();
+        let workspace = Workspace::try_from(temp_dir.path().to_path_buf()).unwrap();
+        let driver = ContainerDriver::new(
+            Config::default(),
+            Box::new(DockerRuntime::new(DockerRuntimeConfig::default())),
+        );
+
+        let oncreate = driver.wrap_once_lifecycle_command(&workspace, "echo hi", "onCreateCommand");
+        let postcreate = driver.wrap_once_lifecycle_command(&workspace, "echo hi", "postCreateCommand");
+
+        assert!(
+            oncreate.contains("lifecycle-markers/onCreateCommand"),
+            "onCreateCommand marker missing"
+        );
+        assert!(
+            postcreate.contains("lifecycle-markers/postCreateCommand"),
+            "postCreateCommand marker missing"
+        );
+        // Markers must be distinct
+        assert_ne!(oncreate, postcreate);
+    }
+
+    #[test]
+    fn test_wrap_once_lifecycle_command_marker_created_only_on_success() {
+        use crate::config::Config;
+        use crate::driver::runtime::docker::DockerRuntime;
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        fs::create_dir(temp_dir.path().join(".devcontainer")).unwrap();
+        fs::write(
+            temp_dir.path().join(".devcontainer/devcontainer.json"),
+            r#"{"image": "ubuntu:22.04"}"#,
+        )
+        .unwrap();
+        let workspace = Workspace::try_from(temp_dir.path().to_path_buf()).unwrap();
+        let driver = ContainerDriver::new(
+            Config::default(),
+            Box::new(DockerRuntime::new(DockerRuntimeConfig::default())),
+        );
+
+        let result = driver.wrap_once_lifecycle_command(&workspace, "false", "onCreateCommand");
+
+        // The touch must come after && so it only runs when the command succeeds
+        let touch_pos = result.find("touch").expect("touch not found");
+        let and_pos = result[..touch_pos].rfind("&&").expect("&& before touch not found");
+        assert!(and_pos < touch_pos, "&& must precede touch");
     }
 }
