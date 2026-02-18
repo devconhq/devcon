@@ -288,7 +288,7 @@ impl ContainerRuntime for DockerRuntime {
         Ok(())
     }
 
-    fn list(&self) -> Result<Vec<(String, Box<dyn super::ContainerHandle>)>> {
+    fn list(&self) -> Result<Vec<(String, String, Box<dyn super::ContainerHandle>)>> {
         let output = Command::new("docker")
             .arg("ps")
             .arg("--filter")
@@ -299,7 +299,7 @@ impl ContainerRuntime for DockerRuntime {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
 
-        let mut result: Vec<(String, Box<dyn super::ContainerHandle>)> = Vec::new();
+        let mut result: Vec<(String, String, Box<dyn super::ContainerHandle>)> = Vec::new();
 
         // Docker outputs one JSON object per line, not an array
         for line in stdout.lines() {
@@ -329,9 +329,15 @@ impl ContainerRuntime for DockerRuntime {
                 .trim()
                 .to_string();
 
+            let image_tag = container["Image"]
+                .as_str()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+
             if !container_name.is_empty() {
                 let handle = DockerContainerHandle { id: id.clone() };
-                result.push((container_name, Box::new(handle)));
+                result.push((container_name, image_tag, Box::new(handle)));
             }
         }
 
@@ -364,6 +370,27 @@ impl ContainerRuntime for DockerRuntime {
         }
 
         Ok(result)
+    }
+
+    fn image_id(&self, image_tag: &str) -> Result<Option<String>> {
+        let output = Command::new("docker")
+            .arg("image")
+            .arg("inspect")
+            .arg("--format")
+            .arg("{{.Id}}")
+            .arg(image_tag)
+            .output()?;
+
+        if !output.status.success() {
+            return Ok(None);
+        }
+
+        let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if id.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(id))
+        }
     }
 
     fn get_host_address(&self) -> String {

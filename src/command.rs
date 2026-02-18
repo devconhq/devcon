@@ -198,6 +198,8 @@ pub struct InfoResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container_running: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_is_latest: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub container_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container_id: Option<String>,
@@ -827,6 +829,7 @@ pub fn handle_info_command(
                     image_exists: None,
                     image_tag: None,
                     container_running: None,
+                    container_is_latest: None,
                     container_name: None,
                     container_id: None,
                 };
@@ -928,18 +931,27 @@ pub fn handle_info_command(
     println!();
 
     // Check for existing image
-    let image_tag = format!(
-        "devcon-{}:latest",
-        devcontainer_workspace.get_sanitized_name()
-    );
+    let base_image_name = format!("devcon-{}", devcontainer_workspace.get_sanitized_name());
+    let latest_tag = format!("{}:latest", base_image_name);
 
     match driver.runtime.images() {
         Ok(images) => {
-            let image_exists = images.iter().any(|img| img == &image_tag);
+            let image_exists = images.iter().any(|img| img == &latest_tag);
             if image_exists {
-                println!("✓ Container image exists: {}", image_tag);
+                println!("✓ Container image exists: {}", latest_tag);
+                // Show all build tags for this image
+                let build_tags: Vec<&String> = images
+                    .iter()
+                    .filter(|img| img.starts_with(&format!("{}:build-", base_image_name)))
+                    .collect();
+                if !build_tags.is_empty() {
+                    println!("  Build tags:");
+                    for tag in &build_tags {
+                        println!("    - {}", tag);
+                    }
+                }
             } else {
-                println!("❌ Container image not found: {}", image_tag);
+                println!("❌ Container image not found: {}", latest_tag);
                 println!("   Run 'devcon build' to create the image");
             }
         }
@@ -948,21 +960,35 @@ pub fn handle_info_command(
         }
     }
 
-    // Check for running container
+    // Check for running container(s)
     let container_name = format!("devcon.{}", devcontainer_workspace.get_sanitized_name());
+    let latest_id = driver.runtime.image_id(&latest_tag).unwrap_or(None);
 
     match driver.runtime.list() {
         Ok(containers) => {
-            let running_container = containers.iter().find(|(name, _)| name == &container_name);
-            if let Some((_, handle)) = running_container {
-                println!(
-                    "✓ Container is running: {} (ID: {})",
-                    container_name,
-                    handle.id()
-                );
-            } else {
+            let running: Vec<_> = containers
+                .iter()
+                .filter(|(name, _, _)| name == &container_name)
+                .collect();
+            if running.is_empty() {
                 println!("❌ No running container found");
                 println!("   Run 'devcon start' or 'devcon up' to start the container");
+            } else {
+                for (_, img, handle) in &running {
+                    let running_id = driver.runtime.image_id(img).unwrap_or(None);
+                    let is_current = match (&latest_id, &running_id) {
+                        (Some(l), Some(r)) => l == r,
+                        _ => img == &latest_tag,
+                    };
+                    let status = if is_current { "latest" } else { "stale" };
+                    println!(
+                        "✓ Container is running: {} (ID: {}, image: {}, {})",
+                        container_name,
+                        handle.id(),
+                        img,
+                        status,
+                    );
+                }
             }
         }
         Err(e) => {
@@ -1019,15 +1045,25 @@ fn handle_info_json(config: &Config, devcontainer_workspace: &Workspace) -> Resu
 
     // Container check
     let container_name = format!("devcon.{}", devcontainer_workspace.get_sanitized_name());
-    let (container_running, container_id) = match driver.runtime.list() {
+    let latest_id = driver.runtime.image_id(&image_tag).unwrap_or(None);
+    let (container_running, container_is_latest, container_id) = match driver.runtime.list() {
         Ok(containers) => {
-            let found = containers.iter().find(|(name, _)| name == &container_name);
+            let found = containers
+                .iter()
+                .find(|(name, _, _)| name == &container_name);
             match found {
-                Some((_, handle)) => (Some(true), Some(handle.id().to_string())),
-                None => (Some(false), None),
+                Some((_, img, handle)) => {
+                    let running_id = driver.runtime.image_id(img).unwrap_or(None);
+                    let is_current = match (&latest_id, &running_id) {
+                        (Some(l), Some(r)) => l == r,
+                        _ => img == &image_tag,
+                    };
+                    (Some(true), Some(is_current), Some(handle.id().to_string()))
+                }
+                None => (Some(false), None, None),
             }
         }
-        Err(_) => (None, None),
+        Err(_) => (None, None, None),
     };
 
     let response = InfoResponse {
@@ -1042,6 +1078,7 @@ fn handle_info_json(config: &Config, devcontainer_workspace: &Workspace) -> Resu
         image_exists,
         image_tag: Some(image_tag),
         container_running,
+        container_is_latest,
         container_name: Some(container_name),
         container_id,
     };
