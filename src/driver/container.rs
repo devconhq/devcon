@@ -699,7 +699,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
         process: &FeatureProcessResult,
         build_directory: &Path,
     ) -> Result<String> {
-        let feature_dest = build_directory.join(process.directory_name());
+        let feature_dest = build_directory.join(&process.feature.id);
 
         let mut options = fs_extra::dir::CopyOptions::new();
         options.overwrite = true;

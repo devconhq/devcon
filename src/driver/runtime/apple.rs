@@ -165,8 +165,8 @@ impl ContainerRuntime for AppleRuntime {
     ) -> Result<Box<dyn super::ContainerHandle>> {
         let mut cmd = Command::new("container");
         cmd.arg("run")
-            .arg("--rm")
             .arg("-d")
+            .arg("--rosetta") // TODO: autodetect / cli param to set this argument
             .arg("-v")
             .arg(volume_mount)
             .arg("-l")
@@ -174,7 +174,7 @@ impl ContainerRuntime for AppleRuntime {
 
         // Add privileged flag if required
         if runtime_parameters.requires_privileged {
-            cmd.arg("--privileged");
+            cmd.arg("--virtualization");
         }
 
         // Add environment variables
@@ -228,7 +228,13 @@ impl ContainerRuntime for AppleRuntime {
 
         // Add port forwards
         for port in runtime_parameters.ports {
-            cmd.arg("-p").arg(port.to_string());
+            let port_number = match port {
+                crate::devcontainer::ForwardPort::Port(port_number) => {
+                    format!("{}:{}", port_number, port_number)
+                }
+                crate::devcontainer::ForwardPort::HostPort(port) => port,
+            };
+            cmd.arg("-p").arg(port_number);
         }
 
         cmd.arg(image_tag);
@@ -236,7 +242,10 @@ impl ContainerRuntime for AppleRuntime {
         let result = cmd.output()?;
 
         if result.status.code() != Some(0) {
-            return Err(Error::runtime("Container start command failed"));
+            return Err(Error::runtime(format!(
+                "Container start command failed: {}",
+                &String::from_utf8(result.stderr).unwrap()
+            )));
         }
         std::thread::sleep(Duration::from_secs(10));
 
