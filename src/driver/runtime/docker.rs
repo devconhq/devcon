@@ -159,7 +159,6 @@ impl ContainerRuntime for DockerRuntime {
         trace!("Running Docker container with image: {}", image_tag);
         let mut cmd = Command::new("docker");
         cmd.arg("run")
-            .arg("--rm")
             .arg("-d")
             .arg("-v")
             .arg(volume_mount)
