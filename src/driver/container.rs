@@ -735,12 +735,18 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
         let mut env_file = File::create(&env_file_path)?;
         for (key, value) in feature_options.as_object().unwrap() {
             use std::io::Write;
-            writeln!(
-                env_file,
-                "export {}={}",
-                key.to_uppercase(),
-                value.as_str().unwrap_or("")
-            )?;
+
+            let val = if let Some(str_value) = value.as_str() {
+                str_value
+            } else if let Some(bool_value) = value.as_bool() {
+                if bool_value { "true" } else { "false" }
+            } else if let Some(num_value) = value.as_number() {
+                &format!("{}", num_value)
+            } else {
+                ""
+            };
+
+            writeln!(env_file, "export {}={}", key.to_uppercase(), val)?;
         }
 
         Ok(feature_dest
@@ -1713,6 +1719,7 @@ mod tests {
     use super::*;
     use crate::config::DockerRuntimeConfig;
     use crate::devcontainer::{FeatureRegistry, FeatureRegistryType, FeatureSource};
+    use crate::driver::runtime::docker::DockerRuntime;
     use crate::feature::Feature;
     use std::path::PathBuf;
 
@@ -2121,5 +2128,95 @@ mod tests {
             .rfind("&&")
             .expect("&& before touch not found");
         assert!(and_pos < touch_pos, "&& must precede touch");
+    }
+
+    #[test]
+    fn test_copy_feature_options_include_different_options() {
+        let feature_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().unwrap().keep();
+
+        let feature = Feature {
+            id: "base".to_string(),
+            version: "1.0.0".to_string(),
+            name: None,
+            description: None,
+            documentation_url: None,
+            license_url: None,
+            keywords: None,
+            options: Some(
+                serde_json::from_str(
+                    r#"
+{
+    "default": {
+        "type": "string",
+        "default": ""
+    },
+    "string": {
+        "type": "string",
+        "default": "test"
+    },
+    "bool": {
+        "type": "boolean",
+        "default": false
+    },
+    "int": {
+        "type": "string",
+        "default": "0"
+    }
+}"#,
+                )
+                .unwrap(),
+            ),
+            installs_after: None,
+            depends_on: None,
+            deprecated: None,
+            legacy_ids: None,
+            cap_add: None,
+            security_opt: None,
+            privileged: None,
+            init: None,
+            entrypoint: None,
+            mounts: None,
+            container_env: None,
+            customizations: None,
+            on_create_command: None,
+            update_content_command: None,
+            post_create_command: None,
+            post_start_command: None,
+            post_attach_command: None,
+        };
+
+        let options =
+            serde_json::from_str(r#"{ "string": "hello", "bool":true, "int": 42 }"#).unwrap();
+
+        let feature_ref = FeatureRef {
+            source: FeatureSource::Local {
+                path: feature_dir.path().to_path_buf(),
+            },
+            options,
+        };
+        let feature_process_result = FeatureProcessResult {
+            feature_ref,
+            feature,
+            path: feature_dir.path().to_path_buf(),
+        };
+
+        let driver = ContainerDriver::new(
+            Config::default(),
+            Box::new(DockerRuntime::new(DockerRuntimeConfig::default())),
+        );
+
+        let result = driver.copy_feature_to_build(&feature_process_result, temp_dir.as_path());
+
+        assert!(result.is_ok());
+        assert!(std::fs::exists(temp_dir.join("base").join("devcontainer-features.env")).unwrap());
+
+        let content =
+            std::fs::read_to_string(temp_dir.join("base").join("devcontainer-features.env"))
+                .unwrap();
+        assert_eq!(
+            "export BOOL=true\nexport DEFAULT=\nexport INT=42\nexport STRING=hello\n",
+            content
+        );
     }
 }
