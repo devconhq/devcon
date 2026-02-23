@@ -2,6 +2,12 @@ syntax = "proto3";
 
 package devcon;
 
+// Message from agent to host identifying the container
+message AgentHello {
+  string container_name = 1;
+  string workspace_name = 2;
+}
+
 // Message from agent to host to request port forwarding
 message StartPortForward {
   uint32 port = 1;
@@ -31,5 +37,6 @@ message AgentMessage {
     StopPortForward stop_port_forward = 2;
     OpenUrl open_url = 3;
     TunnelRequest tunnel_request = 4;
+    AgentHello agent_hello = 5;
   }
 }

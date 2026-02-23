@@ -34,12 +34,14 @@
 //! - Handling errors and returning results
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::output::OutputFormat;
 use crate::{
     config::Config,
     driver::{
+        self,
         container::ContainerDriver,
         control_server,
         runtime::{apple::AppleRuntime, docker::DockerRuntime},
@@ -743,7 +745,11 @@ pub fn handle_up_command(
 /// handle_serve_command(15000, None)?;
 /// # Ok::<(), devcon::error::Error>(())
 /// ```
-pub fn handle_serve_command(port: u16, config_path: Option<PathBuf>) -> Result<()> {
+pub fn handle_serve_command(
+    port: u16,
+    config_path: Option<PathBuf>,
+    status_mode: Option<crate::StatusMode>,
+) -> Result<()> {
     let config = Config::load(config_path)?;
     trace!("Config loaded {:?}", config);
 
@@ -772,7 +778,22 @@ pub fn handle_serve_command(port: u16, config_path: Option<PathBuf>) -> Result<(
             "   More info: https://github.com/apple/container/blob/main/docs/how-to.md#access-a-host-service-from-a-container"
         );
     }
-    control_server::start_control_server(port)
+
+    // Create status callback based on mode
+    let status_callback: Option<driver::control_server::StatusCallback> = status_mode.map(|mode| {
+        use crate::StatusMode;
+        let callback: driver::control_server::StatusCallback = match mode {
+            StatusMode::Inline => Arc::new(|forwards| {
+                driver::control_server::display_forwards_inline(forwards);
+            }),
+            StatusMode::Fullscreen => Arc::new(|forwards| {
+                driver::control_server::display_forwards_fullscreen(forwards);
+            }),
+        };
+        callback
+    });
+
+    control_server::start_control_server(port, status_callback)
 }
 
 /// Handles the info command to display devcontainer information.

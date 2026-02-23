@@ -4,7 +4,9 @@
 
 use clap::{Parser, Subcommand};
 use daemonize::Daemonize;
-use devcon_proto::{AgentMessage, OpenUrl, StartPortForward, StopPortForward, agent_message};
+use devcon_proto::{
+    AgentHello, AgentMessage, OpenUrl, StartPortForward, StopPortForward, agent_message,
+};
 use prost::Message;
 use std::collections::HashSet;
 use std::fs::File;
@@ -70,6 +72,10 @@ enum Commands {
         /// Port scan interval in seconds
         #[arg(long, default_value = "1")]
         scan_interval: u64,
+
+        /// Run in foreground (don't daemonize)
+        #[arg(long, default_value = "false")]
+        foreground: bool,
     },
 }
 
@@ -280,6 +286,27 @@ fn run_daemon(
 ) -> io::Result<()> {
     let mut stream = connect_to_control_server(host, port)?;
     eprintln!("Connected to control server");
+
+    // Send AgentHello message to identify this container
+    let workspace_name =
+        std::env::var("DEVCON_WORKSPACE_NAME").unwrap_or_else(|_| "unknown".to_string());
+    let container_name = std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let hello_msg = AgentMessage {
+        message: Some(agent_message::Message::AgentHello(AgentHello {
+            container_name: container_name.clone(),
+            workspace_name: workspace_name.clone(),
+        })),
+    };
+    send_message(&mut stream, &hello_msg)?;
+    eprintln!(
+        "Sent AgentHello: container={}, workspace={}",
+        container_name, workspace_name
+    );
 
     // Set read timeout to allow checking channel messages periodically
     stream.set_read_timeout(Some(Duration::from_millis(100)))?;
@@ -505,40 +532,52 @@ fn main() {
                 Err(e) => Err(e),
             }
         }
-        Commands::Daemon { scan_interval } => {
-            // Daemonize the process
-            let daemonize = Daemonize::new();
+        Commands::Daemon {
+            scan_interval,
+            foreground,
+        } => {
+            // We're now in the child process
+            // Parse excluded ports from CLI arg or environment variable
+            let mut excluded_ports = HashSet::new();
 
-            match daemonize.start() {
-                Ok(_) => {
-                    // We're now in the child process
-                    // Parse excluded ports from CLI arg or environment variable
-                    let mut excluded_ports = HashSet::new();
-
-                    if let Some(ports) = cli.exclude_ports {
-                        excluded_ports.extend(ports);
-                    } else if let Ok(env_ports) = std::env::var("DEVCON_FORWARDED_PORTS") {
-                        for port_str in env_ports.split(',') {
-                            if let Ok(port) = port_str.trim().parse::<u16>() {
-                                excluded_ports.insert(port);
-                            }
-                        }
+            if let Some(ports) = cli.exclude_ports {
+                excluded_ports.extend(ports);
+            } else if let Ok(env_ports) = std::env::var("DEVCON_FORWARDED_PORTS") {
+                for port_str in env_ports.split(',') {
+                    if let Ok(port) = port_str.trim().parse::<u16>() {
+                        excluded_ports.insert(port);
                     }
+                }
+            }
 
-                    if !excluded_ports.is_empty() {
-                        eprintln!("Excluding ports from auto-forwarding: {:?}", excluded_ports);
-                    }
+            if !excluded_ports.is_empty() {
+                eprintln!("Excluding ports from auto-forwarding: {:?}", excluded_ports);
+            }
 
-                    run_daemon(
+            if foreground {
+                eprintln!("Running in foreground mode (not daemonized)");
+                run_daemon(
+                    &cli.control_host,
+                    cli.control_port,
+                    scan_interval,
+                    excluded_ports,
+                )
+            } else {
+                eprintln!("Running in daemon mode");
+                // Daemonize the process
+                let daemonize = Daemonize::new();
+
+                match daemonize.start() {
+                    Ok(_) => run_daemon(
                         &cli.control_host,
                         cli.control_port,
                         scan_interval,
                         excluded_ports,
-                    )
-                }
-                Err(e) => {
-                    eprintln!("Failed to daemonize: {}", e);
-                    Err(io::Error::other(e))
+                    ),
+                    Err(e) => {
+                        eprintln!("Failed to daemonize: {}", e);
+                        Err(io::Error::other(e))
+                    }
                 }
             }
         }

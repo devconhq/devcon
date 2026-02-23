@@ -26,6 +26,7 @@
 //! container agents and manages port forwarding requests.
 
 use crate::error::{Error, Result};
+use comfy_table::{Cell, Color, Table};
 use devcon_proto::AgentMessage;
 use devcon_proto::agent_message::Message as ProtoMessage;
 use prost::Message;
@@ -37,23 +38,73 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use tracing::{debug, error, info, warn};
 
-/// Type alias for a port forward entry containing the agent stream, container port, tunnel ID counter, and data port
-type ForwardEntry = (Arc<Mutex<TcpStream>>, u16, Arc<AtomicU32>, u16);
+/// Container identification information
+#[derive(Debug, Clone)]
+struct ContainerInfo {
+    container_name: String,
+    workspace_name: String,
+}
+
+/// Display-friendly port forward information
+#[derive(Debug, Clone)]
+pub struct PortForwardInfo {
+    pub local_port: u16,
+    pub container_port: u16,
+    pub peer_address: String,
+}
+
+/// Type alias for a port forward entry containing the agent stream, container port, tunnel ID counter, data port, and container info
+type ForwardEntry = (
+    Arc<Mutex<TcpStream>>,
+    u16,
+    Arc<AtomicU32>,
+    u16,
+    Option<ContainerInfo>,
+);
+
+/// Type alias for status change callback
+pub type StatusCallback = Arc<dyn Fn(&[PortForwardInfo]) + Send + Sync>;
 
 /// Manages active port forwarding sessions
 #[derive(Clone)]
 struct PortForwardManager {
-    /// Map of local_port -> (agent_stream, container_port, tunnel_id_counter, data_port)
+    /// Map of local_port -> (agent_stream, container_port, tunnel_id_counter, data_port, container_info)
     forwards: Arc<Mutex<HashMap<u16, ForwardEntry>>>,
     /// Map of tunnel_id -> pending client stream
     pending_tunnels: Arc<Mutex<HashMap<u32, TcpStream>>>,
+    /// Optional callback for status updates
+    status_callback: Option<StatusCallback>,
 }
 
 impl PortForwardManager {
-    fn new() -> Self {
+    fn new(status_callback: Option<StatusCallback>) -> Self {
         Self {
             forwards: Arc::new(Mutex::new(HashMap::new())),
             pending_tunnels: Arc::new(Mutex::new(HashMap::new())),
+            status_callback,
+        }
+    }
+
+    /// Get current port forwards as display-friendly info
+    fn get_port_forwards(&self) -> Vec<PortForwardInfo> {
+        let forwards = self.forwards.lock().unwrap();
+        forwards
+            .iter()
+            .filter_map(|(local_port, (_, container_port, _, _, container_info))| {
+                container_info.as_ref().map(|info| PortForwardInfo {
+                    local_port: *local_port,
+                    container_port: *container_port,
+                    peer_address: format!("{}:{}", info.container_name, info.workspace_name),
+                })
+            })
+            .collect()
+    }
+
+    /// Notify status callback of current port forwards
+    fn notify_status(&self) {
+        if let Some(callback) = &self.status_callback {
+            let forwards = self.get_port_forwards();
+            callback(&forwards);
         }
     }
 
@@ -63,6 +114,7 @@ impl PortForwardManager {
         local_port: u16,
         container_port: u16,
         stream: Arc<Mutex<TcpStream>>,
+        container_info: Option<ContainerInfo>,
     ) -> Result<()> {
         let mut forwards = self.forwards.lock().unwrap();
 
@@ -105,6 +157,7 @@ impl PortForwardManager {
                 container_port,
                 tunnel_id_counter.clone(),
                 data_port,
+                container_info,
             ),
         );
 
@@ -166,7 +219,7 @@ impl PortForwardManager {
                         // Get the data_port from the forwards map
                         let data_port = {
                             let forwards = forwards_clone.lock().unwrap();
-                            forwards.get(&local_port).map(|(_, _, _, dp)| *dp)
+                            forwards.get(&local_port).map(|(_, _, _, dp, _)| *dp)
                         };
 
                         if let Some(data_port) = data_port {
@@ -203,6 +256,10 @@ impl PortForwardManager {
             );
         });
 
+        // Notify status callback
+        drop(forwards); // Release lock before calling callback
+        self.notify_status();
+
         Ok(())
     }
 
@@ -211,7 +268,9 @@ impl PortForwardManager {
         let mut forwards = self.forwards.lock().unwrap();
 
         if forwards.remove(&local_port).is_some() {
+            drop(forwards); // Release lock before notification
             info!("Stopped forwarding port {}", local_port);
+            self.notify_status();
             Ok(())
         } else {
             Err(Error::new(format!(
@@ -417,6 +476,13 @@ fn handle_agent_connection(mut stream: TcpStream, manager: PortForwardManager) -
 
     let stream_arc = Arc::new(Mutex::new(stream.try_clone()?));
 
+    // Use peer address as identifier
+    let peer_info = ContainerInfo {
+        container_name: peer_addr.ip().to_string(),
+        workspace_name: peer_addr.port().to_string(),
+    };
+    let mut container_info = Some(peer_info);
+
     loop {
         match read_message(&mut stream) {
             Ok(message) => match message.message {
@@ -424,7 +490,12 @@ fn handle_agent_connection(mut stream: TcpStream, manager: PortForwardManager) -
                     let port = fwd.port as u16;
                     info!("Agent requested port forward: {}", port);
 
-                    if let Err(e) = manager.start_forward(port, port, stream_arc.clone()) {
+                    if let Err(e) = manager.start_forward(
+                        port,
+                        port,
+                        stream_arc.clone(),
+                        container_info.clone(),
+                    ) {
                         error!("Failed to start port forward: {}", e);
                     }
                 }
@@ -446,6 +517,17 @@ fn handle_agent_connection(mut stream: TcpStream, manager: PortForwardManager) -
                     warn!(
                         "Received unexpected TunnelRequest from agent (this should only go agent->host)"
                     );
+                }
+                Some(ProtoMessage::AgentHello(hello)) => {
+                    debug!(
+                        "Agent identified as container: {}, workspace: {}",
+                        hello.container_name, hello.workspace_name
+                    );
+                    // Update container info with actual identity
+                    container_info = Some(ContainerInfo {
+                        container_name: hello.container_name,
+                        workspace_name: hello.workspace_name,
+                    });
                 }
                 None => {
                     warn!("Received message with no content");
@@ -471,14 +553,70 @@ fn handle_agent_connection(mut stream: TcpStream, manager: PortForwardManager) -
     Ok(())
 }
 
+/// Display port forwards as an inline table
+pub fn display_forwards_inline(forwards: &[PortForwardInfo]) {
+    if forwards.is_empty() {
+        println!("No active port forwards");
+        return;
+    }
+
+    let mut table = Table::new();
+    table.set_header(vec![
+        Cell::new("Peer Address").fg(Color::Cyan),
+        Cell::new("Local Port").fg(Color::Cyan),
+        Cell::new("Container Port").fg(Color::Cyan),
+    ]);
+
+    for forward in forwards {
+        table.add_row(vec![
+            Cell::new(&forward.peer_address),
+            Cell::new(forward.local_port.to_string()).fg(Color::Green),
+            Cell::new(forward.container_port.to_string()).fg(Color::Yellow),
+        ]);
+    }
+
+    println!("{}", table);
+}
+
+/// Display port forwards in fullscreen mode (clears screen and redraws)
+pub fn display_forwards_fullscreen(forwards: &[PortForwardInfo]) {
+    // Clear screen and move cursor to top-left
+    print!("\x1B[2J\x1B[1;1H");
+
+    println!("=== DevCon Port Forwarding Status ===\n");
+
+    if forwards.is_empty() {
+        println!("No active port forwards");
+    } else {
+        let mut table = Table::new();
+        table.set_header(vec![
+            Cell::new("Peer Address").fg(Color::Cyan),
+            Cell::new("Local Port").fg(Color::Cyan),
+            Cell::new("Container Port").fg(Color::Cyan),
+        ]);
+
+        for forward in forwards {
+            table.add_row(vec![
+                Cell::new(&forward.peer_address),
+                Cell::new(forward.local_port.to_string()).fg(Color::Green),
+                Cell::new(forward.container_port.to_string()).fg(Color::Yellow),
+            ]);
+        }
+
+        println!("{}", table);
+    }
+
+    println!("\nPress Ctrl+C to stop the control server");
+}
+
 /// Start the control server on the specified port
-pub fn start_control_server(port: u16) -> Result<()> {
+pub fn start_control_server(port: u16, status_callback: Option<StatusCallback>) -> Result<()> {
     let listener = TcpListener::bind(format!("0.0.0.0:{}", port))
         .map_err(|e| Error::new(format!("Failed to bind to port {}: {}", port, e)))?;
 
     info!("Control server listening on 0.0.0.0:{}", port);
 
-    let manager = PortForwardManager::new();
+    let manager = PortForwardManager::new(status_callback);
 
     for stream in listener.incoming() {
         match stream {
