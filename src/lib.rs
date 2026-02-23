@@ -33,3 +33,12 @@ pub mod error;
 pub mod feature;
 pub mod output;
 pub mod workspace;
+
+/// Display mode for port forwarding status
+#[derive(Debug, Clone, Copy)]
+pub enum StatusMode {
+    /// Display status updates inline with log output
+    Inline,
+    /// Display status in fullscreen mode (clears and redraws)
+    Fullscreen,
+}

@@ -105,6 +105,24 @@ enum ConfigAction {
     },
 }
 
+/// Display mode for port forwarding status
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum StatusMode {
+    /// Display status updates inline with log output
+    Inline,
+    /// Display status in fullscreen mode (clears and redraws)
+    Fullscreen,
+}
+
+impl From<StatusMode> for devcon::StatusMode {
+    fn from(mode: StatusMode) -> Self {
+        match mode {
+            StatusMode::Inline => devcon::StatusMode::Inline,
+            StatusMode::Fullscreen => devcon::StatusMode::Fullscreen,
+        }
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Builds a development container for the specified path
@@ -190,6 +208,14 @@ enum Commands {
             default_value = "15000"
         )]
         port: u16,
+
+        /// Display mode for port forwarding status
+        #[arg(
+            help = "Display mode for port forwarding status (inline or fullscreen)",
+            long = "status-mode",
+            value_name = "MODE"
+        )]
+        status_mode: Option<StatusMode>,
     },
 }
 
@@ -287,8 +313,8 @@ fn main() -> devcon::error::Result<()> {
                 handle_config_list(filter.as_deref(), output)?;
             }
         },
-        Commands::Serve { port } => {
-            handle_serve_command(*port, config_path)?;
+        Commands::Serve { port, status_mode } => {
+            handle_serve_command(*port, config_path, status_mode.map(|m| m.into()))?;
         }
     }
 
