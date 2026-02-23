@@ -719,9 +719,8 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
         self.runtime
             .build(&dockerfile, &directory_path, &latest_tag, self.silent)?;
 
-        // Also tag with the build timestamp so we can detect stale running containers
-        self.runtime
-            .build(&dockerfile, &directory_path, &build_tag, true)?;
+        // Tag the built image with the build timestamp so we can detect stale running containers
+        self.runtime.tag(&latest_tag, &build_tag)?;
 
         Ok(())
     }

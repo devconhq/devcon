@@ -155,6 +155,20 @@ impl ContainerRuntime for AppleRuntime {
         Ok(())
     }
 
+    fn tag(&self, source_tag: &str, target_tag: &str) -> Result<()> {
+        let result = Command::new("container")
+            .arg("tag")
+            .arg(source_tag)
+            .arg(target_tag)
+            .status()?;
+
+        if !result.success() {
+            return Err(Error::runtime("Container tag command failed"));
+        }
+
+        Ok(())
+    }
+
     fn run(
         &self,
         image_tag: &str,
@@ -304,6 +318,13 @@ impl ContainerRuntime for AppleRuntime {
             .iter()
             .filter_map(|container| {
                 trace!("Inspecting container: {}", container);
+
+                // Only include running containers (matching Docker runtime behavior)
+                let state = container["status"].as_str().unwrap_or_default();
+                if state != "running" {
+                    return None;
+                }
+
                 let project_name = container["configuration"]["labels"]["devcon.project"]
                     .as_str()
                     .unwrap_or_default();

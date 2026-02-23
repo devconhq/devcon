@@ -148,6 +148,20 @@ impl ContainerRuntime for DockerRuntime {
         Ok(())
     }
 
+    fn tag(&self, source_tag: &str, target_tag: &str) -> Result<()> {
+        let result = Command::new("docker")
+            .arg("tag")
+            .arg(source_tag)
+            .arg(target_tag)
+            .status()?;
+
+        if !result.success() {
+            return Err(Error::runtime("Docker tag command failed"));
+        }
+
+        Ok(())
+    }
+
     fn run(
         &self,
         image_tag: &str,
