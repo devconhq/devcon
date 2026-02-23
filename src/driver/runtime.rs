@@ -271,6 +271,18 @@ pub trait ContainerRuntime: Send {
         silent: bool,
     ) -> Result<()>;
 
+    /// Tags an existing image with a new tag without rebuilding.
+    ///
+    /// # Arguments
+    ///
+    /// * `source_tag` - The existing image tag to use as source
+    /// * `target_tag` - The new tag to apply to the image
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tag command fails.
+    fn tag(&self, source_tag: &str, target_tag: &str) -> Result<()>;
+
     /// Starts a container instance.
     ///
     /// # Arguments
