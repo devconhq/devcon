@@ -108,6 +108,7 @@ fn detect_ssh_socket() -> Option<PathBuf> {
 /// Detects the GPG agent socket path using gpgconf.
 ///
 /// Attempts to find the GPG agent socket by running `gpgconf --list-dir agent-socket`.
+/// If the socket doesn't exist but GPG is configured, attempts to start the GPG agent.
 /// Validates that the socket file exists on the filesystem.
 ///
 /// # Returns
@@ -131,14 +132,45 @@ fn detect_gpg_socket() -> Option<PathBuf> {
 
     if path.exists() {
         debug!("Detected GPG agent socket at: {}", socket_path);
-        Some(path)
-    } else {
-        warn!(
-            "gpgconf returned '{}' but socket does not exist",
-            socket_path
-        );
-        None
+        return Some(path);
     }
+
+    // Socket doesn't exist - try to start the GPG agent
+    debug!(
+        "GPG socket not found at {}, attempting to start agent",
+        socket_path
+    );
+
+    let launch_result = std::process::Command::new("gpgconf")
+        .arg("--launch")
+        .arg("gpg-agent")
+        .status();
+
+    match launch_result {
+        Ok(status) if status.success() => {
+            info!("Started GPG agent");
+
+            // Wait briefly for socket to appear
+            std::thread::sleep(std::time::Duration::from_millis(500));
+
+            if path.exists() {
+                info!("GPG agent socket now available at: {}", socket_path);
+                return Some(path);
+            } else {
+                warn!("GPG agent started but socket not found at {}", socket_path);
+            }
+        }
+        Ok(_) => {
+            debug!("Failed to start GPG agent (non-zero exit)");
+        }
+        Err(e) => {
+            debug!("Failed to launch GPG agent: {}", e);
+        }
+    }
+
+    // Final check failed
+    warn!("GPG agent socket not available at {}", socket_path);
+    None
 }
 
 /// Detects the GitHub CLI configuration directory path.
