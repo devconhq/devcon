@@ -34,6 +34,7 @@
 //! - Handling errors and returning results
 
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
@@ -638,6 +639,68 @@ pub fn handle_shell_command(
 
     let driver = ContainerDriver::new(config, runtime);
     driver.shell(devcontainer_workspace)?;
+    Ok(())
+}
+
+/// Handles the ssh command for opening an SSH session to a running container.
+pub fn handle_ssh_command(
+    path: PathBuf,
+    config_path: Option<PathBuf>,
+    proxy_mode: bool,
+) -> Result<()> {
+    let config = Config::load(config_path)?;
+    trace!("Config loaded {:?}", config);
+    let devcontainer_workspace = Workspace::try_from(path.clone())?;
+
+    let runtime_name = config.resolve_runtime()?;
+    debug!("Using runtime {:?}", runtime_name);
+    let runtime = get_runtime_specific_config(&config, &runtime_name)?;
+
+    let driver = ContainerDriver::new(config.clone(), runtime);
+    let container_id = driver.resolve_running_container_id(
+        &devcontainer_workspace,
+        "Multiple containers running — select one to connect via SSH",
+    )?;
+
+    let shell = config.default_shell.as_deref().unwrap_or("zsh").to_string();
+    let proxy = driver::ssh_proxy::SshProxyServer::start(&runtime_name, &container_id, &shell)?;
+
+    if proxy_mode {
+        let status = Command::new("nc")
+            .arg("127.0.0.1")
+            .arg(proxy.port().to_string())
+            .status()?;
+
+        if !status.success() {
+            return Err(Error::runtime(format!(
+                "proxy mode failed with status: {}",
+                status
+            )));
+        }
+
+        return Ok(());
+    }
+
+    let status = Command::new("ssh")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg("UserKnownHostsFile=/dev/null")
+        .arg("-o")
+        .arg("LogLevel=ERROR")
+        .arg("-tt")
+        .arg("-p")
+        .arg(proxy.port().to_string())
+        .arg("devcon@127.0.0.1")
+        .status()?;
+
+    if !status.success() {
+        return Err(Error::runtime(format!(
+            "ssh command failed with status: {}",
+            status
+        )));
+    }
+
     Ok(())
 }
 
