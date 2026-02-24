@@ -237,7 +237,7 @@ pub trait ContainerRuntime: Send {
         &self,
         dockerfile_path: &Path,
         context_path: &Path,
-        image_tag: &str,
+        image_tag: Vec<&str>,
         silent: bool,
     ) -> Result<()>;
 
@@ -264,24 +264,12 @@ pub trait ContainerRuntime: Send {
         &self,
         dockerfile_path: &Path,
         context_path: &Path,
-        image_tag: &str,
+        image_tag: Vec<&str>,
         args: &Option<std::collections::HashMap<String, String>>,
         target: &Option<String>,
         options: &Option<Vec<String>>,
         silent: bool,
     ) -> Result<()>;
-
-    /// Tags an existing image with a new tag without rebuilding.
-    ///
-    /// # Arguments
-    ///
-    /// * `source_tag` - The existing image tag to use as source
-    /// * `target_tag` - The new tag to apply to the image
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the tag command fails.
-    fn tag(&self, source_tag: &str, target_tag: &str) -> Result<()>;
 
     /// Starts a container instance.
     ///

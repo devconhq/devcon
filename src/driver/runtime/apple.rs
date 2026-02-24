@@ -83,7 +83,7 @@ impl ContainerRuntime for AppleRuntime {
         &self,
         dockerfile_path: &Path,
         context_path: &Path,
-        image_tag: &str,
+        image_tag: Vec<&str>,
         silent: bool,
     ) -> Result<()> {
         self.build_with_args(
@@ -101,7 +101,7 @@ impl ContainerRuntime for AppleRuntime {
         &self,
         dockerfile_path: &Path,
         context_path: &Path,
-        image_tag: &str,
+        image_tag: Vec<&str>,
         args: &Option<std::collections::HashMap<String, String>>,
         target: &Option<String>,
         options: &Option<Vec<String>>,
@@ -119,7 +119,10 @@ impl ContainerRuntime for AppleRuntime {
             cmd.arg("--cpus").arg(cpu);
         }
 
-        cmd.arg("-f").arg(dockerfile_path).arg("-t").arg(image_tag);
+        cmd.arg("-f").arg(dockerfile_path);
+        for tag in image_tag {
+            cmd.arg("-t").arg(tag);
+        }
 
         // Add build arguments
         if let Some(build_args) = args {
@@ -150,20 +153,6 @@ impl ContainerRuntime for AppleRuntime {
 
         if !result.success() {
             return Err(Error::runtime("Container build command failed"));
-        }
-
-        Ok(())
-    }
-
-    fn tag(&self, source_tag: &str, target_tag: &str) -> Result<()> {
-        let result = Command::new("container")
-            .arg("tag")
-            .arg(source_tag)
-            .arg(target_tag)
-            .status()?;
-
-        if !result.success() {
-            return Err(Error::runtime("Container tag command failed"));
         }
 
         Ok(())

@@ -83,7 +83,7 @@ impl ContainerRuntime for DockerRuntime {
         &self,
         dockerfile_path: &Path,
         context_path: &Path,
-        image_tag: &str,
+        image_tag: Vec<&str>,
         silent: bool,
     ) -> Result<()> {
         self.build_with_args(
@@ -101,18 +101,18 @@ impl ContainerRuntime for DockerRuntime {
         &self,
         dockerfile_path: &Path,
         context_path: &Path,
-        image_tag: &str,
+        image_tag: Vec<&str>,
         args: &Option<std::collections::HashMap<String, String>>,
         target: &Option<String>,
         options: &Option<Vec<String>>,
         silent: bool,
     ) -> Result<()> {
         let mut cmd = Command::new("docker");
-        cmd.arg("build")
-            .arg("-f")
-            .arg(dockerfile_path)
-            .arg("-t")
-            .arg(image_tag);
+        cmd.arg("build").arg("-f").arg(dockerfile_path);
+
+        for tag in image_tag {
+            cmd.arg("-t").arg(tag);
+        }
 
         // Add build arguments
         if let Some(build_args) = args {
@@ -143,20 +143,6 @@ impl ContainerRuntime for DockerRuntime {
 
         if !result.success() {
             return Err(Error::runtime("Docker build command failed"));
-        }
-
-        Ok(())
-    }
-
-    fn tag(&self, source_tag: &str, target_tag: &str) -> Result<()> {
-        let result = Command::new("docker")
-            .arg("tag")
-            .arg(source_tag)
-            .arg(target_tag)
-            .status()?;
-
-        if !result.success() {
-            return Err(Error::runtime("Docker tag command failed"));
         }
 
         Ok(())

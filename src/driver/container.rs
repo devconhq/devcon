@@ -619,7 +619,7 @@ fi
             self.runtime.build_with_args(
                 &user_dockerfile,
                 &context,
-                &intermediate_tag,
+                vec![&intermediate_tag],
                 &build_config.args,
                 &build_config.target,
                 &build_config.options,
@@ -716,11 +716,12 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
             format!("{}:build-{}", base_tag, now.as_secs())
         };
 
-        self.runtime
-            .build(&dockerfile, &directory_path, &latest_tag, self.silent)?;
-
-        // Tag the built image with the build timestamp so we can detect stale running containers
-        self.runtime.tag(&latest_tag, &build_tag)?;
+        self.runtime.build(
+            &dockerfile,
+            &directory_path,
+            vec![&latest_tag, &build_tag],
+            self.silent,
+        )?;
 
         Ok(())
     }
