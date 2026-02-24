@@ -296,6 +296,64 @@ impl ContainerDriver {
         }
     }
 
+    /// Resolves a running container ID for the given workspace.
+    ///
+    /// If multiple matching containers are running, the user is prompted to pick one.
+    pub fn resolve_running_container_id(
+        &self,
+        devcontainer_workspace: &Workspace,
+        prompt: &str,
+    ) -> Result<String> {
+        let containers = self.runtime.list()?;
+        let container_name = self.get_container_name(devcontainer_workspace);
+
+        let matching: Vec<(String, String)> = containers
+            .iter()
+            .filter(|(name, _, _)| name == &container_name)
+            .map(|(_, image_tag, handle)| (image_tag.clone(), handle.id().to_string()))
+            .collect();
+
+        if matching.is_empty() {
+            return Err(Error::new(
+                "Container not running. Run 'devcon start' or 'devcon up' first.".to_string(),
+            ));
+        }
+
+        if matching.len() == 1 {
+            return Ok(matching[0].1.clone());
+        }
+
+        let latest_tag = format!("{}:latest", self.get_image_tag(devcontainer_workspace));
+        let latest_id = self.runtime.image_id(&latest_tag).unwrap_or(None);
+
+        let items: Vec<String> = matching
+            .iter()
+            .map(|(img, id)| {
+                let is_latest = latest_id
+                    .as_ref()
+                    .and_then(|lid| {
+                        self.runtime
+                            .image_id(img)
+                            .ok()
+                            .flatten()
+                            .map(|rid| lid == &rid)
+                    })
+                    .unwrap_or(img == &latest_tag);
+                let marker = if is_latest { " [latest]" } else { " [stale]" };
+                format!("{} ({}{})", id, img, marker)
+            })
+            .collect();
+
+        let selection = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt(prompt)
+            .items(&items)
+            .default(0)
+            .interact()
+            .map_err(|e| Error::new(format!("Selection cancelled: {e}")))?;
+
+        Ok(matching[selection].1.clone())
+    }
+
     /// Prepares features for building or starting a container.
     ///
     /// This method:
