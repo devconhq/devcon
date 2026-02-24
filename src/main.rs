@@ -181,6 +181,20 @@ enum Commands {
         )]
         env: Vec<String>,
     },
+    /// Connects to a running development container via an SSH proxy
+    #[command(about = "Connect to a running development container via SSH")]
+    Ssh {
+        /// Path to the project directory containing .devcontainer configuration
+        #[arg(
+            help = "Path to the project directory. If not provided, uses current directory.",
+            value_name = "PATH"
+        )]
+        path: Option<PathBuf>,
+
+        /// Run in ProxyCommand mode (for use in ~/.ssh/config)
+        #[arg(long, help = "Use stdio proxy mode for ssh ProxyCommand")]
+        proxy: bool,
+    },
     /// Display information about a devcontainer
     #[command(about = "Display devcontainer status and configuration details")]
     Info {
@@ -281,6 +295,13 @@ fn main() -> devcon::error::Result<()> {
                 path.clone().unwrap_or(PathBuf::from(".").to_path_buf()),
                 env,
                 config_path,
+            )?;
+        }
+        Commands::Ssh { path, proxy } => {
+            handle_ssh_command(
+                path.clone().unwrap_or(PathBuf::from(".").to_path_buf()),
+                config_path,
+                *proxy,
             )?;
         }
         Commands::Info { path } => {
