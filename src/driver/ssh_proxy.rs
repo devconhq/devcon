@@ -257,12 +257,10 @@ impl ProxyServer {
 
             if let Some(command) = requested_command {
                 c.arg(&self.state.default_shell).arg("-lic").arg(command);
+            } else if let Some(shell_cmd) = &interactive_shell_cmd {
+                c.arg("sh").arg("-lc").arg(shell_cmd);
             } else {
-                if let Some(shell_cmd) = &interactive_shell_cmd {
-                    c.arg("sh").arg("-lc").arg(shell_cmd);
-                } else {
-                    c.arg(&self.state.default_shell).arg("-i");
-                }
+                c.arg(&self.state.default_shell).arg("-i");
             }
 
             c
@@ -390,10 +388,13 @@ impl SshProxyServer {
                     Err(_) => return,
                 };
 
-                let mut config = russh::server::Config::default();
-                config.auth_rejection_time = std::time::Duration::from_secs(0);
-                config.auth_rejection_time_initial = Some(std::time::Duration::from_secs(0));
-                config.methods = russh::MethodSet::from(&[russh::MethodKind::None][..]);
+                let mut config = russh::server::Config {
+                    auth_rejection_time: std::time::Duration::from_secs(0),
+                    auth_rejection_time_initial: Some(std::time::Duration::from_secs(0)),
+                    methods: russh::MethodSet::from(&[russh::MethodKind::None][..]),
+                    keys: Vec::new(),
+                    ..Default::default()
+                };
                 let key = PrivateKey::random(&mut OsRng, keys::Algorithm::Ed25519);
                 let Ok(key) = key else {
                     return;
