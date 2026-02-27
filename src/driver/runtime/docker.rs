@@ -31,7 +31,7 @@ use std::{
 
 use crate::error::Error;
 use crate::error::Result;
-use tracing::trace;
+use tracing::{debug, trace};
 
 use crate::config::DockerRuntimeConfig;
 use crate::driver::runtime::RuntimeParameters;
@@ -262,26 +262,16 @@ impl ContainerRuntime for DockerRuntime {
             cmd.arg("-e").arg(env_var);
         }
 
-        cmd.stdout(if attach_stdout {
-            Stdio::inherit()
-        } else {
-            Stdio::piped()
-        })
-        .stderr(if attach_stdout {
-            Stdio::inherit()
-        } else {
-            Stdio::piped()
-        })
-        .stdin(if attach_stdin {
-            Stdio::inherit()
-        } else {
-            Stdio::null()
-        });
+        cmd.arg(container_handle.id()).args(command);
 
-        let result = cmd.arg(container_handle.id()).args(command).output()?;
+        debug!("Executing container exec command: {:?}", cmd);
+        let result = cmd.output()?;
 
         if result.status.code() != Some(0) {
-            return Err(Error::runtime("Docker exec command failed"));
+            return Err(Error::runtime(format!(
+                "Docker exec command failed: {}",
+                &String::from_utf8(result.stderr).unwrap()
+            )));
         }
 
         Ok(())
