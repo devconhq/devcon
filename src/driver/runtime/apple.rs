@@ -283,10 +283,13 @@ impl ContainerRuntime for AppleRuntime {
         cmd.arg(container_handle.id()).args(command);
 
         debug!("Executing container exec command: {:?}", cmd);
-        let result = cmd.status()?;
+        let result = cmd.output()?;
 
-        if result.code() != Some(0) {
-            return Err(Error::runtime("Container exec command failed"));
+        if result.status.code() != Some(0) {
+            return Err(Error::runtime(format!(
+                "Container exec command failed: {}",
+                &String::from_utf8(result.stderr).unwrap()
+            )));
         }
 
         Ok(())
