@@ -1726,7 +1726,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
     fn guard_with_marker(cmd: &str, marker_name: &str) -> String {
         let marker = format!("/var/lib/devcon/lifecycle-markers/{}", marker_name);
         format!(
-            "MARKER='{}'; if [ ! -f \"$MARKER\" ]; then {}; mkdir -p \"$(dirname \"$MARKER\")\" && touch \"$MARKER\"; fi",
+            "MARKER='{}'; if [ ! -f \"$MARKER\" ]; then {}; sudo mkdir -p \"$(dirname \"$MARKER\")\" && sudo touch \"$MARKER\"; fi",
             marker, cmd
         )
     }
