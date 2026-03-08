@@ -212,3 +212,59 @@ jobs:
           asset_path: checksums.txt
           asset_name: checksums.txt
           asset_content_type: text/plain
+
+  update-homebrew-tap:
+    name: Update Homebrew Tap
+    runs-on: ubuntu-latest
+    needs: [create-checksums]
+    if: ${{ !github.event.release.prerelease }}
+    steps:
+      - name: Download checksums
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const release = await github.rest.repos.getRelease({
+              owner,
+              repo,
+              release_id: context.payload.release.id,
+            });
+            const asset = release.data.assets.find(a => a.name === 'checksums.txt');
+            const response = await github.rest.repos.getReleaseAsset({
+              owner,
+              repo,
+              asset_id: asset.id,
+              headers: { Accept: 'application/octet-stream' },
+            });
+            fs.writeFileSync('checksums.txt', Buffer.from(response.data));
+
+      - name: Checkout homebrew-tap
+        uses: actions/checkout@v4
+        with:
+          repository: devconhq/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Update formula
+        run: |
+          VERSION="${{ github.event.release.tag_name }}"
+          VERSION="${VERSION#v}"
+          MACOS_ARM64_SHA=$(awk '/devcon-macos-arm64/{print $1}' checksums.txt)
+          MACOS_UNIVERSAL_SHA=$(awk '/devcon-macos-universal/{print $1}' checksums.txt)
+          LINUX_X86_64_SHA=$(awk '/devcon-linux-x86_64/{print $1}' checksums.txt)
+          LINUX_ARM64_SHA=$(awk '/devcon-linux-arm64/{print $1}' checksums.txt)
+          sed -i "s/version \".*\"/version \"${VERSION}\"/" devcon.rb
+          sed -i "s|releases/download/v[^/]*/|releases/download/v${VERSION}/|g" devcon.rb
+          awk -v sums="${MACOS_ARM64_SHA} ${MACOS_UNIVERSAL_SHA} ${LINUX_X86_64_SHA} ${LINUX_ARM64_SHA}" '
+            BEGIN { n=split(sums,s," "); i=0 }
+            /sha256/ { i++; sub(/sha256 "[^"]*"/, "sha256 \"" s[i] "\"") }
+            { print }
+          ' devcon.rb > devcon.rb.tmp && mv devcon.rb.tmp devcon.rb
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add devcon.rb
+          git commit -m "Update devcon formula to ${{ github.event.release.tag_name }}"
+          git push
