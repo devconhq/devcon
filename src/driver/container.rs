@@ -261,6 +261,14 @@ pub struct ContainerDriver {
     silent: bool,
 }
 
+#[derive(Clone, Debug)]
+struct ResolvedUsers {
+    remote_user: String,
+    container_user: String,
+    remote_user_home: String,
+    container_user_home: String,
+}
+
 impl ContainerDriver {
     /// Creates a new container driver.
     ///
@@ -697,6 +705,8 @@ fi
                 .clone()
         };
 
+        let resolved_users = self.resolve_users_for_image(&devcontainer_workspace, &base_image);
+
         // Phase 2: Build features Dockerfile using base_image
         let env = Environment::new();
         let template = env.template_from_str(
@@ -727,33 +737,12 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
 "#,
         )?;
 
-        let remote_user_val = devcontainer_workspace
-            .devcontainer
-            .remote_user
-            .as_deref()
-            .unwrap_or("vscode");
-        let container_user_val = devcontainer_workspace
-            .devcontainer
-            .container_user
-            .as_deref()
-            .unwrap_or("vscode");
-        let container_user_home = if container_user_val == "root" {
-            "/root".to_string()
-        } else {
-            format!("/home/{}", container_user_val)
-        };
-        let remote_user_home = if remote_user_val == "root" {
-            "/root".to_string()
-        } else {
-            format!("/home/{}", remote_user_val)
-        };
-
         let contents = template.render(minijinja::context! {
             image => &base_image,
-            remote_user => remote_user_val,
-            container_user => container_user_val,
-            remote_user_home => remote_user_home,
-            container_user_home => container_user_home,
+            remote_user => &resolved_users.remote_user,
+            container_user => &resolved_users.container_user,
+            remote_user_home => &resolved_users.remote_user_home,
+            container_user_home => &resolved_users.container_user_home,
             feature_install => &feature_install,
             dotfiles_setup => &dotfiles_setup,
             env_setup => &env_setup,
@@ -966,6 +955,8 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
             ));
         }
 
+        let resolved_users = self.resolve_users_for_image(&devcontainer_workspace, &latest_tag);
+
         let volume_mount = format!(
             "{}:/workspaces/{}",
             devcontainer_workspace.path.to_string_lossy(),
@@ -986,18 +977,25 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
             for mount in mounts {
                 let substituted_mount = match mount {
                     crate::devcontainer::Mount::String(s) => crate::devcontainer::Mount::String(
-                        self.substitute_mount_variables(s, &devcontainer_workspace),
+                        self.substitute_mount_variables_with_users(
+                            s,
+                            &devcontainer_workspace,
+                            &resolved_users,
+                        ),
                     ),
                     crate::devcontainer::Mount::Structured(structured) => {
                         let mut new_mount = structured.clone();
                         if let Some(ref source) = structured.source {
-                            new_mount.source = Some(
-                                self.substitute_mount_variables(source, &devcontainer_workspace),
-                            );
+                            new_mount.source = Some(self.substitute_mount_variables_with_users(
+                                source,
+                                &devcontainer_workspace,
+                                &resolved_users,
+                            ));
                         }
-                        new_mount.target = self.substitute_mount_variables(
+                        new_mount.target = self.substitute_mount_variables_with_users(
                             &structured.target,
                             &devcontainer_workspace,
+                            &resolved_users,
                         );
                         crate::devcontainer::Mount::Structured(new_mount)
                     }
@@ -1020,8 +1018,11 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                 for mount in mounts {
                     match mount {
                         crate::feature::FeatureMount::String(s) => {
-                            let substituted =
-                                self.substitute_mount_variables(s, &devcontainer_workspace);
+                            let substituted = self.substitute_mount_variables_with_users(
+                                s,
+                                &devcontainer_workspace,
+                                &resolved_users,
+                            );
                             all_mounts.push(crate::devcontainer::Mount::String(substituted));
                         }
                         crate::feature::FeatureMount::Structured(sm) => {
@@ -1034,10 +1035,17 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                                 }
                             };
                             let source = sm.source.as_ref().map(|s| {
-                                self.substitute_mount_variables(s, &devcontainer_workspace)
+                                self.substitute_mount_variables_with_users(
+                                    s,
+                                    &devcontainer_workspace,
+                                    &resolved_users,
+                                )
                             });
-                            let target = self
-                                .substitute_mount_variables(&sm.target, &devcontainer_workspace);
+                            let target = self.substitute_mount_variables_with_users(
+                                &sm.target,
+                                &devcontainer_workspace,
+                                &resolved_users,
+                            );
                             all_mounts.push(crate::devcontainer::Mount::Structured(
                                 crate::devcontainer::StructuredMount {
                                     mount_type,
@@ -1106,16 +1114,10 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
 
                 if let Some(socket) = gpg_socket {
                     info!("Forwarding GPG agent socket into container");
-                    // Get the remote user from devcontainer or use default
-                    let remote_user = devcontainer_workspace
-                        .devcontainer
-                        .remote_user
-                        .as_deref()
-                        .unwrap_or("vscode");
                     all_mounts.push(crate::devcontainer::Mount::String(format!(
-                        "{}:/home/{}/.gnupg/S.gpg-agent",
+                        "{}:{}/.gnupg/S.gpg-agent",
                         socket.display(),
-                        remote_user
+                        &resolved_users.remote_user_home
                     )));
 
                     // Export public keyring
@@ -1175,16 +1177,10 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
 
                 if let Some(config_dir) = gh_config {
                     info!("Forwarding GitHub CLI configuration into container");
-                    // Get the remote user from devcontainer or use default
-                    let remote_user = devcontainer_workspace
-                        .devcontainer
-                        .remote_user
-                        .as_deref()
-                        .unwrap_or("vscode");
                     all_mounts.push(crate::devcontainer::Mount::String(format!(
-                        "{}:/home/{}/.config/gh",
+                        "{}:{}/.config/gh",
                         config_dir.display(),
-                        remote_user
+                        &resolved_users.remote_user_home
                     )));
                 } else {
                     info!("GitHub CLI forwarding enabled but no configuration found");
@@ -1224,6 +1220,18 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
             .forward_ports
             .clone()
             .unwrap_or_default();
+
+        match self.runtime.inspect_image(&latest_tag)? {
+            Some(inspect) => {
+                trace!("Pre-run image inspect for '{}': {}", latest_tag, inspect);
+            }
+            None => {
+                trace!(
+                    "Pre-run image inspect skipped; image '{}' not found",
+                    latest_tag
+                );
+            }
+        }
 
         debug!("Starting container with ports: {:?}", ports);
 
@@ -1286,14 +1294,9 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
         // Fix file permissions on gpg agent socket
         if gpg_agent_mounted {
             debug!("Setting permissions on GPG agent socket inside container");
-            let remote_user = devcontainer_workspace
-                .devcontainer
-                .remote_user
-                .as_deref()
-                .unwrap_or("vscode");
             let mut gpg_cmd = format!(
-                "sudo chmod -R 0700 /home/{user}/.gnupg && sudo chown -R $(id -u):$(id -g) /home/{user}/.gnupg",
-                user = remote_user
+                "sudo chmod -R 0700 {home}/.gnupg && sudo chown -R $(id -u):$(id -g) {home}/.gnupg",
+                home = &resolved_users.remote_user_home
             );
             if gpg_public_keyring_path.is_some() {
                 info!("Importing GPG public keyring into container");
@@ -1720,6 +1723,113 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
         format!("{:x}", result)
     }
 
+    fn user_home(user: &str) -> String {
+        if user == "root" {
+            "/root".to_string()
+        } else {
+            format!("/home/{}", user)
+        }
+    }
+
+    fn extract_user_from_inspect(inspect: &serde_json::Value) -> Option<String> {
+        let from_key = |path: &[&str]| {
+            let mut current = inspect;
+            for key in path {
+                current = current.get(*key)?;
+            }
+            current
+                .as_str()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(ToString::to_string)
+        };
+
+        from_key(&["_devconDetectedUser"])
+            .or_else(|| from_key(&["Config", "User"]))
+            .or_else(|| from_key(&["config", "user"]))
+            .or_else(|| from_key(&["configuration", "user"]))
+    }
+
+    fn extract_home_from_inspect(inspect: &serde_json::Value) -> Option<String> {
+        let from_key = |path: &[&str]| {
+            let mut current = inspect;
+            for key in path {
+                current = current.get(*key)?;
+            }
+            current
+                .as_str()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(ToString::to_string)
+        };
+
+        let home_from_env = |path: &[&str]| {
+            let mut current = inspect;
+            for key in path {
+                current = current.get(*key)?;
+            }
+
+            current.as_array().and_then(|envs| {
+                envs.iter().find_map(|env| {
+                    env.as_str()?
+                        .strip_prefix("HOME=")
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                        .map(ToString::to_string)
+                })
+            })
+        };
+
+        from_key(&["_devconDetectedHome"])
+            .or_else(|| home_from_env(&["Config", "Env"]))
+            .or_else(|| home_from_env(&["config", "env"]))
+            .or_else(|| home_from_env(&["configuration", "env"]))
+    }
+
+    fn resolve_users_for_image(&self, workspace: &Workspace, image_tag: &str) -> ResolvedUsers {
+        let inspect = self.runtime.inspect_image(image_tag).ok().flatten();
+        let detected_user = inspect.as_ref().and_then(Self::extract_user_from_inspect);
+        let detected_home = inspect.as_ref().and_then(Self::extract_home_from_inspect);
+
+        let remote_user_override = workspace.devcontainer.remote_user.clone();
+        let container_user_override = workspace.devcontainer.container_user.clone();
+
+        let remote_user = remote_user_override
+            .clone()
+            .or_else(|| detected_user.clone())
+            .unwrap_or_else(|| "vscode".to_string());
+
+        let container_user = container_user_override
+            .clone()
+            .or_else(|| detected_user.clone())
+            .unwrap_or_else(|| remote_user.clone());
+
+        let remote_user_home = if remote_user_override.is_none()
+            && detected_user.as_deref() == Some(remote_user.as_str())
+        {
+            detected_home
+                .clone()
+                .unwrap_or_else(|| Self::user_home(&remote_user))
+        } else {
+            Self::user_home(&remote_user)
+        };
+
+        let container_user_home = if container_user_override.is_none()
+            && detected_user.as_deref() == Some(container_user.as_str())
+        {
+            detected_home.unwrap_or_else(|| Self::user_home(&container_user))
+        } else {
+            Self::user_home(&container_user)
+        };
+
+        ResolvedUsers {
+            remote_user_home,
+            container_user_home,
+            remote_user,
+            container_user,
+        }
+    }
+
     /// Performs variable substitution on a mount string.
     ///
     /// Supports the following variables:
@@ -1735,10 +1845,37 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
     /// # Returns
     ///
     /// The mount string with all variables substituted.
+    #[allow(dead_code)]
     fn substitute_mount_variables(
         &self,
         mount_str: &str,
         devcontainer_workspace: &Workspace,
+    ) -> String {
+        let remote_user = devcontainer_workspace
+            .devcontainer
+            .remote_user
+            .clone()
+            .unwrap_or_else(|| "vscode".to_string());
+        let container_user = devcontainer_workspace
+            .devcontainer
+            .container_user
+            .clone()
+            .unwrap_or_else(|| remote_user.clone());
+        let users = ResolvedUsers {
+            remote_user_home: Self::user_home(&remote_user),
+            container_user_home: Self::user_home(&container_user),
+            remote_user,
+            container_user,
+        };
+
+        self.substitute_mount_variables_with_users(mount_str, devcontainer_workspace, &users)
+    }
+
+    fn substitute_mount_variables_with_users(
+        &self,
+        mount_str: &str,
+        devcontainer_workspace: &Workspace,
+        users: &ResolvedUsers,
     ) -> String {
         let devcontainer_id = self.get_devcontainer_id(devcontainer_workspace);
         let workspace_name = devcontainer_workspace
@@ -1753,6 +1890,10 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
             .replace("${devcontainerId}", &devcontainer_id)
             .replace("${localWorkspaceFolder}", &local_workspace)
             .replace("${containerWorkspaceFolder}", &container_workspace)
+            .replace("${remoteUser}", &users.remote_user)
+            .replace("${containerUser}", &users.container_user)
+            .replace("${remoteUserHome}", &users.remote_user_home)
+            .replace("${containerUserHome}", &users.container_user_home)
     }
 
     /// Wraps a lifecycle command with proper environment and working directory setup.
@@ -2069,6 +2210,11 @@ mod tests {
         assert!(result.contains(&workspace.path.to_string_lossy().to_string()));
         assert!(result.contains(&devcontainer_id));
         assert!(!result.contains("${"));
+
+        // Test user variable substitutions
+        let mount_str = "${remoteUser}:${containerUser}:${remoteUserHome}:${containerUserHome}";
+        let result = driver.substitute_mount_variables(mount_str, &workspace);
+        assert_eq!(result, "vscode:vscode:/home/vscode:/home/vscode");
     }
 
     #[test]
@@ -2140,6 +2286,56 @@ mod tests {
         );
         // Markers must be distinct
         assert_ne!(oncreate, postcreate);
+    }
+
+    #[test]
+    fn test_extract_user_from_inspect_prefers_detected_user() {
+        let inspect = serde_json::json!({
+            "_devconDetectedUser": "node",
+            "Config": {
+                "User": "root"
+            }
+        });
+
+        let user = ContainerDriver::extract_user_from_inspect(&inspect);
+        assert_eq!(user.as_deref(), Some("node"));
+    }
+
+    #[test]
+    fn test_extract_user_from_inspect_uses_metadata_user() {
+        let inspect = serde_json::json!({
+            "Config": {
+                "User": "vscode"
+            }
+        });
+
+        let user = ContainerDriver::extract_user_from_inspect(&inspect);
+        assert_eq!(user.as_deref(), Some("vscode"));
+    }
+
+    #[test]
+    fn test_extract_home_from_inspect_prefers_detected_home() {
+        let inspect = serde_json::json!({
+            "_devconDetectedHome": "/workspace/home",
+            "Config": {
+                "Env": ["HOME=/home/vscode"]
+            }
+        });
+
+        let home = ContainerDriver::extract_home_from_inspect(&inspect);
+        assert_eq!(home.as_deref(), Some("/workspace/home"));
+    }
+
+    #[test]
+    fn test_extract_home_from_inspect_uses_env_home() {
+        let inspect = serde_json::json!({
+            "Config": {
+                "Env": ["PATH=/usr/bin", "HOME=/home/node"]
+            }
+        });
+
+        let home = ContainerDriver::extract_home_from_inspect(&inspect);
+        assert_eq!(home.as_deref(), Some("/home/node"));
     }
 
     #[test]

@@ -353,6 +353,17 @@ pub trait ContainerRuntime: Send {
     /// Returns an error if the inspect command fails unexpectedly.
     fn image_id(&self, image_tag: &str) -> Result<Option<String>>;
 
+    /// Inspect an image and return image metadata as JSON.
+    ///
+    /// # Arguments
+    ///
+    /// * `image_tag` - The image tag to inspect
+    ///
+    /// # Returns
+    ///
+    /// `Ok(Some(metadata))` if inspect succeeds, `Ok(None)` if the image does not exist.
+    fn inspect_image(&self, image_tag: &str) -> Result<Option<serde_json::Value>>;
+
     /// Get the host address for the runtime.
     ///
     /// This is used to configure containers to connect back to the host.
