@@ -65,6 +65,77 @@ impl DockerRuntime {
     pub fn new(config: DockerRuntimeConfig) -> Self {
         Self { config }
     }
+
+    fn metadata_user(inspect: &serde_json::Value) -> Option<String> {
+        inspect
+            .get("Config")
+            .and_then(|v| v.get("User"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToString::to_string)
+    }
+
+    fn metadata_home(inspect: &serde_json::Value) -> Option<String> {
+        let envs = inspect
+            .get("Config")
+            .and_then(|v| v.get("Env"))
+            .and_then(|v| v.as_array())?;
+
+        envs.iter().find_map(|v| {
+            let env = v.as_str()?;
+            env.strip_prefix("HOME=")
+                .map(str::trim)
+                .filter(|h| !h.is_empty())
+                .map(ToString::to_string)
+        })
+    }
+
+    fn probe_image_user_and_home(image_tag: &str) -> Option<(String, String)> {
+        let probes: [Vec<&str>; 2] = [
+            vec![
+                "--entrypoint",
+                "sh",
+                image_tag,
+                "-lc",
+                "id -un; printf '\n'; printf '%s' \"$HOME\"",
+            ],
+            vec![
+                "--entrypoint",
+                "/bin/sh",
+                image_tag,
+                "-lc",
+                "id -un; printf '\n'; printf '%s' \"$HOME\"",
+            ],
+        ];
+
+        for probe in probes {
+            let output = Command::new("docker")
+                .arg("run")
+                .arg("--rm")
+                .args(probe)
+                .output()
+                .ok();
+
+            let Some(output) = output else {
+                continue;
+            };
+
+            if !output.status.success() {
+                continue;
+            }
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut lines = stdout.lines();
+            let user = lines.next().unwrap_or_default().trim().to_string();
+            let home = lines.next().unwrap_or_default().trim().to_string();
+            if !user.is_empty() && !home.is_empty() {
+                return Some((user, home));
+            }
+        }
+
+        None
+    }
 }
 
 /// Handle for a Docker container instance.
@@ -396,6 +467,43 @@ impl ContainerRuntime for DockerRuntime {
         } else {
             Ok(Some(id))
         }
+    }
+
+    fn inspect_image(&self, image_tag: &str) -> Result<Option<serde_json::Value>> {
+        let output = Command::new("docker")
+            .arg("image")
+            .arg("inspect")
+            .arg(image_tag)
+            .output()?;
+
+        if !output.status.success() {
+            return Ok(None);
+        }
+
+        let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        let mut inspect = match parsed {
+            serde_json::Value::Array(mut items) => items.pop().unwrap_or(serde_json::Value::Null),
+            value => value,
+        };
+
+        let has_valid_user = Self::metadata_user(&inspect).is_some();
+        let has_valid_home = Self::metadata_home(&inspect).is_some();
+
+        if let serde_json::Value::Object(ref mut map) = inspect
+            && (!has_valid_user || !has_valid_home)
+            && let Some((user, home)) = Self::probe_image_user_and_home(image_tag)
+        {
+            map.insert(
+                "_devconDetectedUser".to_string(),
+                serde_json::Value::String(user),
+            );
+            map.insert(
+                "_devconDetectedHome".to_string(),
+                serde_json::Value::String(home),
+            );
+        }
+
+        Ok(Some(inspect))
     }
 
     fn get_host_address(&self) -> String {

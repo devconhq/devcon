@@ -76,6 +76,97 @@ impl AppleRuntime {
     pub fn new(config: AppleRuntimeConfig) -> Self {
         Self { config }
     }
+
+    fn metadata_user(inspect: &serde_json::Value) -> Option<String> {
+        inspect
+            .get("config")
+            .and_then(|v| v.get("user"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| {
+                inspect
+                    .get("Config")
+                    .and_then(|v| v.get("User"))
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(ToString::to_string)
+            })
+    }
+
+    fn metadata_home(inspect: &serde_json::Value) -> Option<String> {
+        let env_arrays = [
+            inspect
+                .get("config")
+                .and_then(|v| v.get("env"))
+                .and_then(|v| v.as_array()),
+            inspect
+                .get("Config")
+                .and_then(|v| v.get("Env"))
+                .and_then(|v| v.as_array()),
+        ];
+
+        for envs in env_arrays.into_iter().flatten() {
+            if let Some(home) = envs.iter().find_map(|v| {
+                let env = v.as_str()?;
+                env.strip_prefix("HOME=")
+                    .map(str::trim)
+                    .filter(|h| !h.is_empty())
+                    .map(ToString::to_string)
+            }) {
+                return Some(home);
+            }
+        }
+
+        None
+    }
+
+    fn probe_image_user_and_home(image_tag: &str) -> Option<(String, String)> {
+        let probe_cmd = "id -un; printf '\n'; printf '%s' \"$HOME\"";
+        let probes: [Vec<&str>; 2] = [
+            vec![
+                "run",
+                "--rm",
+                "--entrypoint",
+                "sh",
+                image_tag,
+                "-lc",
+                probe_cmd,
+            ],
+            vec![
+                "run",
+                "--rm",
+                "--entrypoint",
+                "/bin/sh",
+                image_tag,
+                "-lc",
+                probe_cmd,
+            ],
+        ];
+
+        for probe in probes {
+            let output = Command::new("container").args(probe).output().ok();
+            let Some(output) = output else {
+                continue;
+            };
+
+            if !output.status.success() {
+                continue;
+            }
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut lines = stdout.lines();
+            let user = lines.next().unwrap_or_default().trim().to_string();
+            let home = lines.next().unwrap_or_default().trim().to_string();
+            if !user.is_empty() && !home.is_empty() {
+                return Some((user, home));
+            }
+        }
+
+        None
+    }
 }
 
 impl ContainerRuntime for AppleRuntime {
@@ -407,6 +498,41 @@ impl ContainerRuntime for AppleRuntime {
         } else {
             Ok(Some(id))
         }
+    }
+
+    fn inspect_image(&self, image_tag: &str) -> Result<Option<serde_json::Value>> {
+        let output = Command::new("container")
+            .arg("image")
+            .arg("inspect")
+            .arg("--format")
+            .arg("json")
+            .arg(image_tag)
+            .output()?;
+
+        if !output.status.success() {
+            return Ok(None);
+        }
+
+        let mut inspect: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+
+        let has_valid_user = Self::metadata_user(&inspect).is_some();
+        let has_valid_home = Self::metadata_home(&inspect).is_some();
+
+        if let serde_json::Value::Object(ref mut map) = inspect
+            && (!has_valid_user || !has_valid_home)
+            && let Some((user, home)) = Self::probe_image_user_and_home(image_tag)
+        {
+            map.insert(
+                "_devconDetectedUser".to_string(),
+                serde_json::Value::String(user),
+            );
+            map.insert(
+                "_devconDetectedHome".to_string(),
+                serde_json::Value::String(home),
+            );
+        }
+
+        Ok(Some(inspect))
     }
 
     fn get_host_address(&self) -> String {
