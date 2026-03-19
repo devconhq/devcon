@@ -14,7 +14,7 @@ serde_json = "1.0.149"
 yaml_serde = "0.10.3"
 tempfile = "3.24"
 oci-spec = "0.8.4"
-reqwest = { version = "0.13.1", features = ["blocking", "json"] }
+reqwest = { version = "0.13.2", features = ["blocking", "json"] }
 flate2 = { version = "1.1.9", features = ["zlib", "zlib-rs"] }
 tar = "0.4.44"
 dirs = "6.0"
