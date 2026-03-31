@@ -81,6 +81,8 @@ use crate::{
 };
 use std::path::PathBuf;
 
+const GPG_HOST_SOCKET_MOUNT_DIR: &str = "/tmp/devcon-host-gpg";
+
 /// Detects the SSH agent socket path from the environment.
 ///
 /// Attempts to find the SSH agent socket using the SSH_AUTH_SOCK environment variable.
@@ -171,6 +173,34 @@ fn detect_gpg_socket() -> Option<PathBuf> {
     // Final check failed
     warn!("GPG agent socket not available at {}", socket_path);
     None
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn build_gpg_setup_command(
+    remote_user_home: &str,
+    mounted_socket_dir: &str,
+    socket_name: &str,
+    import_public_keyring: bool,
+) -> String {
+    let gnupg_dir = format!("{remote_user_home}/.gnupg");
+    let socket_link = format!("{gnupg_dir}/S.gpg-agent");
+    let mounted_socket = format!("{mounted_socket_dir}/{socket_name}");
+
+    let mut cmd = format!(
+        "sudo install -d -m 0700 -o $(id -u) -g $(id -g) {gnupg_dir} && rm -f {socket_link} && ln -s {mounted_socket} {socket_link}",
+        gnupg_dir = shell_single_quote(&gnupg_dir),
+        socket_link = shell_single_quote(&socket_link),
+        mounted_socket = shell_single_quote(&mounted_socket),
+    );
+
+    if import_public_keyring {
+        cmd.push_str(" && (gpg --import /tmp/gpg-public-keys.asc 2>&1 || true)");
+    }
+
+    cmd
 }
 
 /// Detects the GitHub CLI configuration directory path.
@@ -1062,6 +1092,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
         // Track whether agent forwarding mounts were added (for environment variables later)
         let mut ssh_agent_mounted = false;
         let mut gpg_agent_mounted = false;
+        let mut gpg_agent_socket_name: Option<String> = None;
         let mut gpg_public_keyring_path: Option<PathBuf> = None;
 
         // Add agent forwarding mounts if configured
@@ -1113,12 +1144,26 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                 };
 
                 if let Some(socket) = gpg_socket {
-                    info!("Forwarding GPG agent socket into container");
+                    let socket_dir = socket.parent().ok_or_else(|| {
+                        Error::runtime(format!(
+                            "Failed to determine parent directory for GPG socket '{}'",
+                            socket.display()
+                        ))
+                    })?;
+                    let socket_name = socket.file_name().ok_or_else(|| {
+                        Error::runtime(format!(
+                            "Failed to determine file name for GPG socket '{}'",
+                            socket.display()
+                        ))
+                    })?;
+
+                    info!("Forwarding GPG agent socket directory into container");
                     all_mounts.push(crate::devcontainer::Mount::String(format!(
-                        "{}:{}/.gnupg/S.gpg-agent",
-                        socket.display(),
-                        &resolved_users.remote_user_home
+                        "{}:{}",
+                        socket_dir.display(),
+                        GPG_HOST_SOCKET_MOUNT_DIR,
                     )));
+                    gpg_agent_socket_name = Some(socket_name.to_string_lossy().into_owned());
 
                     // Export public keyring
                     info!("Exporting GPG public keyring");
@@ -1247,6 +1292,40 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
             },
         )?;
 
+        // Ensure forwarded agent sockets are ready before lifecycle hooks run.
+        if gpg_agent_mounted {
+            let socket_name = gpg_agent_socket_name.as_deref().ok_or_else(|| {
+                Error::runtime("GPG agent forwarding enabled without a socket name".to_string())
+            })?;
+            let gpg_cmd = build_gpg_setup_command(
+                &resolved_users.remote_user_home,
+                GPG_HOST_SOCKET_MOUNT_DIR,
+                socket_name,
+                gpg_public_keyring_path.is_some(),
+            );
+            let guarded = Self::guard_with_marker(&gpg_cmd, "gpgAgentSetup");
+            self.runtime.exec(
+                handle.as_ref(),
+                vec!["bash", "-c", &guarded],
+                &[],
+                false,
+                false,
+            )?;
+        }
+
+        if ssh_agent_mounted {
+            debug!("Setting permissions on SSH agent socket inside container");
+            let cmd = "sudo chmod 600 /ssh-agent && sudo chown $(id -u):$(id -g) /ssh-agent";
+            let guarded = Self::guard_with_marker(cmd, "sshAgentSetup");
+            self.runtime.exec(
+                handle.as_ref(),
+                vec!["bash", "-c", &guarded],
+                &[],
+                false,
+                false,
+            )?;
+        }
+
         match &devcontainer_workspace.devcontainer.on_create_command {
             Some(LifecycleCommand::String(cmd)) => {
                 let wrapped_cmd = self.wrap_once_lifecycle_command(
@@ -1290,41 +1369,6 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
             })?,
             None => { /* No onCreateCommand specified */ }
         };
-
-        // Fix file permissions on gpg agent socket
-        if gpg_agent_mounted {
-            debug!("Setting permissions on GPG agent socket inside container");
-            let mut gpg_cmd = format!(
-                "sudo chmod -R 0700 {home}/.gnupg && sudo chown -R $(id -u):$(id -g) {home}/.gnupg",
-                home = &resolved_users.remote_user_home
-            );
-            if gpg_public_keyring_path.is_some() {
-                info!("Importing GPG public keyring into container");
-                gpg_cmd.push_str(" && gpg --import /tmp/gpg-public-keys.asc 2>&1 || true");
-            }
-            let guarded = Self::guard_with_marker(&gpg_cmd, "gpgAgentSetup");
-            self.runtime.exec(
-                handle.as_ref(),
-                vec!["bash", "-c", &guarded],
-                &[],
-                false,
-                false,
-            )?;
-        }
-
-        // Fix file permissions on ssh agent socket
-        if ssh_agent_mounted {
-            debug!("Setting permissions on SSH agent socket inside container");
-            let cmd = "sudo chmod 600 /ssh-agent && sudo chown $(id -u):$(id -g) /ssh-agent";
-            let guarded = Self::guard_with_marker(cmd, "sshAgentSetup");
-            self.runtime.exec(
-                handle.as_ref(),
-                vec!["bash", "-c", &guarded],
-                &[],
-                false,
-                false,
-            )?;
-        }
 
         // Add dotfiles setup if repository is provided
         if let Some(repo) = self.config.dotfiles_repository.as_deref() {
@@ -2414,6 +2458,28 @@ mod tests {
             .rfind("&&")
             .expect("&& before touch not found");
         assert!(and_pos < touch_pos, "&& must precede touch");
+    }
+
+    #[test]
+    fn test_build_gpg_setup_command_uses_symlinked_socket_path() {
+        let command = build_gpg_setup_command(
+            "/home/vscode",
+            GPG_HOST_SOCKET_MOUNT_DIR,
+            "S.gpg-agent",
+            true,
+        );
+
+        assert!(command.contains("install -d -m 0700"));
+        assert!(command.contains("rm -f '/home/vscode/.gnupg/S.gpg-agent'"));
+        assert!(command.contains(
+            "ln -s '/tmp/devcon-host-gpg/S.gpg-agent' '/home/vscode/.gnupg/S.gpg-agent'"
+        ));
+        assert!(command.contains("(gpg --import /tmp/gpg-public-keys.asc 2>&1 || true)"));
+    }
+
+    #[test]
+    fn test_shell_single_quote_escapes_apostrophes() {
+        assert_eq!(shell_single_quote("a'b"), "'a'\"'\"'b'");
     }
 
     #[test]
