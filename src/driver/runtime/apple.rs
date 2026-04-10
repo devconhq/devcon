@@ -371,6 +371,22 @@ impl ContainerRuntime for AppleRuntime {
             cmd.arg("-e").arg(env_var);
         }
 
+        cmd.stdout(if attach_stdout {
+            Stdio::inherit()
+        } else {
+            Stdio::piped()
+        })
+        .stderr(if attach_stdout {
+            Stdio::inherit()
+        } else {
+            Stdio::piped()
+        })
+        .stdin(if attach_stdin {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        });
+
         cmd.arg(container_handle.id()).args(command);
 
         debug!("Executing container exec command: {:?}", cmd);
