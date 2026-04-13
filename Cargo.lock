@@ -716,7 +716,7 @@ dependencies = [
 
 [[package]]
 name = "devcon"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "assert_cmd",
  "bytes",
@@ -754,7 +754,7 @@ dependencies = [
 
 [[package]]
 name = "devcon-agent"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "bytes",
  "clap",
@@ -765,7 +765,7 @@ dependencies = [
 
 [[package]]
 name = "devcon-proto"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "bytes",
  "prost",
