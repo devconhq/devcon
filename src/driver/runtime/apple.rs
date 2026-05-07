@@ -266,6 +266,12 @@ impl ContainerRuntime for AppleRuntime {
             .arg("-l")
             .arg(label);
 
+        // Add CPU and memory limits from config
+        let memory = self.config.run_memory.as_deref().unwrap_or("8g");
+        cmd.arg("--memory").arg(memory);
+        let cpu = self.config.run_cpu.as_deref().unwrap_or("2");
+        cmd.arg("--cpus").arg(cpu);
+
         // Add privileged flag if required
         if runtime_parameters.requires_privileged {
             cmd.arg("--virtualization");

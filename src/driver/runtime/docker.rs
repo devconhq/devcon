@@ -57,7 +57,6 @@ fn extract_container_port(port: &crate::devcontainer::ForwardPort) -> Option<u16
 
 /// Docker CLI runtime implementation.
 pub struct DockerRuntime {
-    #[allow(dead_code)]
     config: DockerRuntimeConfig,
 }
 
@@ -181,6 +180,16 @@ impl ContainerRuntime for DockerRuntime {
         let mut cmd = Command::new("docker");
         cmd.arg("build").arg("-f").arg(dockerfile_path);
 
+        // Add memory limit if configured
+        if let Some(memory) = &self.config.build_memory {
+            cmd.arg("--memory").arg(memory);
+        }
+
+        // Add CPU limit if configured
+        if let Some(cpu) = &self.config.build_cpu {
+            cmd.arg("--cpus").arg(cpu);
+        }
+
         for tag in image_tag {
             cmd.arg("-t").arg(tag);
         }
@@ -239,6 +248,14 @@ impl ContainerRuntime for DockerRuntime {
         // Add privileged flag if required
         if runtime_parameters.requires_privileged {
             cmd.arg("--privileged");
+        }
+
+        // Add memory and CPU limits from config
+        if let Some(memory) = &self.config.run_memory {
+            cmd.arg("--memory").arg(memory);
+        }
+        if let Some(cpu) = &self.config.run_cpu {
+            cmd.arg("--cpus").arg(cpu);
         }
 
         // Add environment variables
