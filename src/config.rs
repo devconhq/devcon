@@ -492,7 +492,60 @@ impl_property_registry! {
 /// Docker runtime-specific configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct DockerRuntimeConfig {}
+pub struct DockerRuntimeConfig {
+    /// Memory limit for container builds (e.g., "4g", "512m").
+    ///
+    /// If not set, no memory limit is applied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_memory: Option<String>,
+
+    /// CPU limit for container builds (e.g., "2", "0.5").
+    ///
+    /// If not set, no CPU limit is applied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_cpu: Option<String>,
+
+    /// Memory limit for running containers (e.g., "8g", "512m").
+    ///
+    /// If not set, no memory limit is applied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_memory: Option<String>,
+
+    /// CPU limit for running containers (e.g., "2", "0.5").
+    ///
+    /// If not set, no CPU limit is applied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_cpu: Option<String>,
+}
+
+impl_property_registry! {
+    DockerRuntimeConfig {
+        build_memory: Option<String> => {
+            path: "buildMemory",
+            property_type: PropertyType::String,
+            description: "Memory limit for Docker builds (e.g., 4g, 512m)",
+            validator: PropertyValidator::Memory,
+        },
+        build_cpu: Option<String> => {
+            path: "buildCpu",
+            property_type: PropertyType::String,
+            description: "CPU limit for Docker builds (e.g., 2, 0.5)",
+            validator: PropertyValidator::Cpu,
+        },
+        run_memory: Option<String> => {
+            path: "runMemory",
+            property_type: PropertyType::String,
+            description: "Memory limit for Docker containers (e.g., 8g, 512m)",
+            validator: PropertyValidator::Memory,
+        },
+        run_cpu: Option<String> => {
+            path: "runCpu",
+            property_type: PropertyType::String,
+            description: "CPU limit for Docker containers (e.g., 2, 0.5)",
+            validator: PropertyValidator::Cpu,
+        },
+    }
+}
 
 /// Apple runtime-specific configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -509,6 +562,18 @@ pub struct AppleRuntimeConfig {
     /// If not set, no CPU limit is applied.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build_cpu: Option<String>,
+
+    /// Memory limit for running containers (e.g., "8g", "512m").
+    ///
+    /// Defaults to "8g" if not specified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_memory: Option<String>,
+
+    /// CPU limit for running containers (e.g., "2", "0.5").
+    ///
+    /// Defaults to "2" if not specified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_cpu: Option<String>,
 }
 
 impl Default for AppleRuntimeConfig {
@@ -516,6 +581,8 @@ impl Default for AppleRuntimeConfig {
         Self {
             build_memory: Some("4g".to_string()),
             build_cpu: None,
+            run_memory: Some("8g".to_string()),
+            run_cpu: Some("2".to_string()),
         }
     }
 }
@@ -532,6 +599,18 @@ impl_property_registry! {
             path: "buildCpu",
             property_type: PropertyType::String,
             description: "CPU limit for Apple builds (e.g., 2, 0.5)",
+            validator: PropertyValidator::Cpu,
+        },
+        run_memory: Option<String> => {
+            path: "runMemory",
+            property_type: PropertyType::String,
+            description: "Memory limit for Apple containers (default: 8g)",
+            validator: PropertyValidator::Memory,
+        },
+        run_cpu: Option<String> => {
+            path: "runCpu",
+            property_type: PropertyType::String,
+            description: "CPU limit for Apple containers (default: 2)",
             validator: PropertyValidator::Cpu,
         },
     }
@@ -1009,6 +1088,16 @@ impl Config {
                 .get_property(rest);
         }
 
+        // Handle nested runtimeConfig.docker properties
+        if let Some(rest) = property.strip_prefix("runtimeConfig.docker.") {
+            return self
+                .runtime_config
+                .as_ref()?
+                .docker
+                .as_ref()?
+                .get_property(rest);
+        }
+
         // Handle nested agentForwarding properties
         if let Some(rest) = property.strip_prefix("agentForwarding.") {
             return self.agent_forwarding.as_ref()?.get_property(rest);
@@ -1067,6 +1156,13 @@ impl Config {
             return apple.set_property(rest, value);
         }
 
+        // Handle nested runtimeConfig.docker properties
+        if let Some(rest) = property.strip_prefix("runtimeConfig.docker.") {
+            let runtime_config = self.runtime_config.get_or_insert_with(Default::default);
+            let docker = runtime_config.docker.get_or_insert_with(Default::default);
+            return docker.set_property(rest, value);
+        }
+
         // Handle nested agentForwarding properties
         if let Some(rest) = property.strip_prefix("agentForwarding.") {
             let agent_forwarding = self.agent_forwarding.get_or_insert_with(Default::default);
@@ -1119,6 +1215,16 @@ impl Config {
         {
             if let Some(apple) = runtime_config.apple.as_mut() {
                 return apple.unset_property(rest);
+            }
+            return Ok(());
+        }
+
+        // Handle nested runtimeConfig.docker properties
+        if let Some(rest) = property.strip_prefix("runtimeConfig.docker.")
+            && let Some(runtime_config) = self.runtime_config.as_mut()
+        {
+            if let Some(docker) = runtime_config.docker.as_mut() {
+                return docker.unset_property(rest);
             }
             return Ok(());
         }
@@ -1192,6 +1298,18 @@ impl Config {
             ));
         }
 
+        // Add runtimeConfig.docker properties with prefix
+        for meta in DockerRuntimeConfig::PROPERTIES {
+            all_properties.push((
+                format!("runtimeConfig.docker.{}", meta.path),
+                match meta.property_type {
+                    PropertyType::String => "string".to_string(),
+                    PropertyType::Boolean => "boolean".to_string(),
+                },
+                meta.description.to_string(),
+            ));
+        }
+
         // Add agentForwarding properties with prefix
         for meta in AgentForwardingConfig::PROPERTIES {
             all_properties.push((
@@ -1236,14 +1354,34 @@ impl Config {
         )?;
 
         // Validate runtime config
-        if let Some(rc) = &self.runtime_config
-            && let Some(apple) = &rc.apple
-        {
-            if let Some(mem) = &apple.build_memory {
-                validate_property_value(&PropertyValidator::Memory, mem)?;
+        if let Some(rc) = &self.runtime_config {
+            if let Some(apple) = &rc.apple {
+                if let Some(mem) = &apple.build_memory {
+                    validate_property_value(&PropertyValidator::Memory, mem)?;
+                }
+                if let Some(cpu) = &apple.build_cpu {
+                    validate_property_value(&PropertyValidator::Cpu, cpu)?;
+                }
+                if let Some(mem) = &apple.run_memory {
+                    validate_property_value(&PropertyValidator::Memory, mem)?;
+                }
+                if let Some(cpu) = &apple.run_cpu {
+                    validate_property_value(&PropertyValidator::Cpu, cpu)?;
+                }
             }
-            if let Some(cpu) = &apple.build_cpu {
-                validate_property_value(&PropertyValidator::Cpu, cpu)?;
+            if let Some(docker) = &rc.docker {
+                if let Some(mem) = &docker.build_memory {
+                    validate_property_value(&PropertyValidator::Memory, mem)?;
+                }
+                if let Some(cpu) = &docker.build_cpu {
+                    validate_property_value(&PropertyValidator::Cpu, cpu)?;
+                }
+                if let Some(mem) = &docker.run_memory {
+                    validate_property_value(&PropertyValidator::Memory, mem)?;
+                }
+                if let Some(cpu) = &docker.run_cpu {
+                    validate_property_value(&PropertyValidator::Cpu, cpu)?;
+                }
             }
         }
 
