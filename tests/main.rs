@@ -291,6 +291,74 @@ fn test_build_multiple_features() {
     );
 }
 
+/// Regression test for https://github.com/devconhq/devcon/issues/82.
+///
+/// `mcr.microsoft.com/devcontainers/base:ubuntu` sets `Config.User = "root"` in its Docker image
+/// metadata but embeds `"remoteUser": "vscode"` in the OCI label `devcontainer.metadata`.
+/// devcon must read that label so the container's `_REMOTE_USER` resolves to `"vscode"`, not
+/// `"root"`.
+#[test]
+fn test_up_microsoft_devcontainer_base_resolves_remote_user() {
+    let runtime = get_runtime();
+    if !is_runtime_available(runtime) {
+        println!("Skipping test: {:?} runtime not available", runtime);
+        return;
+    }
+
+    let test_config = create_test_config();
+    let temp_dir = create_test_devcontainer(
+        "test-remote-user-base",
+        "mcr.microsoft.com/devcontainers/base:ubuntu",
+        None,
+    );
+
+    let mut cmd = cargo_bin_cmd!("devcon");
+    let result = cmd
+        .arg("--config")
+        .arg(&test_config)
+        .arg("--output")
+        .arg("json")
+        .arg("up")
+        .arg(temp_dir.path().to_str().unwrap())
+        .output();
+
+    assert!(result.is_ok(), "Failed to execute up command");
+    let output = result.unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "Up command failed.\nStdout: {}\nStderr: {}",
+        stdout,
+        stderr
+    );
+
+    let output_json =
+        serde_json::from_str::<serde_json::Value>(&stdout).expect("Output is not valid JSON");
+    let container_id = output_json["container_id"]
+        .as_str()
+        .expect("Output JSON does not contain container_id");
+
+    // The Dockerfile layer written by devcon injects `ENV _REMOTE_USER=<resolved_user>`.
+    // For this image the devcontainer.metadata label specifies remoteUser=vscode, so devcon
+    // must resolve to "vscode" rather than falling back to the raw Config.User value ("root").
+    let user_output = exec_in_container(runtime, container_id, &["printenv", "_REMOTE_USER"]);
+    assert!(
+        user_output.is_ok(),
+        "Failed to read _REMOTE_USER inside container"
+    );
+    let remote_user = user_output.unwrap().trim().to_string();
+    assert_eq!(
+        remote_user, "vscode",
+        "Expected _REMOTE_USER='vscode' (from devcontainer.metadata label) but got '{}'",
+        remote_user
+    );
+
+    drop(temp_dir);
+}
+
 #[test]
 #[cfg(target_os = "macos")]
 fn test_build_apple_runtime() {
