@@ -301,10 +301,7 @@ impl ProxyServer {
             let handle_out = handle.clone();
             tokio::spawn(async move {
                 let mut buf = vec![0_u8; 8192];
-                loop {
-                    let Ok(n) = stdout.read(&mut buf).await else {
-                        break;
-                    };
+                while let Ok(n) = stdout.read(&mut buf).await {
                     if n == 0 {
                         break;
                     }
@@ -319,10 +316,7 @@ impl ProxyServer {
             let handle_err = handle.clone();
             tokio::spawn(async move {
                 let mut buf = vec![0_u8; 8192];
-                loop {
-                    let Ok(n) = stderr.read(&mut buf).await else {
-                        break;
-                    };
+                while let Ok(n) = stderr.read(&mut buf).await {
                     if n == 0 {
                         break;
                     }
