@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use rand_core::OsRng;
+use russh::keys::ssh_key::rand_core::OsRng;
 use russh::keys::{self, PrivateKey};
 use russh::server::{Auth, Msg, Server as _, Session};
 use russh::{Channel, ChannelId, CryptoVec};
