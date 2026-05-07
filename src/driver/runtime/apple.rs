@@ -77,14 +77,92 @@ impl AppleRuntime {
         Self { config }
     }
 
+    /// Extracts `remoteUser` from the `devcontainer.metadata` OCI label embedded in the image.
+    ///
+    /// The Apple container runtime's inspect JSON uses both lowercase (`config.labels`) and
+    /// Docker-style (`Config.Labels`) key names — we check both.
+    fn remote_user_from_metadata_label(inspect: &serde_json::Value) -> Option<String> {
+        let label_str = inspect
+            .get("Config")
+            .or_else(|| inspect.get("config"))
+            .and_then(|v| v.get("Labels").or_else(|| v.get("labels")))
+            .and_then(|v| v.get("devcontainer.metadata"))
+            .and_then(|v| v.as_str())?;
+
+        let entries: serde_json::Value = serde_json::from_str(label_str).ok()?;
+        entries.as_array()?.iter().rev().find_map(|entry| {
+            entry
+                .get("remoteUser")
+                .and_then(|u| u.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+        })
+    }
+
+    /// Probes the home directory of `user` by running a throwaway container.
+    fn probe_home_for_user(image_tag: &str, user: &str) -> Option<String> {
+        let probe_cmd = "printf '%s' \"$HOME\"";
+        let probes: [Vec<&str>; 2] = [
+            vec![
+                "run",
+                "--rm",
+                "--user",
+                user,
+                "--entrypoint",
+                "sh",
+                image_tag,
+                "-lc",
+                probe_cmd,
+            ],
+            vec![
+                "run",
+                "--rm",
+                "--user",
+                user,
+                "--entrypoint",
+                "/bin/sh",
+                image_tag,
+                "-lc",
+                probe_cmd,
+            ],
+        ];
+
+        for probe in probes {
+            let output = Command::new("container").args(probe).output().ok()?;
+            if !output.status.success() {
+                continue;
+            }
+            let home = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !home.is_empty() {
+                return Some(home);
+            }
+        }
+
+        None
+    }
+
+    /// Returns the conventional home directory path for `user`.
+    fn default_home_for_user(user: &str) -> String {
+        if user == "root" {
+            "/root".to_string()
+        } else {
+            format!("/home/{}", user)
+        }
+    }
+
     fn metadata_user(inspect: &serde_json::Value) -> Option<String> {
-        inspect
-            .get("config")
-            .and_then(|v| v.get("user"))
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(ToString::to_string)
+        // The devcontainer.metadata OCI label takes precedence over config.user / Config.User.
+        Self::remote_user_from_metadata_label(inspect)
+            .or_else(|| {
+                inspect
+                    .get("config")
+                    .and_then(|v| v.get("user"))
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(ToString::to_string)
+            })
             .or_else(|| {
                 inspect
                     .get("Config")
@@ -547,6 +625,24 @@ impl ContainerRuntime for AppleRuntime {
             map.insert(
                 "_devconDetectedUser".to_string(),
                 serde_json::Value::String(user),
+            );
+            map.insert(
+                "_devconDetectedHome".to_string(),
+                serde_json::Value::String(home),
+            );
+        }
+
+        // The devcontainer.metadata label is authoritative for the remote user.
+        // Override whatever the probe detected so that images with Config.User=root
+        // but a metadata label remoteUser resolve to the correct user and home.
+        if let Some(label_user) = Self::remote_user_from_metadata_label(&inspect)
+            && let serde_json::Value::Object(ref mut map) = inspect
+        {
+            let home = Self::probe_home_for_user(image_tag, &label_user)
+                .unwrap_or_else(|| Self::default_home_for_user(&label_user));
+            map.insert(
+                "_devconDetectedUser".to_string(),
+                serde_json::Value::String(label_user),
             );
             map.insert(
                 "_devconDetectedHome".to_string(),

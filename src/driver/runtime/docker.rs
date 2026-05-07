@@ -65,14 +65,98 @@ impl DockerRuntime {
         Self { config }
     }
 
-    fn metadata_user(inspect: &serde_json::Value) -> Option<String> {
-        inspect
+    /// Extracts `remoteUser` from the `devcontainer.metadata` OCI label embedded in the image.
+    ///
+    /// Devcontainer-aware images (e.g. `mcr.microsoft.com/devcontainers/base:ubuntu`) set
+    /// `Config.User` to `root` for technical reasons, but encode the intended development user
+    /// in a JSON array stored in the `devcontainer.metadata` label.  The last entry that
+    /// contains a non-empty `remoteUser` field wins (per the devcontainer spec merge order).
+    fn remote_user_from_metadata_label(inspect: &serde_json::Value) -> Option<String> {
+        let label_str = inspect
             .get("Config")
-            .and_then(|v| v.get("User"))
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(ToString::to_string)
+            .and_then(|v| v.get("Labels"))
+            .and_then(|v| v.get("devcontainer.metadata"))
+            .and_then(|v| v.as_str())?;
+
+        let entries: serde_json::Value = serde_json::from_str(label_str).ok()?;
+        entries.as_array()?.iter().rev().find_map(|entry| {
+            entry
+                .get("remoteUser")
+                .and_then(|u| u.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+        })
+    }
+
+    /// Probes the home directory of `user` by running a throwaway container.
+    ///
+    /// Returns `None` if the probe fails (e.g. the user does not exist in the image).
+    fn probe_home_for_user(image_tag: &str, user: &str) -> Option<String> {
+        let probes: [Vec<&str>; 2] = [
+            vec![
+                "--user",
+                user,
+                "--entrypoint",
+                "sh",
+                image_tag,
+                "-lc",
+                "printf '%s' \"$HOME\"",
+            ],
+            vec![
+                "--user",
+                user,
+                "--entrypoint",
+                "/bin/sh",
+                image_tag,
+                "-lc",
+                "printf '%s' \"$HOME\"",
+            ],
+        ];
+
+        for probe in probes {
+            let output = Command::new("docker")
+                .arg("run")
+                .arg("--rm")
+                .args(probe)
+                .output()
+                .ok()?;
+
+            if !output.status.success() {
+                continue;
+            }
+
+            let home = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !home.is_empty() {
+                return Some(home);
+            }
+        }
+
+        None
+    }
+
+    /// Returns the conventional home directory path for `user`.
+    fn default_home_for_user(user: &str) -> String {
+        if user == "root" {
+            "/root".to_string()
+        } else {
+            format!("/home/{}", user)
+        }
+    }
+
+    fn metadata_user(inspect: &serde_json::Value) -> Option<String> {
+        // The devcontainer.metadata OCI label takes precedence over Config.User.
+        // Devcontainer-aware images may set Config.User to "root" while embedding
+        // the real remote user (e.g. "vscode") in the label.
+        Self::remote_user_from_metadata_label(inspect).or_else(|| {
+            inspect
+                .get("Config")
+                .and_then(|v| v.get("User"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(ToString::to_string)
+        })
     }
 
     fn metadata_home(inspect: &serde_json::Value) -> Option<String> {
@@ -520,10 +604,60 @@ impl ContainerRuntime for DockerRuntime {
             );
         }
 
+        // The devcontainer.metadata label is authoritative for the remote user.
+        // Override whatever the probe detected so that images like
+        // mcr.microsoft.com/devcontainers/base:ubuntu (which run as root but embed
+        // remoteUser=vscode in the label) resolve to the correct user and home.
+        if let Some(label_user) = Self::remote_user_from_metadata_label(&inspect)
+            && let serde_json::Value::Object(ref mut map) = inspect
+        {
+            let home = Self::probe_home_for_user(image_tag, &label_user)
+                .unwrap_or_else(|| Self::default_home_for_user(&label_user));
+            map.insert(
+                "_devconDetectedUser".to_string(),
+                serde_json::Value::String(label_user),
+            );
+            map.insert(
+                "_devconDetectedHome".to_string(),
+                serde_json::Value::String(home),
+            );
+        }
+
         Ok(Some(inspect))
     }
 
     fn get_host_address(&self) -> String {
         "host.docker.internal".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Images like `mcr.microsoft.com/devcontainers/base:ubuntu` have `Config.User` set to
+    /// `"root"` but embed the intended remote user (`vscode`) in the OCI label
+    /// `devcontainer.metadata`. This test demonstrates that `metadata_user` must read the label
+    /// rather than returning the raw `Config.User` value in that case.
+    #[test]
+    fn test_metadata_user_reads_devcontainer_metadata_label() {
+        let inspect = serde_json::json!({
+            "Config": {
+                "User": "root",
+                "Labels": {
+                    "devcontainer.metadata": "[{\"remoteUser\": \"vscode\"}]"
+                }
+            }
+        });
+
+        // Config.User is "root", but devcontainer.metadata specifies remoteUser as "vscode".
+        // metadata_user should prefer the devcontainer.metadata label over Config.User = "root".
+        let user = DockerRuntime::metadata_user(&inspect);
+        assert_eq!(
+            user.as_deref(),
+            Some("vscode"),
+            "metadata_user should resolve remoteUser from the devcontainer.metadata label \
+             when Config.User is 'root'"
+        );
     }
 }
