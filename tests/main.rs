@@ -603,6 +603,71 @@ fn test_up_rebuilds_when_config_changes() {
 }
 
 #[test]
+fn test_up_force_rebuild() {
+    let runtime = get_runtime();
+    if !is_runtime_available(runtime) {
+        println!("Skipping test: {:?} runtime not available", runtime);
+        return;
+    }
+
+    let test_config = create_test_config();
+    cleanup_test_artifacts(runtime, "test-force-rebuild");
+    let temp_dir = create_test_devcontainer(
+        "test-force-rebuild",
+        "mcr.microsoft.com/devcontainers/base:ubuntu",
+        None,
+    );
+
+    // First `up` — builds the image normally.
+    let mut cmd = cargo_bin_cmd!("devcon");
+    let result = cmd
+        .arg("--config")
+        .arg(&test_config)
+        .arg("up")
+        .arg(temp_dir.path().to_str().unwrap())
+        .output();
+
+    assert!(result.is_ok(), "Failed to execute first up command");
+    let output = result.unwrap();
+    assert!(
+        output.status.success(),
+        "First up command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let image_id_after_first_up = get_image_id(runtime, "devcon-test-force-rebuild:latest")
+        .expect("Image not found after first up");
+
+    // Second `up` with --force-rebuild — config is unchanged, but must rebuild anyway.
+    let mut cmd = cargo_bin_cmd!("devcon");
+    let result = cmd
+        .arg("--config")
+        .arg(&test_config)
+        .arg("up")
+        .arg("--force-rebuild")
+        .arg(temp_dir.path().to_str().unwrap())
+        .output();
+
+    assert!(result.is_ok(), "Failed to execute second up command");
+    let output = result.unwrap();
+    assert!(
+        output.status.success(),
+        "Second up command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let image_id_after_force_rebuild = get_image_id(runtime, "devcon-test-force-rebuild:latest")
+        .expect("Image not found after force rebuild");
+
+    assert_ne!(
+        image_id_after_first_up, image_id_after_force_rebuild,
+        "Image was NOT rebuilt when --force-rebuild was passed"
+    );
+
+    drop(temp_dir);
+}
+
+#[test]
 #[cfg(target_os = "macos")]
 fn test_build_apple_runtime() {
     let runtime = Runtime::Apple;

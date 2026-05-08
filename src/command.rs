@@ -736,7 +736,7 @@ pub fn handle_ssh_command(
 /// # use devcon::command::handle_up_command;
 ///
 /// let project_path = PathBuf::from("/path/to/project");
-/// handle_up_command(project_path, None, None, devcon::output::OutputFormat::Text)?;
+/// handle_up_command(project_path, None, None, devcon::output::OutputFormat::Text, false)?;
 /// # Ok::<(), devcon::error::Error>(())
 /// ```
 pub fn handle_up_command(
@@ -744,6 +744,7 @@ pub fn handle_up_command(
     build_path: Option<PathBuf>,
     config_path: Option<PathBuf>,
     output: OutputFormat,
+    force_rebuild: bool,
 ) -> Result<()> {
     warn_if_serve_not_running();
     let config = Config::load(config_path)?;
@@ -763,15 +764,19 @@ pub fn handle_up_command(
     // Process features once
     let (processed_features, _) = driver.prepare_features(&devcontainer_workspace)?;
 
-    // Only build if the config has changed or the image does not yet exist.
+    // Only build if the config has changed, the image does not yet exist, or a force rebuild
+    // was requested.
     // Docker rebuilding the same Dockerfile always produces a new image ID (the manifest includes
     // a created timestamp), which would cause `start_with_features` to treat the existing
     // container as stale and create a new one on every `devcon up` — the bug reported in #85.
     // The config hash (stored as a LABEL on the image) detects genuine changes while keeping
     // the no-op fast-path when nothing has changed.
-    if driver.image_is_current(&devcontainer_workspace)? {
+    if !force_rebuild && driver.image_is_current(&devcontainer_workspace)? {
         debug!("Config hash unchanged, skipping build");
     } else {
+        if force_rebuild {
+            debug!("Force rebuild requested, rebuilding image");
+        }
         driver.build_with_features(
             devcontainer_workspace.clone(),
             &[],
