@@ -163,6 +163,10 @@ enum Commands {
         /// Path to the build directory.
         #[arg(short, long, help = "Path to the build directory.")]
         build_path: Option<PathBuf>,
+
+        /// Force a rebuild even if the config hash is unchanged.
+        #[arg(long, help = "Force a rebuild, ignoring the cached image.")]
+        force_rebuild: bool,
     },
     /// Execs a shell in a development container for the specified path
     #[command(about = "Exec a shell in a development container with the devcontainer CLI")]
@@ -282,12 +286,17 @@ fn main() -> devcon::error::Result<()> {
                 output,
             )?;
         }
-        Commands::Up { path, build_path } => {
+        Commands::Up {
+            path,
+            build_path,
+            force_rebuild,
+        } => {
             handle_up_command(
                 path.clone().unwrap_or(PathBuf::from(".").to_path_buf()),
                 build_path.clone(),
                 config_path,
                 output,
+                *force_rebuild,
             )?;
         }
         Commands::Shell { path, env } => {
