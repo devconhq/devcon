@@ -182,10 +182,7 @@ pub fn extract_container_name(output: &str) -> Option<String> {
 #[allow(dead_code)]
 pub fn stop_container(runtime: Runtime, container_id: &str) {
     let cmd = runtime_cmd(runtime);
-    let _ = Command::new(cmd)
-        .arg("stop")
-        .arg(container_id)
-        .output();
+    let _ = Command::new(cmd).arg("stop").arg(container_id).output();
 }
 
 /// Remove all containers and images belonging to a devcon test project.
@@ -204,7 +201,14 @@ pub fn cleanup_test_artifacts(runtime: Runtime, project_name: &str) {
         Runtime::Docker => {
             // Find all containers (running or stopped) for this project
             let ps_output = Command::new(cmd)
-                .args(["ps", "-a", "--filter", &format!("label={}", label), "--format", "{{.ID}}"])
+                .args([
+                    "ps",
+                    "-a",
+                    "--filter",
+                    &format!("label={}", label),
+                    "--format",
+                    "{{.ID}}",
+                ])
                 .output();
             if let Ok(out) = ps_output {
                 let ids = String::from_utf8_lossy(&out.stdout);
@@ -219,7 +223,11 @@ pub fn cleanup_test_artifacts(runtime: Runtime, project_name: &str) {
                 .output();
             if let Ok(out) = img_output {
                 let tags = String::from_utf8_lossy(&out.stdout);
-                for tag in tags.lines().map(str::trim).filter(|t| t.starts_with(&image_prefix)) {
+                for tag in tags
+                    .lines()
+                    .map(str::trim)
+                    .filter(|t| t.starts_with(&image_prefix))
+                {
                     let _ = Command::new(cmd).args(["rmi", "-f", tag]).output();
                 }
             }
@@ -236,12 +244,16 @@ pub fn cleanup_test_artifacts(runtime: Runtime, project_name: &str) {
                     let name = entry["name"].as_str().unwrap_or("");
                     // devcon container name is devcon.<project_name>
                     if name == format!("devcon.{}", project_name) {
-                        let _ = Command::new(cmd).args(["container", "rm", "-f", name]).output();
+                        let _ = Command::new(cmd)
+                            .args(["container", "rm", "-f", name])
+                            .output();
                     }
                 }
             }
             // Remove images
-            let img_output = Command::new(cmd).args(["image", "list", "--format", "json"]).output();
+            let img_output = Command::new(cmd)
+                .args(["image", "list", "--format", "json"])
+                .output();
             if let Ok(out) = img_output
                 && let Ok(entries) = serde_json::from_slice::<Vec<serde_json::Value>>(&out.stdout)
             {
@@ -250,7 +262,9 @@ pub fn cleanup_test_artifacts(runtime: Runtime, project_name: &str) {
                     let tag = entry["tag"].as_str().unwrap_or("");
                     let full = format!("{}:{}", repo, tag);
                     if full.starts_with(&image_prefix) {
-                        let _ = Command::new(cmd).args(["image", "rm", "-f", &full]).output();
+                        let _ = Command::new(cmd)
+                            .args(["image", "rm", "-f", &full])
+                            .output();
                     }
                 }
             }

@@ -438,8 +438,8 @@ fn test_start_reuses_stopped_container() {
         stderr
     );
 
-    let start_json = serde_json::from_str::<serde_json::Value>(&stdout)
-        .expect("start output is not valid JSON");
+    let start_json =
+        serde_json::from_str::<serde_json::Value>(&stdout).expect("start output is not valid JSON");
     let container_id_after_start = start_json["container_id"]
         .as_str()
         .expect("start output JSON does not contain container_id")

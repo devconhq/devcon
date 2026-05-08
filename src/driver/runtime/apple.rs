@@ -558,10 +558,7 @@ impl ContainerRuntime for AppleRuntime {
         self.list_containers(true)
     }
 
-    fn start_container(
-        &self,
-        container_id: &str,
-    ) -> Result<Box<dyn super::ContainerHandle>> {
+    fn start_container(&self, container_id: &str) -> Result<Box<dyn super::ContainerHandle>> {
         let output = Command::new("container")
             .arg("start")
             .arg(container_id)
