@@ -17,6 +17,107 @@ struct PtyInfo {
     rows: u32,
 }
 
+/// Holds all information needed to spawn a container exec process.
+#[derive(Debug)]
+struct ExecCommandSpec {
+    program: String,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+}
+
+/// Builds the exec command spec without side effects, enabling unit testing.
+///
+/// The `-t` flag (PTY allocation) is only added for interactive shell sessions
+/// (i.e. `requested_command` is `None`). Specific commands must never receive a
+/// PTY because the resulting escape sequences corrupt their output.
+fn build_exec_command(
+    runtime_name: &str,
+    container_id: &str,
+    default_shell: &str,
+    pty_info: Option<&PtyInfo>,
+    requested_command: Option<&str>,
+) -> ExecCommandSpec {
+    let has_pty = pty_info.is_some();
+    let interactive_shell_cmd = pty_info.map(|pty| {
+        format!(
+            "stty cols {} rows {} 2>/dev/null; exec {} -i",
+            pty.cols, pty.rows, default_shell
+        )
+    });
+
+    let (program, args) = if runtime_name == "apple" {
+        if let Some(command) = requested_command {
+            // For specific commands, skip the `script` PTY wrapper to avoid
+            // escape sequences polluting command output (e.g. `uname`).
+            let args = vec![
+                "exec".to_string(),
+                "-i".to_string(),
+                container_id.to_string(),
+                default_shell.to_string(),
+                "-lic".to_string(),
+                command.to_string(),
+            ];
+            ("container".to_string(), args)
+        } else {
+            // Interactive shell: use `script` to allocate a PTY on the host side.
+            let mut args = vec![
+                "-q".to_string(),
+                "/dev/null".to_string(),
+                "container".to_string(),
+                "exec".to_string(),
+                "-t".to_string(),
+                "-i".to_string(),
+                container_id.to_string(),
+            ];
+            if let Some(shell_cmd) = &interactive_shell_cmd {
+                args.push("sh".to_string());
+                args.push("-lc".to_string());
+                args.push(shell_cmd.clone());
+            } else {
+                args.push(default_shell.to_string());
+                args.push("-i".to_string());
+            }
+            ("script".to_string(), args)
+        }
+    } else {
+        // Docker (and any other runtime).
+        let mut args = vec!["exec".to_string()];
+        // Only allocate a PTY when running an interactive shell, not for
+        // specific commands.  Allocating a PTY for commands like `uname`
+        // injects cursor-control escape sequences into their output which
+        // breaks clients that parse the result (e.g. Zed remote development).
+        if has_pty && requested_command.is_none() {
+            args.push("-t".to_string());
+        }
+        args.push("-i".to_string());
+        args.push(container_id.to_string());
+
+        if let Some(command) = requested_command {
+            args.push(default_shell.to_string());
+            args.push("-lic".to_string());
+            args.push(command.to_string());
+        } else if let Some(shell_cmd) = &interactive_shell_cmd {
+            args.push("sh".to_string());
+            args.push("-lc".to_string());
+            args.push(shell_cmd.clone());
+        } else {
+            args.push(default_shell.to_string());
+            args.push("-i".to_string());
+        }
+
+        ("docker".to_string(), args)
+    };
+
+    let mut env = vec![("SHELL".to_string(), default_shell.to_string())];
+    if let Some(pty) = pty_info {
+        env.push(("TERM".to_string(), pty.term.clone()));
+        env.push(("COLUMNS".to_string(), pty.cols.to_string()));
+        env.push(("LINES".to_string(), pty.rows.to_string()));
+    }
+
+    ExecCommandSpec { program, args, env }
+}
+
 fn normalize_pty(term: &str, cols: u32, rows: u32) -> PtyInfo {
     let normalized_term = if term.is_empty() {
         "xterm-256color".to_string()
@@ -213,66 +314,21 @@ impl ProxyServer {
             lock.get(&key).cloned()
         };
 
-        let has_pty = pty_info.is_some();
+        let spec = build_exec_command(
+            &self.state.runtime_name,
+            &self.state.container_id,
+            &self.state.default_shell,
+            pty_info.as_ref(),
+            requested_command.as_deref(),
+        );
 
-        let interactive_shell_cmd = pty_info.as_ref().map(|pty| {
-            format!(
-                "stty cols {} rows {} 2>/dev/null; exec {} -i",
-                pty.cols, pty.rows, self.state.default_shell
-            )
-        });
-
-        let mut cmd = if self.state.runtime_name == "apple" {
-            let mut c = Command::new("script");
-            c.arg("-q").arg("/dev/null");
-            c.arg("container").arg("exec").arg("-t").arg("-i");
-            c.arg(&self.state.container_id);
-            if let Some(command) = requested_command {
-                c.arg(&self.state.default_shell).arg("-lic").arg(command);
-            } else if let Some(shell_cmd) = &interactive_shell_cmd {
-                c.arg("sh").arg("-lc").arg(shell_cmd);
-            } else {
-                c.arg(&self.state.default_shell).arg("-i");
-            }
-            c
-        } else {
-            let mut c = match self.state.runtime_name.as_str() {
-                "apple" => {
-                    let mut inner = Command::new("container");
-                    inner.arg("exec");
-                    inner
-                }
-                _ => {
-                    let mut inner = Command::new("docker");
-                    inner.arg("exec");
-                    inner
-                }
-            };
-
-            if has_pty && self.state.runtime_name == "docker" {
-                c.arg("-t");
-            }
-
-            c.arg("-i").arg(&self.state.container_id);
-
-            if let Some(command) = requested_command {
-                c.arg(&self.state.default_shell).arg("-lic").arg(command);
-            } else if let Some(shell_cmd) = &interactive_shell_cmd {
-                c.arg("sh").arg("-lc").arg(shell_cmd);
-            } else {
-                c.arg(&self.state.default_shell).arg("-i");
-            }
-
-            c
-        };
-
-        if let Some(pty) = pty_info {
-            cmd.env("TERM", pty.term)
-                .env("COLUMNS", pty.cols.to_string())
-                .env("LINES", pty.rows.to_string());
+        let mut cmd = Command::new(&spec.program);
+        for arg in &spec.args {
+            cmd.arg(arg);
         }
-
-        cmd.env("SHELL", &self.state.default_shell);
+        for (key, val) in &spec.env {
+            cmd.env(key, val);
+        }
 
         cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -440,5 +496,137 @@ impl Drop for SshProxyServer {
         {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CONTAINER: &str = "test-container-id";
+    const SHELL: &str = "/bin/bash";
+
+    fn pty() -> PtyInfo {
+        normalize_pty("xterm-256color", 120, 30)
+    }
+
+    // ── Docker ────────────────────────────────────────────────────────────────
+
+    /// pty_request + exec_request(command) → no `-t` (regression guard for #90)
+    #[test]
+    fn docker_exec_with_pty_does_not_allocate_tty() {
+        let spec = build_exec_command("docker", CONTAINER, SHELL, Some(&pty()), Some("uname"));
+        assert_eq!(spec.program, "docker");
+        assert!(
+            !spec.args.contains(&"-t".to_string()),
+            "docker exec must not pass -t for a specific command even when pty was requested; \
+             got args: {:?}",
+            spec.args
+        );
+    }
+
+    /// pty_request + shell_request → `-t` is present
+    #[test]
+    fn docker_shell_with_pty_allocates_tty() {
+        let spec = build_exec_command("docker", CONTAINER, SHELL, Some(&pty()), None);
+        assert_eq!(spec.program, "docker");
+        assert!(
+            spec.args.contains(&"-t".to_string()),
+            "docker exec should pass -t for an interactive shell when pty was requested; \
+             got args: {:?}",
+            spec.args
+        );
+    }
+
+    /// no pty_request + exec_request(command) → no `-t`
+    #[test]
+    fn docker_exec_without_pty_does_not_allocate_tty() {
+        let spec = build_exec_command("docker", CONTAINER, SHELL, None, Some("uname"));
+        assert_eq!(spec.program, "docker");
+        assert!(
+            !spec.args.contains(&"-t".to_string()),
+            "docker exec must not pass -t when no pty was requested; got args: {:?}",
+            spec.args
+        );
+    }
+
+    /// no pty_request + shell_request → no `-t`
+    #[test]
+    fn docker_shell_without_pty_does_not_allocate_tty() {
+        let spec = build_exec_command("docker", CONTAINER, SHELL, None, None);
+        assert_eq!(spec.program, "docker");
+        assert!(
+            !spec.args.contains(&"-t".to_string()),
+            "docker exec must not pass -t for a shell when no pty was requested; \
+             got args: {:?}",
+            spec.args
+        );
+    }
+
+    // ── Apple ─────────────────────────────────────────────────────────────────
+
+    /// pty_request + exec_request(command) → uses `container exec` directly, no `script` wrapper
+    #[test]
+    fn apple_exec_with_pty_does_not_use_script_wrapper() {
+        let spec = build_exec_command("apple", CONTAINER, SHELL, Some(&pty()), Some("uname"));
+        assert_eq!(
+            spec.program, "container",
+            "Apple exec with a specific command should call `container` directly, not `script`; \
+             program was: {:?}",
+            spec.program
+        );
+        assert!(
+            !spec.args.contains(&"-t".to_string()),
+            "Apple exec with a specific command must not pass -t; got args: {:?}",
+            spec.args
+        );
+    }
+
+    /// pty_request + shell_request → uses `script` wrapper with `-t`
+    #[test]
+    fn apple_shell_with_pty_uses_script_wrapper() {
+        let spec = build_exec_command("apple", CONTAINER, SHELL, Some(&pty()), None);
+        assert_eq!(
+            spec.program, "script",
+            "Apple interactive shell should use the `script` PTY wrapper"
+        );
+        assert!(
+            spec.args.contains(&"-t".to_string()),
+            "Apple interactive shell should pass -t to container exec; got args: {:?}",
+            spec.args
+        );
+    }
+
+    // ── Env vars ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn env_contains_term_when_pty_present() {
+        let spec = build_exec_command("docker", CONTAINER, SHELL, Some(&pty()), Some("uname"));
+        let term_val = spec
+            .env
+            .iter()
+            .find(|(k, _)| k == "TERM")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(term_val, Some("xterm-256color"));
+    }
+
+    #[test]
+    fn env_does_not_contain_term_without_pty() {
+        let spec = build_exec_command("docker", CONTAINER, SHELL, None, Some("uname"));
+        assert!(
+            !spec.env.iter().any(|(k, _)| k == "TERM"),
+            "TERM should not be set when no pty was requested"
+        );
+    }
+
+    #[test]
+    fn env_always_contains_shell() {
+        let spec = build_exec_command("docker", CONTAINER, SHELL, None, None);
+        let shell_val = spec
+            .env
+            .iter()
+            .find(|(k, _)| k == "SHELL")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(shell_val, Some(SHELL));
     }
 }
