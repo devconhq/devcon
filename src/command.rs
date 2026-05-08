@@ -37,6 +37,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 
+use dirs;
+
 use crate::error::{Error, Result};
 use crate::output::OutputFormat;
 use crate::{
@@ -704,6 +706,110 @@ pub fn handle_ssh_command(
     Ok(())
 }
 
+/// Handles the `ssh create-config` command.
+///
+/// Writes (or replaces) a `Host devcon-<name>` block in `~/.ssh/config` so that
+/// `ssh devcon-<name>` transparently proxies through `devcon ssh connect --proxy`.
+pub fn handle_ssh_create_config_command(
+    path: PathBuf,
+    _config_path: Option<PathBuf>,
+) -> Result<()> {
+    let workspace = Workspace::try_from(path.clone())?;
+    let host_alias = format!("devcon-{}", workspace.get_sanitized_name());
+    let canonical_path = workspace.path.display().to_string();
+
+    let block = format!(
+        "Host {host_alias}\n\
+         \tHostName 127.0.0.1\n\
+         \tUser devcon\n\
+         \tStrictHostKeyChecking no\n\
+         \tUserKnownHostsFile /dev/null\n\
+         \tLogLevel ERROR\n\
+         \tProxyCommand devcon ssh connect {canonical_path} --proxy\n"
+    );
+
+    let home = dirs::home_dir()
+        .ok_or_else(|| Error::runtime("Cannot determine home directory"))?;
+    let ssh_dir = home.join(".ssh");
+    let config_file = ssh_dir.join("config");
+
+    // Ensure ~/.ssh exists
+    if !ssh_dir.exists() {
+        std::fs::create_dir_all(&ssh_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&ssh_dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+
+    // Read existing config (empty string if file doesn't exist)
+    let existing = if config_file.exists() {
+        std::fs::read_to_string(&config_file)?
+    } else {
+        String::new()
+    };
+
+    let updated = replace_or_append_host_block(&existing, &host_alias, &block);
+
+    std::fs::write(&config_file, &updated)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&config_file, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    println!("SSH config entry written for host: {host_alias}");
+    println!("You can now connect with: ssh {host_alias}");
+    Ok(())
+}
+
+/// Replace an existing `Host <alias>` block in an SSH config string, or append if absent.
+///
+/// A block is considered to end at the next `Host ` line (case-sensitive) or EOF.
+fn replace_or_append_host_block(existing: &str, host_alias: &str, new_block: &str) -> String {
+    let needle = format!("Host {host_alias}");
+    let mut result = String::new();
+    let mut inside_block = false;
+    let mut replaced = false;
+
+    for line in existing.lines() {
+        if line.trim_start().starts_with("Host ") {
+            if inside_block {
+                // We've moved past the target block without finding its end — shouldn't happen,
+                // but close it out cleanly.
+                inside_block = false;
+            }
+            if line.trim() == needle {
+                // Start of the block we want to replace
+                inside_block = true;
+                result.push_str(new_block);
+                replaced = true;
+                continue;
+            }
+        }
+
+        if inside_block {
+            // Skip lines belonging to the old block
+            continue;
+        }
+
+        result.push_str(line);
+        result.push('\n');
+    }
+
+    if !replaced {
+        if !result.is_empty() && !result.ends_with('\n') {
+            result.push('\n');
+        }
+        result.push('\n');
+        result.push_str(new_block);
+    }
+
+    result
+}
+
 /// Handles the up command for building and starting a development container.
 ///
 /// This function:
@@ -1222,5 +1328,39 @@ mod test {
             OutputFormat::Text,
         );
         assert!(result.is_ok(), "Build command failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_replace_or_append_host_block_append_to_empty() {
+        let result = replace_or_append_host_block("", "devcon-myproject", "Host devcon-myproject\n\tUser devcon\n");
+        assert!(result.contains("Host devcon-myproject"));
+        assert!(result.contains("User devcon"));
+    }
+
+    #[test]
+    fn test_replace_or_append_host_block_append_to_existing() {
+        let existing = "Host other\n\tUser foo\n";
+        let result = replace_or_append_host_block(existing, "devcon-myproject", "Host devcon-myproject\n\tUser devcon\n");
+        assert!(result.contains("Host other"));
+        assert!(result.contains("Host devcon-myproject"));
+    }
+
+    #[test]
+    fn test_replace_or_append_host_block_replaces_existing() {
+        let existing = "Host devcon-myproject\n\tUser old\n\tHostName 1.2.3.4\n";
+        let result = replace_or_append_host_block(existing, "devcon-myproject", "Host devcon-myproject\n\tUser devcon\n");
+        assert!(result.contains("User devcon"));
+        assert!(!result.contains("User old"));
+        assert!(!result.contains("1.2.3.4"));
+    }
+
+    #[test]
+    fn test_replace_or_append_host_block_replaces_middle_block() {
+        let existing = "Host first\n\tUser a\nHost devcon-myproject\n\tUser old\nHost last\n\tUser b\n";
+        let result = replace_or_append_host_block(existing, "devcon-myproject", "Host devcon-myproject\n\tUser devcon\n");
+        assert!(result.contains("Host first"));
+        assert!(result.contains("Host last"));
+        assert!(result.contains("User devcon"));
+        assert!(!result.contains("User old"));
     }
 }
