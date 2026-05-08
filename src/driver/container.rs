@@ -726,6 +726,7 @@ ENV _CONTAINER_USER={{ container_user }}
 ENV _REMOTE_USER_HOME={{ remote_user_home }}
 ENV _CONTAINER_USER_HOME={{ container_user_home }}
 ENV DEVCON_CONTROL_HOST={{ runtime_host_address }}
+LABEL devcon.config-hash={{ config_hash }}
 
 USER root
 RUN mkdir /tmp/features
@@ -743,6 +744,8 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
 "#,
         )?;
 
+        let config_hash = self.get_devcontainer_id(&devcontainer_workspace);
+
         let contents = template.render(minijinja::context! {
             image => &base_image,
             remote_user => &resolved_users.remote_user,
@@ -754,6 +757,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
             env_setup => &env_setup,
             workspace_name => devcontainer_workspace.path.file_name().unwrap().to_string_lossy(),
             runtime_host_address => self.runtime.get_host_address(),
+            config_hash => &config_hash,
         })?;
 
         fs::write(&dockerfile, contents)?;
@@ -1744,7 +1748,6 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
 
         match fs::read_to_string(&devcontainer_path) {
             Ok(content) => {
-                // Hash the file content for configuration-specific ID
                 hasher.update(content.as_bytes());
             }
             Err(_) => {
@@ -1753,8 +1756,56 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
             }
         }
 
+        // Also hash the Dockerfile when a build config references one, so that
+        // changes to the Dockerfile trigger a rebuild even if devcontainer.json
+        // is unchanged.
+        if let Some(build_config) = &devcontainer_workspace.devcontainer.build {
+            if build_config.dockerfile.is_some() {
+                let devcontainer_dir = if devcontainer_path.exists() {
+                    devcontainer_path
+                        .parent()
+                        .unwrap_or(&devcontainer_workspace.path)
+                        .to_path_buf()
+                } else {
+                    devcontainer_workspace.path.clone()
+                };
+                let dockerfile_path = resolve_dockerfile_path(build_config, &devcontainer_dir);
+                if let Ok(df_content) = fs::read_to_string(&dockerfile_path) {
+                    hasher.update(df_content.as_bytes());
+                }
+            }
+
+            // Hash build args (sorted for determinism) so arg changes invalidate the cache.
+            if let Some(args) = &build_config.args {
+                let mut sorted_args: Vec<(&String, &String)> = args.iter().collect();
+                sorted_args.sort_by_key(|(k, _)| *k);
+                for (k, v) in sorted_args {
+                    hasher.update(format!("{}={}", k, v).as_bytes());
+                }
+            }
+        }
+
         let result = hasher.finalize();
         format!("{:x}", result)
+    }
+
+    /// Returns `true` when the existing image's config hash matches the current workspace config.
+    ///
+    /// The hash is stored as the `devcon.config-hash` image label at build time. If the image is
+    /// absent or the label is missing (e.g. an image built by an older version of devcon), this
+    /// method returns `false` so that a rebuild is triggered.
+    pub fn image_is_current(&self, devcontainer_workspace: &Workspace) -> Result<bool> {
+        let latest_tag = format!("{}:latest", self.get_image_tag(devcontainer_workspace));
+        let stored = self
+            .runtime
+            .image_label(&latest_tag, "devcon.config-hash")?;
+        match stored {
+            None => Ok(false),
+            Some(stored_hash) => {
+                let current_hash = self.get_devcontainer_id(devcontainer_workspace);
+                Ok(stored_hash == current_hash)
+            }
+        }
     }
 
     fn user_home(user: &str) -> String {

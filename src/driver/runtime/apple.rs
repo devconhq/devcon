@@ -688,6 +688,19 @@ impl ContainerRuntime for AppleRuntime {
         Ok(Some(inspect))
     }
 
+    fn image_label(&self, image_tag: &str, label_key: &str) -> Result<Option<String>> {
+        let inspect = self.inspect_image(image_tag)?;
+        // Apple's inspect JSON uses both lowercase and Docker-style key names.
+        let value = inspect
+            .as_ref()
+            .and_then(|v| v.get("Config").or_else(|| v.get("config")))
+            .and_then(|v| v.get("Labels").or_else(|| v.get("labels")))
+            .and_then(|v| v.get(label_key))
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string);
+        Ok(value)
+    }
+
     fn get_host_address(&self) -> String {
         "host.container.internal".to_string()
     }

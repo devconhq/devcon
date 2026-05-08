@@ -763,13 +763,14 @@ pub fn handle_up_command(
     // Process features once
     let (processed_features, _) = driver.prepare_features(&devcontainer_workspace)?;
 
-    // Only build if the image does not already exist. Docker rebuilding the same Dockerfile
-    // always produces a new image ID (the manifest includes a created timestamp), which would
-    // cause `start_with_features` to treat the existing container as stale and create a new
-    // one on every `devcon up` — the bug reported in #85.  When the image is already present
-    // the existing container remains current and is reused.
-    if driver.image_exists(&devcontainer_workspace)? {
-        debug!("Image already exists, skipping build");
+    // Only build if the config has changed or the image does not yet exist.
+    // Docker rebuilding the same Dockerfile always produces a new image ID (the manifest includes
+    // a created timestamp), which would cause `start_with_features` to treat the existing
+    // container as stale and create a new one on every `devcon up` — the bug reported in #85.
+    // The config hash (stored as a LABEL on the image) detects genuine changes while keeping
+    // the no-op fast-path when nothing has changed.
+    if driver.image_is_current(&devcontainer_workspace)? {
+        debug!("Config hash unchanged, skipping build");
     } else {
         driver.build_with_features(
             devcontainer_workspace.clone(),
