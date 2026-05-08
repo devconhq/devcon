@@ -392,6 +392,19 @@ pub trait ContainerRuntime: Send {
     /// `Ok(Some(metadata))` if inspect succeeds, `Ok(None)` if the image does not exist.
     fn inspect_image(&self, image_tag: &str) -> Result<Option<serde_json::Value>>;
 
+    /// Read a single label from an image's metadata.
+    ///
+    /// # Arguments
+    ///
+    /// * `image_tag` - The image tag to inspect (e.g. "devcon-myproject:latest")
+    /// * `label_key` - The label key to look up (e.g. "devcon.config-hash")
+    ///
+    /// # Returns
+    ///
+    /// `Ok(Some(value))` if the label exists, `Ok(None)` if the image is absent or the label
+    /// is not set.
+    fn image_label(&self, image_tag: &str, label_key: &str) -> Result<Option<String>>;
+
     /// Get the host address for the runtime.
     ///
     /// This is used to configure containers to connect back to the host.

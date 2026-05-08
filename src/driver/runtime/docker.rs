@@ -663,6 +663,18 @@ impl ContainerRuntime for DockerRuntime {
         Ok(Some(inspect))
     }
 
+    fn image_label(&self, image_tag: &str, label_key: &str) -> Result<Option<String>> {
+        let inspect = self.inspect_image(image_tag)?;
+        let value = inspect
+            .as_ref()
+            .and_then(|v| v.get("Config"))
+            .and_then(|v| v.get("Labels"))
+            .and_then(|v| v.get(label_key))
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string);
+        Ok(value)
+    }
+
     fn get_host_address(&self) -> String {
         "host.docker.internal".to_string()
     }

@@ -524,6 +524,85 @@ fn test_up_does_not_rebuild_existing_image() {
 }
 
 #[test]
+fn test_up_rebuilds_when_config_changes() {
+    let runtime = get_runtime();
+    if !is_runtime_available(runtime) {
+        println!("Skipping test: {:?} runtime not available", runtime);
+        return;
+    }
+
+    let test_config = create_test_config();
+    cleanup_test_artifacts(runtime, "test-rebuild-on-change");
+    let temp_dir = create_test_devcontainer(
+        "test-rebuild-on-change",
+        "mcr.microsoft.com/devcontainers/base:ubuntu",
+        None,
+    );
+
+    // First `up` — builds the image with the initial config hash label.
+    let mut cmd = cargo_bin_cmd!("devcon");
+    let result = cmd
+        .arg("--config")
+        .arg(&test_config)
+        .arg("up")
+        .arg(temp_dir.path().to_str().unwrap())
+        .output();
+
+    assert!(result.is_ok(), "Failed to execute first up command");
+    let output = result.unwrap();
+    assert!(
+        output.status.success(),
+        "First up command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let image_id_after_first_up = get_image_id(runtime, "devcon-test-rebuild-on-change:latest")
+        .expect("Image not found after first up");
+
+    // Mutate devcontainer.json so the config hash changes.
+    let devcontainer_path = temp_dir
+        .path()
+        .join(".devcontainer")
+        .join("devcontainer.json");
+    std::fs::write(
+        &devcontainer_path,
+        r#"{
+    "name": "test-rebuild-on-change",
+    "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+    "remoteEnv": { "DEVCON_TEST_CHANGE": "1" }
+}"#,
+    )
+    .expect("Failed to update devcontainer.json");
+
+    // Second `up` — config changed, must rebuild the image.
+    let mut cmd = cargo_bin_cmd!("devcon");
+    let result = cmd
+        .arg("--config")
+        .arg(&test_config)
+        .arg("up")
+        .arg(temp_dir.path().to_str().unwrap())
+        .output();
+
+    assert!(result.is_ok(), "Failed to execute second up command");
+    let output = result.unwrap();
+    assert!(
+        output.status.success(),
+        "Second up command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let image_id_after_second_up = get_image_id(runtime, "devcon-test-rebuild-on-change:latest")
+        .expect("Image not found after second up");
+
+    assert_ne!(
+        image_id_after_first_up, image_id_after_second_up,
+        "Image was NOT rebuilt after devcontainer.json changed"
+    );
+
+    drop(temp_dir);
+}
+
+#[test]
 #[cfg(target_os = "macos")]
 fn test_build_apple_runtime() {
     let runtime = Runtime::Apple;
