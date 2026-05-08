@@ -728,8 +728,7 @@ pub fn handle_ssh_create_config_command(
          \tProxyCommand devcon ssh connect {canonical_path} --proxy\n"
     );
 
-    let home = dirs::home_dir()
-        .ok_or_else(|| Error::runtime("Cannot determine home directory"))?;
+    let home = dirs::home_dir().ok_or_else(|| Error::runtime("Cannot determine home directory"))?;
     let ssh_dir = home.join(".ssh");
     let config_file = ssh_dir.join("config");
 
@@ -1332,7 +1331,11 @@ mod test {
 
     #[test]
     fn test_replace_or_append_host_block_append_to_empty() {
-        let result = replace_or_append_host_block("", "devcon-myproject", "Host devcon-myproject\n\tUser devcon\n");
+        let result = replace_or_append_host_block(
+            "",
+            "devcon-myproject",
+            "Host devcon-myproject\n\tUser devcon\n",
+        );
         assert!(result.contains("Host devcon-myproject"));
         assert!(result.contains("User devcon"));
     }
@@ -1340,7 +1343,11 @@ mod test {
     #[test]
     fn test_replace_or_append_host_block_append_to_existing() {
         let existing = "Host other\n\tUser foo\n";
-        let result = replace_or_append_host_block(existing, "devcon-myproject", "Host devcon-myproject\n\tUser devcon\n");
+        let result = replace_or_append_host_block(
+            existing,
+            "devcon-myproject",
+            "Host devcon-myproject\n\tUser devcon\n",
+        );
         assert!(result.contains("Host other"));
         assert!(result.contains("Host devcon-myproject"));
     }
@@ -1348,7 +1355,11 @@ mod test {
     #[test]
     fn test_replace_or_append_host_block_replaces_existing() {
         let existing = "Host devcon-myproject\n\tUser old\n\tHostName 1.2.3.4\n";
-        let result = replace_or_append_host_block(existing, "devcon-myproject", "Host devcon-myproject\n\tUser devcon\n");
+        let result = replace_or_append_host_block(
+            existing,
+            "devcon-myproject",
+            "Host devcon-myproject\n\tUser devcon\n",
+        );
         assert!(result.contains("User devcon"));
         assert!(!result.contains("User old"));
         assert!(!result.contains("1.2.3.4"));
@@ -1356,8 +1367,13 @@ mod test {
 
     #[test]
     fn test_replace_or_append_host_block_replaces_middle_block() {
-        let existing = "Host first\n\tUser a\nHost devcon-myproject\n\tUser old\nHost last\n\tUser b\n";
-        let result = replace_or_append_host_block(existing, "devcon-myproject", "Host devcon-myproject\n\tUser devcon\n");
+        let existing =
+            "Host first\n\tUser a\nHost devcon-myproject\n\tUser old\nHost last\n\tUser b\n";
+        let result = replace_or_append_host_block(
+            existing,
+            "devcon-myproject",
+            "Host devcon-myproject\n\tUser devcon\n",
+        );
         assert!(result.contains("Host first"));
         assert!(result.contains("Host last"));
         assert!(result.contains("User devcon"));
