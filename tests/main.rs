@@ -153,6 +153,7 @@ fn test_build_with_dockerfile() {
         println!("Skipping test: {:?} runtime not available", runtime);
         return;
     }
+    cleanup_test_artifacts(runtime, "test-dockerfile");
     let test_config = create_test_config();
 
     let dockerfile_content = r#"FROM mcr.microsoft.com/devcontainers/base:ubuntu
@@ -305,6 +306,7 @@ fn test_up_microsoft_devcontainer_base_resolves_remote_user() {
         return;
     }
 
+    cleanup_test_artifacts(runtime, "test-remote-user-base");
     let test_config = create_test_config();
     let temp_dir = create_test_devcontainer(
         "test-remote-user-base",
@@ -354,6 +356,168 @@ fn test_up_microsoft_devcontainer_base_resolves_remote_user() {
         remote_user, "vscode",
         "Expected _REMOTE_USER='vscode' (from devcontainer.metadata label) but got '{}'",
         remote_user
+    );
+
+    drop(temp_dir);
+}
+
+/// Regression test for the `devcon start` command always creating a new container.
+///
+/// `list()` calls `docker ps` (no `-a` flag), which only returns *running*
+/// containers.  When the container is stopped, `start_with_features` cannot
+/// find it and calls `docker run` again, spawning a duplicate container.
+/// The correct behaviour is to restart the existing stopped container and
+/// return its original ID.
+#[test]
+fn test_start_reuses_stopped_container() {
+    let runtime = get_runtime();
+    if !is_runtime_available(runtime) {
+        println!("Skipping test: {:?} runtime not available", runtime);
+        return;
+    }
+
+    let test_config = create_test_config();
+    cleanup_test_artifacts(runtime, "test-start-reuse");
+    let temp_dir = create_test_devcontainer(
+        "test-start-reuse",
+        "mcr.microsoft.com/devcontainers/base:ubuntu",
+        None,
+    );
+
+    // First `up` — build and start the container.
+    let mut cmd = cargo_bin_cmd!("devcon");
+    let result = cmd
+        .arg("--config")
+        .arg(&test_config)
+        .arg("--output")
+        .arg("json")
+        .arg("up")
+        .arg(temp_dir.path().to_str().unwrap())
+        .output();
+
+    assert!(result.is_ok(), "Failed to execute up command");
+    let output = result.unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "Up command failed.\nStdout: {}\nStderr: {}",
+        stdout,
+        stderr
+    );
+
+    let up_json =
+        serde_json::from_str::<serde_json::Value>(&stdout).expect("up output is not valid JSON");
+    let container_id_after_up = up_json["container_id"]
+        .as_str()
+        .expect("up output JSON does not contain container_id")
+        .to_string();
+
+    // Stop the container so it is in an exited (not running) state.
+    stop_container(runtime, &container_id_after_up);
+
+    // `devcon start` — must restart the existing stopped container, not spawn a new one.
+    let mut cmd = cargo_bin_cmd!("devcon");
+    let result = cmd
+        .arg("--config")
+        .arg(&test_config)
+        .arg("--output")
+        .arg("json")
+        .arg("start")
+        .arg(temp_dir.path().to_str().unwrap())
+        .output();
+
+    assert!(result.is_ok(), "Failed to execute start command");
+    let output = result.unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "Start command failed.\nStdout: {}\nStderr: {}",
+        stdout,
+        stderr
+    );
+
+    let start_json = serde_json::from_str::<serde_json::Value>(&stdout)
+        .expect("start output is not valid JSON");
+    let container_id_after_start = start_json["container_id"]
+        .as_str()
+        .expect("start output JSON does not contain container_id")
+        .to_string();
+
+    assert_eq!(
+        container_id_after_up, container_id_after_start,
+        "devcon start created a new container instead of restarting the existing stopped one"
+    );
+
+    drop(temp_dir);
+}
+
+/// Regression test for https://github.com/devconhq/devcon/issues/85.
+///
+/// Running `devcon up` a second time on an already-built image must reuse the
+/// cached image rather than rebuilding it from scratch.  If the image ID
+/// reported by the runtime changes between two consecutive `up` invocations
+/// (with no changes to the devcontainer configuration), the cache is broken.
+#[test]
+fn test_up_does_not_rebuild_existing_image() {
+    let runtime = get_runtime();
+    if !is_runtime_available(runtime) {
+        println!("Skipping test: {:?} runtime not available", runtime);
+        return;
+    }
+
+    let test_config = create_test_config();
+    cleanup_test_artifacts(runtime, "test-no-rebuild");
+    let temp_dir = create_test_devcontainer(
+        "test-no-rebuild",
+        "mcr.microsoft.com/devcontainers/base:ubuntu",
+        None,
+    );
+
+    // First `up` — builds and starts the container.
+    let mut cmd = cargo_bin_cmd!("devcon");
+    let result = cmd
+        .arg("--config")
+        .arg(&test_config)
+        .arg("up")
+        .arg(temp_dir.path().to_str().unwrap())
+        .output();
+
+    assert!(result.is_ok(), "Failed to execute first up command");
+    let output = result.unwrap();
+    assert!(
+        output.status.success(),
+        "First up command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let image_id_after_first_up = get_image_id(runtime, "devcon-test-no-rebuild:latest")
+        .expect("Image devcon-test-no-rebuild:latest not found after first up");
+
+    // Second `up` — must reuse the cached image, not rebuild it.
+    let mut cmd = cargo_bin_cmd!("devcon");
+    let result = cmd
+        .arg("--config")
+        .arg(&test_config)
+        .arg("up")
+        .arg(temp_dir.path().to_str().unwrap())
+        .output();
+
+    assert!(result.is_ok(), "Failed to execute second up command");
+    let output = result.unwrap();
+    assert!(
+        output.status.success(),
+        "Second up command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let image_id_after_second_up = get_image_id(runtime, "devcon-test-no-rebuild:latest")
+        .expect("Image devcon-test-no-rebuild:latest not found after second up");
+
+    assert_eq!(
+        image_id_after_first_up, image_id_after_second_up,
+        "Image was rebuilt on second 'devcon up' even though nothing changed (issue #85)"
     );
 
     drop(temp_dir);

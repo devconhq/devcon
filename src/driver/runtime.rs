@@ -327,6 +327,34 @@ pub trait ContainerRuntime: Send {
     #[allow(clippy::type_complexity)]
     fn list(&self) -> Result<Vec<(String, String, Box<dyn ContainerHandle>)>>;
 
+    /// Lists all containers including stopped ones.
+    ///
+    /// # Returns
+    ///
+    /// A vector of tuples containing (container_name, image_tag, handle) triples for
+    /// all devcon-managed containers regardless of their state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the list command fails or output cannot be parsed.
+    #[allow(clippy::type_complexity)]
+    fn list_all(&self) -> Result<Vec<(String, String, Box<dyn ContainerHandle>)>>;
+
+    /// Starts a previously stopped container.
+    ///
+    /// # Arguments
+    ///
+    /// * `container_id` - The ID of the stopped container to start
+    ///
+    /// # Returns
+    ///
+    /// A handle to the now-running container.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the start command fails.
+    fn start_container(&self, container_id: &str) -> Result<Box<dyn ContainerHandle>>;
+
     /// List images.
     ///
     /// # Returns

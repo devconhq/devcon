@@ -497,8 +497,14 @@ impl ContainerDriver {
         self.build_with_features(devcontainer_workspace, env_variables, None, build_path)
     }
 
+    /// Returns `true` if the latest image for the given workspace already exists in the runtime.
+    pub fn image_exists(&self, devcontainer_workspace: &Workspace) -> Result<bool> {
+        let latest_tag = format!("{}:latest", self.get_image_tag(devcontainer_workspace));
+        let images = self.runtime.images()?;
+        Ok(images.iter().any(|image| image == &latest_tag))
+    }
+
     /// Builds a container image with optional pre-processed features.
-    ///
     /// This is the internal implementation that allows reusing already-processed
     /// features to avoid redundant processing.
     ///
@@ -940,6 +946,34 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
             info!(
                 "Running container uses a stale image ({}), starting new container with latest",
                 running_image
+            );
+        }
+
+        // Check for a stopped container that already uses the current image.
+        // list() only returns running containers; list_all() includes stopped ones.
+        let all_handles = self.runtime.list_all()?;
+        let stopped_handle = all_handles
+            .iter()
+            .find(|(name, _, _)| name == &container_name);
+
+        if let Some((_, stopped_image, handle)) = stopped_handle {
+            let latest_id = self.runtime.image_id(&latest_tag).unwrap_or(None);
+            let stopped_id = self.runtime.image_id(stopped_image).unwrap_or(None);
+
+            let is_current = match (&latest_id, &stopped_id) {
+                (Some(l), Some(r)) => l == r,
+                _ => stopped_image == &latest_tag,
+            };
+
+            if is_current {
+                info!("Restarting stopped container with latest image");
+                let restarted = self.runtime.start_container(handle.id())?;
+                return Ok(restarted.id().to_string());
+            }
+
+            debug!(
+                "Stopped container uses a stale image ({}), creating new container with latest",
+                stopped_image
             );
         }
 
