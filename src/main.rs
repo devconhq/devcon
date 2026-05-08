@@ -124,6 +124,35 @@ impl From<StatusMode> for devcon::StatusMode {
 }
 
 #[derive(Subcommand, Debug)]
+enum SshAction {
+    /// Connect to a running development container via SSH
+    #[command(about = "Connect to a running development container via SSH")]
+    Connect {
+        /// Path to the project directory containing .devcontainer configuration
+        #[arg(
+            help = "Path to the project directory. If not provided, uses current directory.",
+            value_name = "PATH"
+        )]
+        path: Option<PathBuf>,
+
+        /// Run in ProxyCommand mode (for use in ~/.ssh/config)
+        #[arg(long, help = "Use stdio proxy mode for ssh ProxyCommand")]
+        proxy: bool,
+    },
+
+    /// Create an SSH config entry for the devcontainer in ~/.ssh/config
+    #[command(about = "Write a Host block for this devcontainer to ~/.ssh/config")]
+    CreateConfig {
+        /// Path to the project directory containing .devcontainer configuration
+        #[arg(
+            help = "Path to the project directory. If not provided, uses current directory.",
+            value_name = "PATH"
+        )]
+        path: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum Commands {
     /// Builds a development container for the specified path
     #[command(about = "Create a development container")]
@@ -185,19 +214,11 @@ enum Commands {
         )]
         env: Vec<String>,
     },
-    /// Connects to a running development container via an SSH proxy
-    #[command(about = "Connect to a running development container via SSH")]
+    /// Connect to or configure SSH access for a development container
+    #[command(about = "Connect to or configure SSH access for a development container")]
     Ssh {
-        /// Path to the project directory containing .devcontainer configuration
-        #[arg(
-            help = "Path to the project directory. If not provided, uses current directory.",
-            value_name = "PATH"
-        )]
-        path: Option<PathBuf>,
-
-        /// Run in ProxyCommand mode (for use in ~/.ssh/config)
-        #[arg(long, help = "Use stdio proxy mode for ssh ProxyCommand")]
-        proxy: bool,
+        #[command(subcommand)]
+        action: SshAction,
     },
     /// Display information about a devcontainer
     #[command(about = "Display devcontainer status and configuration details")]
@@ -306,13 +327,21 @@ fn main() -> devcon::error::Result<()> {
                 config_path,
             )?;
         }
-        Commands::Ssh { path, proxy } => {
-            handle_ssh_command(
-                path.clone().unwrap_or(PathBuf::from(".").to_path_buf()),
-                config_path,
-                *proxy,
-            )?;
-        }
+        Commands::Ssh { action } => match action {
+            SshAction::Connect { path, proxy } => {
+                handle_ssh_command(
+                    path.clone().unwrap_or(PathBuf::from(".").to_path_buf()),
+                    config_path,
+                    *proxy,
+                )?;
+            }
+            SshAction::CreateConfig { path } => {
+                handle_ssh_create_config_command(
+                    path.clone().unwrap_or(PathBuf::from(".").to_path_buf()),
+                    config_path,
+                )?;
+            }
+        },
         Commands::Info { path } => {
             handle_info_command(
                 path.clone().unwrap_or(PathBuf::from(".").to_path_buf()),
