@@ -178,6 +178,86 @@ pub fn extract_container_name(output: &str) -> Option<String> {
     None
 }
 
+/// Stop a running container
+#[allow(dead_code)]
+pub fn stop_container(runtime: Runtime, container_id: &str) {
+    let cmd = runtime_cmd(runtime);
+    let _ = Command::new(cmd)
+        .arg("stop")
+        .arg(container_id)
+        .output();
+}
+
+/// Remove all containers and images belonging to a devcon test project.
+///
+/// Stops and force-removes any containers labelled `devcon.project=<project_name>`,
+/// then removes all images whose repository matches `devcon-<project_name>`.
+/// Call this at the start of tests that create containers so stale state from
+/// previous runs does not interfere.
+#[allow(dead_code)]
+pub fn cleanup_test_artifacts(runtime: Runtime, project_name: &str) {
+    let cmd = runtime_cmd(runtime);
+    let label = format!("devcon.project={}", project_name);
+    let image_prefix = format!("devcon-{}", project_name);
+
+    match runtime {
+        Runtime::Docker => {
+            // Find all containers (running or stopped) for this project
+            let ps_output = Command::new(cmd)
+                .args(["ps", "-a", "--filter", &format!("label={}", label), "--format", "{{.ID}}"])
+                .output();
+            if let Ok(out) = ps_output {
+                let ids = String::from_utf8_lossy(&out.stdout);
+                for id in ids.lines().map(str::trim).filter(|s| !s.is_empty()) {
+                    let _ = Command::new(cmd).args(["rm", "-f", id]).output();
+                }
+            }
+
+            // Remove all images for this project (latest + any build-* tags)
+            let img_output = Command::new(cmd)
+                .args(["image", "ls", "--format", "{{.Repository}}:{{.Tag}}"])
+                .output();
+            if let Ok(out) = img_output {
+                let tags = String::from_utf8_lossy(&out.stdout);
+                for tag in tags.lines().map(str::trim).filter(|t| t.starts_with(&image_prefix)) {
+                    let _ = Command::new(cmd).args(["rmi", "-f", tag]).output();
+                }
+            }
+        }
+        Runtime::Apple => {
+            // Apple: list all containers and filter by name prefix
+            let ls_output = Command::new(cmd)
+                .args(["container", "list", "--all", "--format", "json"])
+                .output();
+            if let Ok(out) = ls_output
+                && let Ok(entries) = serde_json::from_slice::<Vec<serde_json::Value>>(&out.stdout)
+            {
+                for entry in entries {
+                    let name = entry["name"].as_str().unwrap_or("");
+                    // devcon container name is devcon.<project_name>
+                    if name == format!("devcon.{}", project_name) {
+                        let _ = Command::new(cmd).args(["container", "rm", "-f", name]).output();
+                    }
+                }
+            }
+            // Remove images
+            let img_output = Command::new(cmd).args(["image", "list", "--format", "json"]).output();
+            if let Ok(out) = img_output
+                && let Ok(entries) = serde_json::from_slice::<Vec<serde_json::Value>>(&out.stdout)
+            {
+                for entry in entries {
+                    let repo = entry["repository"].as_str().unwrap_or("");
+                    let tag = entry["tag"].as_str().unwrap_or("");
+                    let full = format!("{}:{}", repo, tag);
+                    if full.starts_with(&image_prefix) {
+                        let _ = Command::new(cmd).args(["image", "rm", "-f", &full]).output();
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Clean up a container by name
 #[allow(dead_code)]
 pub fn cleanup_container(runtime: Runtime, container_name: &str) {
@@ -231,6 +311,27 @@ pub fn exec_in_container(
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     } else {
         Err(String::from_utf8_lossy(&output.stderr).to_string())
+    }
+}
+
+/// Get the image ID for a given image tag, returns None if not found
+#[allow(dead_code)]
+pub fn get_image_id(runtime: Runtime, image_tag: &str) -> Option<String> {
+    let cmd = runtime_cmd(runtime);
+    let output = Command::new(cmd)
+        .arg("image")
+        .arg("inspect")
+        .arg(image_tag)
+        .arg("--format")
+        .arg("{{.Id}}")
+        .output()
+        .ok()?;
+
+    if output.status.success() {
+        let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if id.is_empty() { None } else { Some(id) }
+    } else {
+        None
     }
 }
 

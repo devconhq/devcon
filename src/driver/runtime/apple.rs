@@ -245,6 +245,70 @@ impl AppleRuntime {
 
         None
     }
+
+    /// Shared implementation for `list` and `list_all`.
+    ///
+    /// When `all` is `true`, stopped/exited containers are included in addition to
+    /// running ones.
+    #[allow(clippy::type_complexity)]
+    fn list_containers(
+        &self,
+        all: bool,
+    ) -> Result<Vec<(String, String, Box<dyn super::ContainerHandle>)>> {
+        let output = Command::new("container")
+            .arg("list")
+            .arg("--format")
+            .arg("json")
+            .output()?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let containers: Vec<serde_json::Value> = serde_json::from_str(&stdout)?;
+
+        let result: Vec<(String, String, Box<dyn super::ContainerHandle>)> = containers
+            .iter()
+            .filter_map(|container| {
+                trace!("Inspecting container: {}", container);
+
+                let state = container["status"].as_str().unwrap_or_default();
+                if !all && state != "running" {
+                    return None;
+                }
+
+                let project_name = container["configuration"]["labels"]["devcon.project"]
+                    .as_str()
+                    .unwrap_or_default();
+
+                trace!("Container project name: {}", project_name);
+                if project_name.is_empty() {
+                    return None;
+                }
+
+                let id = container["configuration"]["id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+
+                debug!("Found container with ID: {}", id);
+
+                let image_tag = container["configuration"]["image"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+
+                let container_name = format!("devcon.{}", project_name);
+                let handle = AppleContainerHandle { id };
+                Some((
+                    container_name,
+                    image_tag,
+                    Box::new(handle) as Box<dyn super::ContainerHandle>,
+                ))
+            })
+            .collect();
+
+        Ok(result)
+    }
 }
 
 impl ContainerRuntime for AppleRuntime {
@@ -487,61 +551,32 @@ impl ContainerRuntime for AppleRuntime {
     }
 
     fn list(&self) -> Result<Vec<(String, String, Box<dyn super::ContainerHandle>)>> {
+        self.list_containers(false)
+    }
+
+    fn list_all(&self) -> Result<Vec<(String, String, Box<dyn super::ContainerHandle>)>> {
+        self.list_containers(true)
+    }
+
+    fn start_container(
+        &self,
+        container_id: &str,
+    ) -> Result<Box<dyn super::ContainerHandle>> {
         let output = Command::new("container")
-            .arg("list")
-            .arg("--format")
-            .arg("json")
+            .arg("start")
+            .arg(container_id)
             .output()?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !output.status.success() {
+            return Err(Error::runtime(format!(
+                "container start failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
 
-        let containers: Vec<serde_json::Value> = serde_json::from_str(&stdout)?;
-
-        let result: Vec<(String, String, Box<dyn super::ContainerHandle>)> = containers
-            .iter()
-            .filter_map(|container| {
-                trace!("Inspecting container: {}", container);
-
-                // Only include running containers (matching Docker runtime behavior)
-                let state = container["status"].as_str().unwrap_or_default();
-                if state != "running" {
-                    return None;
-                }
-
-                let project_name = container["configuration"]["labels"]["devcon.project"]
-                    .as_str()
-                    .unwrap_or_default();
-
-                trace!("Container project name: {}", project_name);
-                if project_name.is_empty() {
-                    return None;
-                }
-
-                let id = container["configuration"]["id"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
-
-                debug!("Found container with ID: {}", id);
-
-                let image_tag = container["configuration"]["image"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
-
-                let container_name = format!("devcon.{}", project_name);
-                let handle = AppleContainerHandle { id };
-                Some((
-                    container_name,
-                    image_tag,
-                    Box::new(handle) as Box<dyn super::ContainerHandle>,
-                ))
-            })
-            .collect();
-
-        Ok(result)
+        Ok(Box::new(AppleContainerHandle {
+            id: container_id.to_string(),
+        }))
     }
 
     fn images(&self) -> Result<Vec<String>> {

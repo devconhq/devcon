@@ -219,6 +219,70 @@ impl DockerRuntime {
 
         None
     }
+
+    /// Shared implementation for `list` and `list_all`.
+    ///
+    /// When `all` is `true`, stopped containers are included (equivalent to `docker ps -a`).
+    #[allow(clippy::type_complexity)]
+    fn list_containers(
+        &self,
+        all: bool,
+    ) -> Result<Vec<(String, String, Box<dyn super::ContainerHandle>)>> {
+        let mut cmd = Command::new("docker");
+        cmd.arg("ps")
+            .arg("--no-trunc")
+            .arg("--filter")
+            .arg("label=devcon.project")
+            .arg("--format")
+            .arg("{{json .}}");
+
+        if all {
+            cmd.arg("--all");
+        }
+
+        let output = cmd.output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut result: Vec<(String, String, Box<dyn super::ContainerHandle>)> = Vec::new();
+
+        for line in stdout.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            let container: serde_json::Value = serde_json::from_str(line)?;
+
+            // Labels format: "key1=value1,key2=value2"
+            let labels = container["Labels"].as_str().unwrap_or_default();
+            let mut container_name = String::new();
+            for label_pair in labels.split(',') {
+                if let Some((key, value)) = label_pair.split_once('=')
+                    && key == "devcon.project"
+                {
+                    container_name = format!("devcon.{}", value);
+                    break;
+                }
+            }
+
+            let id = container["ID"]
+                .as_str()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+
+            let image_tag = container["Image"]
+                .as_str()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+
+            if !container_name.is_empty() {
+                let handle = DockerContainerHandle { id: id.clone() };
+                result.push((container_name, image_tag, Box::new(handle)));
+            }
+        }
+
+        Ok(result)
+    }
 }
 
 /// Handle for a Docker container instance.
@@ -466,59 +530,32 @@ impl ContainerRuntime for DockerRuntime {
     }
 
     fn list(&self) -> Result<Vec<(String, String, Box<dyn super::ContainerHandle>)>> {
+        self.list_containers(false)
+    }
+
+    fn list_all(&self) -> Result<Vec<(String, String, Box<dyn super::ContainerHandle>)>> {
+        self.list_containers(true)
+    }
+
+    fn start_container(
+        &self,
+        container_id: &str,
+    ) -> Result<Box<dyn super::ContainerHandle>> {
         let output = Command::new("docker")
-            .arg("ps")
-            .arg("--filter")
-            .arg("label=devcon.project")
-            .arg("--format")
-            .arg("{{json .}}")
+            .arg("start")
+            .arg(container_id)
             .output()?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-
-        let mut result: Vec<(String, String, Box<dyn super::ContainerHandle>)> = Vec::new();
-
-        // Docker outputs one JSON object per line, not an array
-        for line in stdout.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-
-            let container: serde_json::Value = serde_json::from_str(line)?;
-
-            // Parse labels to find devcon.project label value
-            let labels = container["Labels"].as_str().unwrap_or_default();
-            let mut container_name = String::new();
-
-            // Labels format: "key1=value1,key2=value2"
-            for label_pair in labels.split(',') {
-                if let Some((key, value)) = label_pair.split_once('=')
-                    && key == "devcon.project"
-                {
-                    container_name = format!("devcon.{}", value);
-                    break;
-                }
-            }
-
-            let id = container["ID"]
-                .as_str()
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-
-            let image_tag = container["Image"]
-                .as_str()
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-
-            if !container_name.is_empty() {
-                let handle = DockerContainerHandle { id: id.clone() };
-                result.push((container_name, image_tag, Box::new(handle)));
-            }
+        if !output.status.success() {
+            return Err(Error::runtime(format!(
+                "docker start failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
         }
 
-        Ok(result)
+        Ok(Box::new(DockerContainerHandle {
+            id: container_id.to_string(),
+        }))
     }
 
     fn images(&self) -> Result<Vec<String>> {
