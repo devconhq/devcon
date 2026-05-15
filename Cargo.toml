@@ -38,8 +38,9 @@ assert_cmd = "2.1.2"
 daemonize = "0.5"
 pidlock = "0.2.2"
 tokio = "1.48.0"
-russh = "0.50.4"
+russh = "0.60.2"
 rand_core = "0.10.1"
+rand = { version = "0.10", features = ["thread_rng"] }
 devcon-proto = { path = "proto" }
 
 [package]
@@ -88,6 +89,7 @@ pidlock.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "process", "sync", "time"] }
 russh.workspace = true
 rand_core.workspace = true
+rand.workspace = true
 rustls-webpki = "0.103.13"
 
 [dev-dependencies]
