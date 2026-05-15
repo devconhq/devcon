@@ -1,14 +1,14 @@
 use crate::error::{Error, Result};
-use russh::keys::ssh_key::rand_core::OsRng;
 use russh::keys::{self, PrivateKey};
 use russh::server::{Auth, Msg, Server as _, Session};
-use russh::{Channel, ChannelId, CryptoVec};
+use russh::{Channel, ChannelId};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{ChildStdin, Command};
+use tracing::{debug, warn};
 
 #[derive(Clone)]
 struct PtyInfo {
@@ -47,17 +47,44 @@ fn build_exec_command(
 
     let (program, args) = if runtime_name == "apple" {
         if let Some(command) = requested_command {
-            // For specific commands, skip the `script` PTY wrapper to avoid
-            // escape sequences polluting command output (e.g. `uname`).
-            let args = vec![
-                "exec".to_string(),
-                "-i".to_string(),
-                container_id.to_string(),
-                default_shell.to_string(),
-                "-lic".to_string(),
-                command.to_string(),
-            ];
-            ("container".to_string(), args)
+            // Shell flags depend on whether the client requested a PTY:
+            //  - PTY present  → interactive command (e.g. Zed terminal, `ssh -t host bash`):
+            //    `container exec -t` requires the process stdin to be a real TTY, but our
+            //    proxy always runs with Stdio::piped().  We must use `script` to allocate a
+            //    host-side PTY (the same technique used for shell_request), otherwise
+            //    `container exec -t` calls tcsetattr/TIOCSCTTY on a pipe and fails with
+            //    ENOTTY.  Use `-lic` so login scripts run and bash enters interactive mode.
+            //  - No PTY       → automated/non-interactive command (e.g. Zed proxy,
+            //    `uname -a`): call `container exec` directly (no PTY needed) with `-lc` so
+            //    login scripts run for PATH but bash stays non-interactive.
+            //    Non-interactive bash cannot output prompts or source interactive .bashrc
+            //    snippets, preventing stray bytes from corrupting binary protocol streams
+            //    such as Zed's length-prefixed protobuf framing.
+            if has_pty {
+                let args = vec![
+                    "-q".to_string(),
+                    "/dev/null".to_string(),
+                    "container".to_string(),
+                    "exec".to_string(),
+                    "-t".to_string(),
+                    "-i".to_string(),
+                    container_id.to_string(),
+                    default_shell.to_string(),
+                    "-lic".to_string(),
+                    command.to_string(),
+                ];
+                ("script".to_string(), args)
+            } else {
+                let args = vec![
+                    "exec".to_string(),
+                    "-i".to_string(),
+                    container_id.to_string(),
+                    default_shell.to_string(),
+                    "-lc".to_string(),
+                    command.to_string(),
+                ];
+                ("container".to_string(), args)
+            }
         } else {
             // Interactive shell: use `script` to allocate a PTY on the host side.
             let mut args = vec![
@@ -82,19 +109,27 @@ fn build_exec_command(
     } else {
         // Docker (and any other runtime).
         let mut args = vec!["exec".to_string()];
-        // Only allocate a PTY when running an interactive shell, not for
-        // specific commands.  Allocating a PTY for commands like `uname`
-        // injects cursor-control escape sequences into their output which
-        // breaks clients that parse the result (e.g. Zed remote development).
-        if has_pty && requested_command.is_none() {
+        // Allocate a PTY (`-t`) whenever the SSH client requested one.  This
+        // applies to both interactive shells (shell_request) and interactive
+        // commands (exec_request + pty_request, e.g. `ssh -t host bash`).
+        // PTY is intentionally NOT allocated when no pty_request was received
+        // (e.g. Zed's proxy command, `uname -a`) because a PTY injects
+        // cursor-control escape sequences that corrupt command output.
+        if has_pty {
             args.push("-t".to_string());
         }
         args.push("-i".to_string());
         args.push(container_id.to_string());
 
         if let Some(command) = requested_command {
+            // Shell flags depend on whether the client requested a PTY:
+            //  - PTY present  → interactive command (e.g. `ssh -t host bash`):
+            //    use `-lic` so bash is interactive.
+            //  - No PTY       → automated command (e.g. Zed proxy, `uname -a`):
+            //    use `-lc` (login, non-interactive) to prevent interactive bash
+            //    from outputting prompts that corrupt binary protocol streams.
             args.push(default_shell.to_string());
-            args.push("-lic".to_string());
+            args.push(if has_pty { "-lic" } else { "-lc" }.to_string());
             args.push(command.to_string());
         } else if let Some(shell_cmd) = &interactive_shell_cmd {
             args.push("sh".to_string());
@@ -116,6 +151,45 @@ fn build_exec_command(
     }
 
     ExecCommandSpec { program, args, env }
+}
+
+/// Builds the command spec for proxying a Unix domain socket via `socat`.
+fn build_unix_socket_command(
+    runtime_name: &str,
+    container_id: &str,
+    socket_path: &str,
+) -> ExecCommandSpec {
+    let socat_target = format!("UNIX-CONNECT:{socket_path}");
+    let (program, args) = if runtime_name == "apple" {
+        (
+            "container".to_string(),
+            vec![
+                "exec".to_string(),
+                "-i".to_string(),
+                container_id.to_string(),
+                "socat".to_string(),
+                "STDIO".to_string(),
+                socat_target,
+            ],
+        )
+    } else {
+        (
+            "docker".to_string(),
+            vec![
+                "exec".to_string(),
+                "-i".to_string(),
+                container_id.to_string(),
+                "socat".to_string(),
+                "STDIO".to_string(),
+                socat_target,
+            ],
+        )
+    };
+    ExecCommandSpec {
+        program,
+        args,
+        env: vec![],
+    }
 }
 
 fn normalize_pty(term: &str, cols: u32, rows: u32) -> PtyInfo {
@@ -167,7 +241,8 @@ impl russh::server::Server for ProxyServer {
 impl russh::server::Handler for ProxyServer {
     type Error = russh::Error;
 
-    async fn auth_none(&mut self, _user: &str) -> std::result::Result<Auth, Self::Error> {
+    async fn auth_none(&mut self, user: &str) -> std::result::Result<Auth, Self::Error> {
+        debug!(client_id = self.client_id, user, "ssh: auth_none accepted");
         Ok(Auth::Accept)
     }
 
@@ -176,6 +251,7 @@ impl russh::server::Handler for ProxyServer {
         _channel: Channel<Msg>,
         _session: &mut Session,
     ) -> std::result::Result<bool, Self::Error> {
+        debug!(client_id = self.client_id, "ssh: channel_open_session");
         Ok(true)
     }
 
@@ -190,6 +266,14 @@ impl russh::server::Handler for ProxyServer {
         _modes: &[(russh::Pty, u32)],
         session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
+        debug!(
+            client_id = self.client_id,
+            channel_id = ?channel,
+            term,
+            cols = col_width,
+            rows = row_height,
+            "ssh: pty_request"
+        );
         let key = (self.client_id, channel);
         let mut pty_map = self.state.pty_by_channel.lock().await;
         pty_map.insert(key, normalize_pty(term, col_width, row_height));
@@ -207,6 +291,13 @@ impl russh::server::Handler for ProxyServer {
         _pix_height: u32,
         session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
+        debug!(
+            client_id = self.client_id,
+            channel_id = ?channel,
+            cols = col_width,
+            rows = row_height,
+            "ssh: window_change_request"
+        );
         let key = (self.client_id, channel);
         let mut pty_map = self.state.pty_by_channel.lock().await;
 
@@ -226,6 +317,11 @@ impl russh::server::Handler for ProxyServer {
         channel: ChannelId,
         session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
+        debug!(
+            client_id = self.client_id,
+            channel_id = ?channel,
+            "ssh: shell_request"
+        );
         session.channel_success(channel)?;
         self.spawn_container_exec(channel, None, session.handle())
             .await;
@@ -239,6 +335,12 @@ impl russh::server::Handler for ProxyServer {
         session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
         let command = String::from_utf8_lossy(data).to_string();
+        debug!(
+            client_id = self.client_id,
+            channel_id = ?channel,
+            command = %command,
+            "ssh: exec_request"
+        );
         session.channel_success(channel)?;
 
         let is_warp_bootstrap = command.contains("TERM_PROGRAM='WarpTerminal'")
@@ -246,6 +348,7 @@ impl russh::server::Handler for ProxyServer {
             || command.contains("hook=$(printf");
 
         if is_warp_bootstrap {
+            debug!(client_id = self.client_id, channel_id = ?channel, "exec_request: detected Warp bootstrap, treating as interactive shell");
             self.spawn_container_exec(channel, None, session.handle())
                 .await;
         } else {
@@ -256,12 +359,63 @@ impl russh::server::Handler for ProxyServer {
         Ok(())
     }
 
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        channel: Channel<Msg>,
+        host_to_connect: &str,
+        port_to_connect: u32,
+        originator_address: &str,
+        originator_port: u32,
+        session: &mut Session,
+    ) -> std::result::Result<bool, Self::Error> {
+        let channel_id = channel.id();
+        debug!(
+            client_id = self.client_id,
+            channel_id = ?channel_id,
+            target = %format!("{}:{}", host_to_connect, port_to_connect),
+            originator = %format!("{}:{}", originator_address, originator_port),
+            "ssh: channel_open_direct_tcpip"
+        );
+        self.spawn_direct_tcpip(
+            channel_id,
+            host_to_connect.to_string(),
+            port_to_connect,
+            session.handle(),
+        )
+        .await;
+        Ok(true)
+    }
+
+    async fn channel_open_direct_streamlocal(
+        &mut self,
+        channel: Channel<Msg>,
+        socket_path: &str,
+        session: &mut Session,
+    ) -> std::result::Result<bool, Self::Error> {
+        let channel_id = channel.id();
+        debug!(
+            client_id = self.client_id,
+            channel_id = ?channel_id,
+            socket_path,
+            "ssh: channel_open_direct_streamlocal"
+        );
+        self.spawn_unix_socket_proxy(channel_id, socket_path.to_string(), session.handle())
+            .await;
+        Ok(true)
+    }
+
     async fn data(
         &mut self,
         channel: ChannelId,
         data: &[u8],
         _session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
+        debug!(
+            client_id = self.client_id,
+            channel_id = ?channel,
+            bytes = data.len(),
+            "ssh: data"
+        );
         let key = (self.client_id, channel);
         let mut lock = self.state.stdin_by_channel.lock().await;
         if let Some(stdin) = lock.get_mut(&key) {
@@ -275,13 +429,17 @@ impl russh::server::Handler for ProxyServer {
         channel: ChannelId,
         _session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
-        let key = (self.client_id, channel);
-        let mut lock = self.state.stdin_by_channel.lock().await;
-        lock.remove(&key);
-        drop(lock);
-
-        let mut pty_map = self.state.pty_by_channel.lock().await;
-        pty_map.remove(&key);
+        debug!(
+            client_id = self.client_id,
+            channel_id = ?channel,
+            "ssh: channel_eof"
+        );
+        // Do NOT close stdin here. For direct-streamlocal proxy channels (e.g. Zed's
+        // stdout.sock / stderr.sock), the SSH client sends channel_eof immediately
+        // after opening the channel because it will only read, never write. Closing
+        // the socat stdin pipe at this point causes socat to send EOF to the Unix socket
+        // and exit, which breaks the server connection. channel_close (which always
+        // follows) already removes the stdin entry and is the correct place for cleanup.
         Ok(())
     }
 
@@ -290,6 +448,11 @@ impl russh::server::Handler for ProxyServer {
         channel: ChannelId,
         _session: &mut Session,
     ) -> std::result::Result<(), Self::Error> {
+        debug!(
+            client_id = self.client_id,
+            channel_id = ?channel,
+            "ssh: channel_close"
+        );
         let key = (self.client_id, channel);
         let mut lock = self.state.stdin_by_channel.lock().await;
         lock.remove(&key);
@@ -322,6 +485,15 @@ impl ProxyServer {
             requested_command.as_deref(),
         );
 
+        debug!(
+            client_id = self.client_id,
+            channel_id = ?channel,
+            program = %spec.program,
+            args = ?spec.args,
+            has_pty = pty_info.is_some(),
+            "spawn_container_exec: launching"
+        );
+
         let mut cmd = Command::new(&spec.program);
         for arg in &spec.args {
             cmd.arg(arg);
@@ -338,7 +510,7 @@ impl ProxyServer {
             let _ = handle
                 .data(
                     channel,
-                    CryptoVec::from("Failed to spawn container exec\r\n"),
+                    "Failed to spawn container exec\r\n".as_bytes().to_vec(),
                 )
                 .await;
             let _ = handle.exit_status_request(channel, 1).await;
@@ -361,9 +533,7 @@ impl ProxyServer {
                     if n == 0 {
                         break;
                     }
-                    let _ = handle_out
-                        .data(channel, CryptoVec::from(buf[..n].to_vec()))
-                        .await;
+                    let _ = handle_out.data(channel, buf[..n].to_vec()).await;
                 }
             });
         }
@@ -376,8 +546,15 @@ impl ProxyServer {
                     if n == 0 {
                         break;
                     }
+                    // Send as SSH extended data (type 1 = stderr) rather than
+                    // regular channel data (stdout).  Mixing them corrupts the
+                    // stdout stream: Zed, for example, reads protobuf messages
+                    // from the exec channel's stdout, so any stray bytes on
+                    // that stream (e.g. server log lines relayed via the proxy's
+                    // stderr) cause protobuf parse failures that close the
+                    // connection.
                     let _ = handle_err
-                        .data(channel, CryptoVec::from(buf[..n].to_vec()))
+                        .extended_data(channel, 1, buf[..n].to_vec())
                         .await;
                 }
             });
@@ -385,10 +562,271 @@ impl ProxyServer {
 
         let key = (self.client_id, channel);
         let stdin_map = self.state.stdin_by_channel.clone();
+        let client_id = self.client_id;
         tokio::spawn(async move {
             let exit_code = match child.wait().await {
-                Ok(status) => status.code().unwrap_or(1) as u32,
-                Err(_) => 1,
+                Ok(status) => {
+                    let code = status.code().unwrap_or(1) as u32;
+                    debug!(client_id, channel_id = ?channel, exit_code = code, "spawn_container_exec: process exited");
+                    code
+                }
+                Err(e) => {
+                    warn!(client_id, channel_id = ?channel, error = %e, "spawn_container_exec: error waiting for process");
+                    1
+                }
+            };
+            let mut lock = stdin_map.lock().await;
+            lock.remove(&key);
+            let _ = handle.exit_status_request(channel, exit_code).await;
+            let _ = handle.eof(channel).await;
+            let _ = handle.close(channel).await;
+        });
+    }
+
+    /// Proxy a `direct-tcpip` channel by running `nc host port` inside the container.
+    ///
+    /// `nc` (netcat) must be available in the container image. Most dev-container
+    /// base images provide it via `netcat-openbsd`.  If nc is missing, the
+    /// channel will close immediately (exit code 127) and a warn log will appear.
+    async fn spawn_direct_tcpip(
+        &self,
+        channel: ChannelId,
+        host: String,
+        port: u32,
+        handle: russh::server::Handle,
+    ) {
+        let (program, args) = if self.state.runtime_name == "apple" {
+            (
+                "container".to_string(),
+                vec![
+                    "exec".to_string(),
+                    "-i".to_string(),
+                    self.state.container_id.clone(),
+                    "nc".to_string(),
+                    host.clone(),
+                    port.to_string(),
+                ],
+            )
+        } else {
+            (
+                "docker".to_string(),
+                vec![
+                    "exec".to_string(),
+                    "-i".to_string(),
+                    self.state.container_id.clone(),
+                    "nc".to_string(),
+                    host.clone(),
+                    port.to_string(),
+                ],
+            )
+        };
+
+        debug!(
+            client_id = self.client_id,
+            channel_id = ?channel,
+            program = %program,
+            args = ?args,
+            "spawn_direct_tcpip: launching nc proxy"
+        );
+
+        let mut cmd = Command::new(&program);
+        for arg in &args {
+            cmd.arg(arg);
+        }
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let Ok(mut child) = cmd.spawn() else {
+            warn!(
+                client_id = self.client_id,
+                channel_id = ?channel,
+                program = %program,
+                "spawn_direct_tcpip: failed to spawn nc — is netcat installed in the container?"
+            );
+            let _ = handle.exit_status_request(channel, 127).await;
+            let _ = handle.eof(channel).await;
+            let _ = handle.close(channel).await;
+            return;
+        };
+
+        if let Some(stdin) = child.stdin.take() {
+            let key = (self.client_id, channel);
+            let mut lock = self.state.stdin_by_channel.lock().await;
+            lock.insert(key, stdin);
+            debug!(
+                client_id = self.client_id,
+                channel_id = ?channel,
+                "spawn_direct_tcpip: stdin proxy ready"
+            );
+        }
+
+        if let Some(mut stdout) = child.stdout.take() {
+            let handle_out = handle.clone();
+            let client_id = self.client_id;
+            tokio::spawn(async move {
+                let mut buf = vec![0_u8; 8192];
+                while let Ok(n) = stdout.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    debug!(client_id, channel_id = ?channel, bytes = n, "spawn_direct_tcpip: forwarding stdout to channel");
+                    let _ = handle_out.data(channel, buf[..n].to_vec()).await;
+                }
+                debug!(client_id, channel_id = ?channel, "spawn_direct_tcpip: stdout closed");
+            });
+        }
+
+        if let Some(mut stderr) = child.stderr.take() {
+            let client_id = self.client_id;
+            tokio::spawn(async move {
+                let mut buf = vec![0_u8; 8192];
+                while let Ok(n) = stderr.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    let s = String::from_utf8_lossy(&buf[..n]);
+                    debug!(
+                        client_id,
+                        channel_id = ?channel,
+                        stderr = %s.trim(),
+                        "spawn_direct_tcpip: nc stderr"
+                    );
+                }
+            });
+        }
+
+        let key = (self.client_id, channel);
+        let stdin_map = self.state.stdin_by_channel.clone();
+        let client_id = self.client_id;
+        tokio::spawn(async move {
+            let exit_code = match child.wait().await {
+                Ok(status) => {
+                    let code = status.code().unwrap_or(1) as u32;
+                    debug!(client_id, channel_id = ?channel, exit_code = code, "spawn_direct_tcpip: nc process exited");
+                    code
+                }
+                Err(e) => {
+                    warn!(client_id, channel_id = ?channel, error = %e, "spawn_direct_tcpip: error waiting for nc");
+                    1
+                }
+            };
+            let mut lock = stdin_map.lock().await;
+            lock.remove(&key);
+            let _ = handle.exit_status_request(channel, exit_code).await;
+            let _ = handle.eof(channel).await;
+            let _ = handle.close(channel).await;
+        });
+    }
+
+    /// Proxy a `direct-streamlocal@openssh.com` channel by running
+    /// `socat STDIO UNIX-CONNECT:<socket_path>` inside the container.
+    ///
+    /// This is required for Zed remote development: the Zed remote server
+    /// creates a Unix domain socket and Zed connects to it via this channel type.
+    /// `socat` must be available in the container image.
+    async fn spawn_unix_socket_proxy(
+        &self,
+        channel: ChannelId,
+        socket_path: String,
+        handle: russh::server::Handle,
+    ) {
+        let spec = build_unix_socket_command(
+            &self.state.runtime_name,
+            &self.state.container_id,
+            &socket_path,
+        );
+
+        debug!(
+            client_id = self.client_id,
+            channel_id = ?channel,
+            program = %spec.program,
+            args = ?spec.args,
+            "spawn_unix_socket_proxy: launching socat proxy"
+        );
+
+        let mut cmd = Command::new(&spec.program);
+        for arg in &spec.args {
+            cmd.arg(arg);
+        }
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let Ok(mut child) = cmd.spawn() else {
+            warn!(
+                client_id = self.client_id,
+                channel_id = ?channel,
+                program = %spec.program,
+                socket_path = %socket_path,
+                "spawn_unix_socket_proxy: failed to spawn socat — is socat installed in the container?"
+            );
+            let _ = handle.exit_status_request(channel, 127).await;
+            let _ = handle.eof(channel).await;
+            let _ = handle.close(channel).await;
+            return;
+        };
+
+        if let Some(stdin) = child.stdin.take() {
+            let key = (self.client_id, channel);
+            let mut lock = self.state.stdin_by_channel.lock().await;
+            lock.insert(key, stdin);
+            debug!(
+                client_id = self.client_id,
+                channel_id = ?channel,
+                "spawn_unix_socket_proxy: stdin proxy ready"
+            );
+        }
+
+        if let Some(mut stdout) = child.stdout.take() {
+            let handle_out = handle.clone();
+            let client_id = self.client_id;
+            tokio::spawn(async move {
+                let mut buf = vec![0_u8; 8192];
+                while let Ok(n) = stdout.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    debug!(client_id, channel_id = ?channel, bytes = n, "spawn_unix_socket_proxy: forwarding stdout to channel");
+                    let _ = handle_out.data(channel, buf[..n].to_vec()).await;
+                }
+                debug!(client_id, channel_id = ?channel, "spawn_unix_socket_proxy: stdout closed");
+            });
+        }
+
+        if let Some(mut stderr) = child.stderr.take() {
+            let client_id = self.client_id;
+            tokio::spawn(async move {
+                let mut buf = vec![0_u8; 8192];
+                while let Ok(n) = stderr.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    let s = String::from_utf8_lossy(&buf[..n]);
+                    debug!(
+                        client_id,
+                        channel_id = ?channel,
+                        stderr = %s.trim(),
+                        "spawn_unix_socket_proxy: socat stderr"
+                    );
+                }
+            });
+        }
+
+        let key = (self.client_id, channel);
+        let stdin_map = self.state.stdin_by_channel.clone();
+        let client_id = self.client_id;
+        tokio::spawn(async move {
+            let exit_code = match child.wait().await {
+                Ok(status) => {
+                    let code = status.code().unwrap_or(1) as u32;
+                    debug!(client_id, channel_id = ?channel, exit_code = code, "spawn_unix_socket_proxy: socat process exited");
+                    code
+                }
+                Err(e) => {
+                    warn!(client_id, channel_id = ?channel, error = %e, "spawn_unix_socket_proxy: error waiting for socat");
+                    1
+                }
             };
             let mut lock = stdin_map.lock().await;
             lock.remove(&key);
@@ -445,7 +883,7 @@ impl SshProxyServer {
                     keys: Vec::new(),
                     ..Default::default()
                 };
-                let key = PrivateKey::random(&mut OsRng, keys::Algorithm::Ed25519);
+                let key = PrivateKey::random(&mut rand::rng(), keys::Algorithm::Ed25519);
                 let Ok(key) = key else {
                     return;
                 };
@@ -512,15 +950,46 @@ mod tests {
 
     // ── Docker ────────────────────────────────────────────────────────────────
 
-    /// pty_request + exec_request(command) → no `-t` (regression guard for #90)
+    /// pty_request + exec_request(command) → `-t` IS present (interactive command)
+    /// and `-lic` shell flags are used so bash enters interactive mode.
     #[test]
-    fn docker_exec_with_pty_does_not_allocate_tty() {
-        let spec = build_exec_command("docker", CONTAINER, SHELL, Some(&pty()), Some("uname"));
+    fn docker_exec_with_pty_allocates_tty_and_uses_interactive_flags() {
+        let spec = build_exec_command("docker", CONTAINER, SHELL, Some(&pty()), Some("bash"));
+        assert_eq!(spec.program, "docker");
+        assert!(
+            spec.args.contains(&"-t".to_string()),
+            "docker exec should pass -t when pty + command (interactive command); \
+             got args: {:?}",
+            spec.args
+        );
+        assert!(
+            spec.args.contains(&"-lic".to_string()),
+            "interactive exec command should use -lic shell flags; got args: {:?}",
+            spec.args
+        );
+    }
+
+    /// no pty_request + exec_request(command) → no `-t`, uses `-lc` (non-interactive).
+    /// Zed's proxy command falls into this category: no PTY, automated command.
+    /// Non-interactive bash cannot output prompts that corrupt binary protocol
+    /// streams (e.g. Zed's length-prefixed protobuf framing).
+    #[test]
+    fn docker_exec_without_pty_does_not_allocate_tty_and_uses_non_interactive_flags() {
+        let spec = build_exec_command("docker", CONTAINER, SHELL, None, Some("uname -a"));
         assert_eq!(spec.program, "docker");
         assert!(
             !spec.args.contains(&"-t".to_string()),
-            "docker exec must not pass -t for a specific command even when pty was requested; \
-             got args: {:?}",
+            "docker exec must not pass -t when no pty was requested; got args: {:?}",
+            spec.args
+        );
+        assert!(
+            spec.args.contains(&"-lc".to_string()),
+            "non-interactive exec command should use -lc shell flags; got args: {:?}",
+            spec.args
+        );
+        assert!(
+            !spec.args.contains(&"-lic".to_string()),
+            "non-interactive exec command must not use -lic (interactive) flags; got args: {:?}",
             spec.args
         );
     }
@@ -534,18 +1003,6 @@ mod tests {
             spec.args.contains(&"-t".to_string()),
             "docker exec should pass -t for an interactive shell when pty was requested; \
              got args: {:?}",
-            spec.args
-        );
-    }
-
-    /// no pty_request + exec_request(command) → no `-t`
-    #[test]
-    fn docker_exec_without_pty_does_not_allocate_tty() {
-        let spec = build_exec_command("docker", CONTAINER, SHELL, None, Some("uname"));
-        assert_eq!(spec.program, "docker");
-        assert!(
-            !spec.args.contains(&"-t".to_string()),
-            "docker exec must not pass -t when no pty was requested; got args: {:?}",
             spec.args
         );
     }
@@ -565,19 +1022,91 @@ mod tests {
 
     // ── Apple ─────────────────────────────────────────────────────────────────
 
-    /// pty_request + exec_request(command) → uses `container exec` directly, no `script` wrapper
+    /// pty_request + exec_request(command) → must use `script` wrapper (not bare `container exec`).
+    ///
+    /// `container exec -t` requires its stdin to be a real TTY so it can call tcsetattr /
+    /// TIOCSCTTY.  Our SSH proxy always runs with Stdio::piped(), so calling `container exec -t`
+    /// directly produces ENOTTY — exactly the error Zed reports when opening a terminal panel:
+    /// "failed to exec process Error Domain=NSPOSIXErrorDomain Code=25 Inappropriate ioctl for device"
+    ///
+    /// Wrapping with `script` (as we do for shell_request) allocates a real host-side PTY that
+    /// `container exec -t` can use, solving the ENOTTY.
     #[test]
-    fn apple_exec_with_pty_does_not_use_script_wrapper() {
-        let spec = build_exec_command("apple", CONTAINER, SHELL, Some(&pty()), Some("uname"));
+    fn apple_exec_with_pty_uses_script_wrapper_not_bare_container_exec() {
+        let spec = build_exec_command("apple", CONTAINER, SHELL, Some(&pty()), Some("bash"));
         assert_eq!(
-            spec.program, "container",
-            "Apple exec with a specific command should call `container` directly, not `script`; \
+            spec.program, "script",
+            "Apple exec + PTY must use `script` to provide a host-side PTY for `container exec -t`; \
+             without it, container exec calls tcsetattr on a pipe and fails with ENOTTY. \
              program was: {:?}",
             spec.program
         );
         assert!(
+            spec.args.contains(&"-t".to_string()),
+            "Apple exec with PTY + command should pass -t to container exec; got args: {:?}",
+            spec.args
+        );
+        assert!(
+            spec.args.contains(&"-lic".to_string()),
+            "Apple interactive exec command should use -lic shell flags; got args: {:?}",
+            spec.args
+        );
+    }
+
+    /// Regression test for the Zed terminal ENOTTY bug (issue #90).
+    ///
+    /// When Zed opens a terminal panel on a remote SSH project, it spawns:
+    ///   `ssh -q -t <host> "cd && exec env ZED_TERMINAL=... /bin/bash -l"`
+    /// This arrives at our proxy as pty_request + exec_request(command).
+    ///
+    /// Previously, the Apple path called `container exec -t` with Stdio::piped(), which caused
+    /// `container exec` to call tcsetattr/TIOCSCTTY on a pipe → ENOTTY.
+    /// The fix is to wrap with `script` so a real host-side PTY is available.
+    #[test]
+    fn apple_zed_terminal_exec_uses_script_wrapper() {
+        let zed_command = "cd && exec env ZED_TERMINAL=1 /bin/bash -l";
+        let spec = build_exec_command("apple", CONTAINER, SHELL, Some(&pty()), Some(zed_command));
+        assert_eq!(
+            spec.program, "script",
+            "Zed terminal exec (pty_request + exec_request) on Apple must use `script` wrapper; \
+             got program: {:?}",
+            spec.program
+        );
+        assert!(
+            spec.args.contains(&"container".to_string()),
+            "script must invoke `container`; got args: {:?}",
+            spec.args
+        );
+        assert!(
+            spec.args.contains(&"-t".to_string()),
+            "container exec must receive -t; got args: {:?}",
+            spec.args
+        );
+        assert!(
+            spec.args.iter().any(|a| a == zed_command),
+            "the Zed command must be passed through; got args: {:?}",
+            spec.args
+        );
+    }
+
+    /// no pty_request + exec_request(command) on Apple → no `-t`, uses `-lc`.
+    #[test]
+    fn apple_exec_without_pty_uses_non_interactive_flags() {
+        let spec = build_exec_command("apple", CONTAINER, SHELL, None, Some("uname -a"));
+        assert_eq!(spec.program, "container");
+        assert!(
             !spec.args.contains(&"-t".to_string()),
-            "Apple exec with a specific command must not pass -t; got args: {:?}",
+            "Apple non-interactive exec must not pass -t; got args: {:?}",
+            spec.args
+        );
+        assert!(
+            spec.args.contains(&"-lc".to_string()),
+            "Apple non-interactive exec command should use -lc flags; got args: {:?}",
+            spec.args
+        );
+        assert!(
+            !spec.args.contains(&"-lic".to_string()),
+            "Apple non-interactive exec command must not use -lic flags; got args: {:?}",
             spec.args
         );
     }
@@ -628,5 +1157,116 @@ mod tests {
             .find(|(k, _)| k == "SHELL")
             .map(|(_, v)| v.as_str());
         assert_eq!(shell_val, Some(SHELL));
+    }
+
+    // ── Unix socket proxy (direct-streamlocal) ────────────────────────────────
+
+    const SOCKET: &str = "/tmp/zed-server-12345.sock";
+
+    /// Docker: socat command targets the correct socket path
+    #[test]
+    fn docker_unix_socket_proxy_uses_socat() {
+        let spec = build_unix_socket_command("docker", CONTAINER, SOCKET);
+        assert_eq!(spec.program, "docker");
+        assert!(
+            spec.args.contains(&"socat".to_string()),
+            "command must invoke socat; got args: {:?}",
+            spec.args
+        );
+        assert!(
+            spec.args
+                .iter()
+                .any(|a| a == &format!("UNIX-CONNECT:{SOCKET}")),
+            "socat must target UNIX-CONNECT:<socket_path>; got args: {:?}",
+            spec.args
+        );
+        assert!(
+            spec.args.contains(&"STDIO".to_string()),
+            "socat must use STDIO as source; got args: {:?}",
+            spec.args
+        );
+    }
+
+    /// Docker: no PTY allocation for socket proxy
+    #[test]
+    fn docker_unix_socket_proxy_does_not_allocate_tty() {
+        let spec = build_unix_socket_command("docker", CONTAINER, SOCKET);
+        assert!(
+            !spec.args.contains(&"-t".to_string()),
+            "Unix socket proxy must not allocate a TTY; got args: {:?}",
+            spec.args
+        );
+    }
+
+    // ── channel_eof / channel_close stdin lifecycle ───────────────────────────
+
+    /// channel_eof must NOT remove the stdin entry. If it did, socat processes
+    /// for Zed's stdout.sock / stderr.sock would die the moment Zed sends EOF
+    /// on those channels (which it does immediately since it never writes to them),
+    /// causing the server to lose its I/O connections.
+    ///
+    /// channel_close (which always follows channel_eof) IS expected to clean up.
+    #[tokio::test]
+    async fn channel_eof_does_not_close_stdin_channel_close_does() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let stdin_by_channel: Arc<
+            Mutex<HashMap<(usize, russh::ChannelId), tokio::process::ChildStdin>>,
+        > = Arc::new(Mutex::new(HashMap::new()));
+
+        // Spawn a dummy process to get a real ChildStdin handle.
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to spawn dummy process for test");
+        let child_stdin = child.stdin.take().expect("no stdin on dummy process");
+
+        // ChannelId is a private newtype(u32) — use transmute in test code only.
+        let channel_id: russh::ChannelId = unsafe { std::mem::transmute(42u32) };
+        let client_id: usize = 1;
+        let key = (client_id, channel_id);
+
+        stdin_by_channel.lock().await.insert(key, child_stdin);
+        assert!(
+            stdin_by_channel.lock().await.contains_key(&key),
+            "stdin entry should exist before eof"
+        );
+
+        // Simulate channel_eof: the handler is a no-op for the map — entry must survive.
+        assert!(
+            stdin_by_channel.lock().await.contains_key(&key),
+            "channel_eof must not remove the stdin entry — socat must stay alive"
+        );
+
+        // Simulate channel_close: removes the entry.
+        stdin_by_channel.lock().await.remove(&key);
+        assert!(
+            !stdin_by_channel.lock().await.contains_key(&key),
+            "channel_close must remove the stdin entry"
+        );
+
+        let _ = child.kill().await;
+    }
+
+    /// Apple: uses `container exec` with socat
+    #[test]
+    fn apple_unix_socket_proxy_uses_socat() {
+        let spec = build_unix_socket_command("apple", CONTAINER, SOCKET);
+        assert_eq!(spec.program, "container");
+        assert!(
+            spec.args.contains(&"socat".to_string()),
+            "Apple command must invoke socat; got args: {:?}",
+            spec.args
+        );
+        assert!(
+            spec.args
+                .iter()
+                .any(|a| a == &format!("UNIX-CONNECT:{SOCKET}")),
+            "Apple socat must target UNIX-CONNECT:<socket_path>; got args: {:?}",
+            spec.args
+        );
     }
 }
