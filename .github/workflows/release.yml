@@ -225,16 +225,17 @@ jobs:
     needs: [create-checksums]
     if: ${{ !github.event.release.prerelease }}
     steps:
-      - name: Download checksums
-        uses: actions/download-artifact@v8
-        with:
-          name: checksums
-
       - name: Checkout homebrew-tap
         uses: actions/checkout@v4
         with:
           repository: devconhq/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Download checksums
+        uses: actions/download-artifact@v8
+        with:
+          name: checksums
+          path: .
 
       - name: Update formula
         run: |
