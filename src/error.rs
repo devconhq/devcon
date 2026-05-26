@@ -43,6 +43,10 @@ pub enum Error {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
+    /// Schema parsing and validation error
+    #[error("Schema error: {0}")]
+    Schema(#[from] schema::Error),
+
     /// YAML parsing or serialization error
     #[error("YAML error: {0}")]
     Yaml(#[from] yaml_serde::Error),
