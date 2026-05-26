@@ -20,6 +20,36 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! Compatibility module that re-exports the devcontainer schema and parsing API.
+use std::collections::HashMap;
 
-pub use schema::*;
+use serde::{Deserialize, Serialize};
+
+/// Represents a lifecycle command that can be a string, array, or object.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum LifecycleCommand {
+    /// Single command as a string
+    String(String),
+    /// Multiple commands as an array
+    Array(Vec<String>),
+    /// Named commands as an object
+    Object(HashMap<String, LifecycleCommandValue>),
+}
+
+/// Represents a value in a lifecycle command object.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum LifecycleCommandValue {
+    String(String),
+    Array(Vec<String>),
+}
+
+impl LifecycleCommandValue {
+    /// Convert to a shell command string.
+    pub fn to_command_string(&self) -> String {
+        match self {
+            LifecycleCommandValue::String(s) => s.clone(),
+            LifecycleCommandValue::Array(arr) => arr.join(" && "),
+        }
+    }
+}

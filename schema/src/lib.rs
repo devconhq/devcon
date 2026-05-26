@@ -20,6 +20,12 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! Compatibility module that re-exports the devcontainer schema and parsing API.
+pub mod devcontainer;
+pub mod error;
+pub mod feature;
+mod feature_ref;
+pub mod lifecycle;
 
-pub use schema::*;
+pub use devcontainer::*;
+pub use error::{Error, Result};
+pub use lifecycle::{LifecycleCommand, LifecycleCommandValue};
