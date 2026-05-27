@@ -435,7 +435,7 @@ pub struct AgentConfig {
     /// Git repository URL for agent source code.
     ///
     /// If set (and binary_url is not set), the agent will be compiled from this repository.
-    /// Defaults to "https://github.com/kreemer/devcon.git" if not specified.
+    /// Defaults to "https://github.com/devconhq/devcon.git" if not specified.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git_repository: Option<String>,
 

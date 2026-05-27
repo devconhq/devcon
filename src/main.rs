@@ -32,7 +32,7 @@ use devcon::output::OutputFormat;
 #[derive(Parser, Debug)]
 #[command(
     name = "devcon",
-    author = "kreemer",
+    author = "devconhq",
     about = "A CLI tool for managing development containers",
     long_about = None,
     version = env!("CARGO_PKG_VERSION")
