@@ -112,7 +112,7 @@ fn build_exec_command(
         )
     });
 
-    let (program, args) = if runtime_name == "apple" {
+    let (program, args) = if runtime_name == "container" {
         if let Some(command) = requested_command {
             // Shell flags depend on whether the client requested a PTY:
             //  - PTY present  → interactive command (e.g. Zed terminal, `ssh -t host bash`):
@@ -188,7 +188,7 @@ fn build_exec_command(
         // `docker exec -t` requires the calling process's stdin to be a real
         // TTY so Docker can configure the PTY.  Our proxy always spawns child
         // processes with Stdio::piped(), so stdin is never a terminal.  We use
-        // the same `script -q /dev/null` wrapper that the Apple path uses to
+        // the same `script -q /dev/null` wrapper that the Container path uses to
         // allocate a host-side PTY whenever the SSH client requested one.
         //
         // When no PTY was requested (e.g. Zed's proxy command, `uname -a`) we
@@ -412,7 +412,7 @@ async fn run_scp_receive(
 
     receive_scp_entries(&mut reader, handle, channel, temp_dir.path()).await?;
 
-    let program = if state.runtime_name == "apple" {
+    let program = if state.runtime_name == "container" {
         "container"
     } else {
         "docker"
@@ -790,7 +790,7 @@ async fn run_sftp_session(
         return Ok(());
     }
 
-    let program = if state.runtime_name == "apple" {
+    let program = if state.runtime_name == "container" {
         "container"
     } else {
         "docker"
@@ -944,7 +944,7 @@ fn build_unix_socket_command(
     socket_path: &str,
 ) -> ExecCommandSpec {
     let socat_target = format!("UNIX-CONNECT:{socket_path}");
-    let (program, args) = if runtime_name == "apple" {
+    let (program, args) = if runtime_name == "container" {
         (
             "container".to_string(),
             vec![
@@ -1510,7 +1510,7 @@ impl ProxyServer {
         port: u32,
         handle: russh::server::Handle,
     ) {
-        let (program, args) = if self.state.runtime_name == "apple" {
+        let (program, args) = if self.state.runtime_name == "container" {
             (
                 "container".to_string(),
                 vec![
@@ -2045,7 +2045,7 @@ mod tests {
         );
     }
 
-    // ── Apple ─────────────────────────────────────────────────────────────────
+    // ── Container ─────────────────────────────────────────────────────────────────
 
     /// pty_request + exec_request(command) → must use `script` wrapper (not bare `container exec`).
     ///
@@ -2057,23 +2057,30 @@ mod tests {
     /// Wrapping with `script` (as we do for shell_request) allocates a real host-side PTY that
     /// `container exec -t` can use, solving the ENOTTY.
     #[test]
-    fn apple_exec_with_pty_uses_script_wrapper_not_bare_container_exec() {
-        let spec = build_exec_command("apple", CONTAINER, SHELL, Some(&pty()), Some("bash"), &[]);
+    fn container_exec_with_pty_uses_script_wrapper_not_bare_container_exec() {
+        let spec = build_exec_command(
+            "container",
+            CONTAINER,
+            SHELL,
+            Some(&pty()),
+            Some("bash"),
+            &[],
+        );
         assert_eq!(
             spec.program, "script",
-            "Apple exec + PTY must use `script` to provide a host-side PTY for `container exec -t`; \
+            "Container exec + PTY must use `script` to provide a host-side PTY for `container exec -t`; \
              without it, container exec calls tcsetattr on a pipe and fails with ENOTTY. \
              program was: {:?}",
             spec.program
         );
         assert!(
             spec.args.contains(&"-t".to_string()),
-            "Apple exec with PTY + command should pass -t to container exec; got args: {:?}",
+            "Container exec with PTY + command should pass -t to container exec; got args: {:?}",
             spec.args
         );
         assert!(
             spec.args.contains(&"-lic".to_string()),
-            "Apple interactive exec command should use -lic shell flags; got args: {:?}",
+            "Container interactive exec command should use -lic shell flags; got args: {:?}",
             spec.args
         );
     }
@@ -2084,14 +2091,14 @@ mod tests {
     ///   `ssh -q -t <host> "cd && exec env ZED_TERMINAL=... /bin/bash -l"`
     /// This arrives at our proxy as pty_request + exec_request(command).
     ///
-    /// Previously, the Apple path called `container exec -t` with Stdio::piped(), which caused
+    /// Previously, the Container path called `container exec -t` with Stdio::piped(), which caused
     /// `container exec` to call tcsetattr/TIOCSCTTY on a pipe → ENOTTY.
     /// The fix is to wrap with `script` so a real host-side PTY is available.
     #[test]
-    fn apple_zed_terminal_exec_uses_script_wrapper() {
+    fn container_zed_terminal_exec_uses_script_wrapper() {
         let zed_command = "cd && exec env ZED_TERMINAL=1 /bin/bash -l";
         let spec = build_exec_command(
-            "apple",
+            "container",
             CONTAINER,
             SHELL,
             Some(&pty()),
@@ -2100,7 +2107,7 @@ mod tests {
         );
         assert_eq!(
             spec.program, "script",
-            "Zed terminal exec (pty_request + exec_request) on Apple must use `script` wrapper; \
+            "Zed terminal exec (pty_request + exec_request) on Container must use `script` wrapper; \
              got program: {:?}",
             spec.program
         );
@@ -2121,39 +2128,39 @@ mod tests {
         );
     }
 
-    /// no pty_request + exec_request(command) on Apple → no `-t`, uses `-lc`.
+    /// no pty_request + exec_request(command) on Container → no `-t`, uses `-lc`.
     #[test]
-    fn apple_exec_without_pty_uses_non_interactive_flags() {
-        let spec = build_exec_command("apple", CONTAINER, SHELL, None, Some("uname -a"), &[]);
+    fn container_exec_without_pty_uses_non_interactive_flags() {
+        let spec = build_exec_command("container", CONTAINER, SHELL, None, Some("uname -a"), &[]);
         assert_eq!(spec.program, "container");
         assert!(
             !spec.args.contains(&"-t".to_string()),
-            "Apple non-interactive exec must not pass -t; got args: {:?}",
+            "Container non-interactive exec must not pass -t; got args: {:?}",
             spec.args
         );
         assert!(
             spec.args.contains(&"-lc".to_string()),
-            "Apple non-interactive exec command should use -lc flags; got args: {:?}",
+            "Container non-interactive exec command should use -lc flags; got args: {:?}",
             spec.args
         );
         assert!(
             !spec.args.contains(&"-lic".to_string()),
-            "Apple non-interactive exec command must not use -lic flags; got args: {:?}",
+            "Container non-interactive exec command must not use -lic flags; got args: {:?}",
             spec.args
         );
     }
 
     /// pty_request + shell_request → uses `script` wrapper with `-t`
     #[test]
-    fn apple_shell_with_pty_uses_script_wrapper() {
-        let spec = build_exec_command("apple", CONTAINER, SHELL, Some(&pty()), None, &[]);
+    fn container_shell_with_pty_uses_script_wrapper() {
+        let spec = build_exec_command("container", CONTAINER, SHELL, Some(&pty()), None, &[]);
         assert_eq!(
             spec.program, "script",
-            "Apple interactive shell should use the `script` PTY wrapper"
+            "Container interactive shell should use the `script` PTY wrapper"
         );
         assert!(
             spec.args.contains(&"-t".to_string()),
-            "Apple interactive shell should pass -t to container exec; got args: {:?}",
+            "Container interactive shell should pass -t to container exec; got args: {:?}",
             spec.args
         );
     }
@@ -2228,12 +2235,12 @@ mod tests {
     }
 
     #[test]
-    fn apple_exec_extra_env_vars_are_passed_with_e_flag() {
+    fn container_exec_extra_env_vars_are_passed_with_e_flag() {
         let env = vec![("ZED_REMOTE_SERVER_VERSION".to_string(), "0.1.0".to_string())];
-        let spec = build_exec_command("apple", CONTAINER, SHELL, None, Some("uname"), &env);
+        let spec = build_exec_command("container", CONTAINER, SHELL, None, Some("uname"), &env);
         assert!(
             spec.args.contains(&"-e".to_string()),
-            "Apple exec must contain -e flag for extra env; got args: {:?}",
+            "Container exec must contain -e flag for extra env; got args: {:?}",
             spec.args
         );
         assert!(
@@ -2344,21 +2351,21 @@ mod tests {
         let _ = child.kill().await;
     }
 
-    /// Apple: uses `container exec` with socat
+    /// Container: uses `container exec` with socat
     #[test]
-    fn apple_unix_socket_proxy_uses_socat() {
-        let spec = build_unix_socket_command("apple", CONTAINER, SOCKET);
+    fn container_unix_socket_proxy_uses_socat() {
+        let spec = build_unix_socket_command("container", CONTAINER, SOCKET);
         assert_eq!(spec.program, "container");
         assert!(
             spec.args.contains(&"socat".to_string()),
-            "Apple command must invoke socat; got args: {:?}",
+            "Container command must invoke socat; got args: {:?}",
             spec.args
         );
         assert!(
             spec.args
                 .iter()
                 .any(|a| a == &format!("UNIX-CONNECT:{SOCKET}")),
-            "Apple socat must target UNIX-CONNECT:<socket_path>; got args: {:?}",
+            "Container socat must target UNIX-CONNECT:<socket_path>; got args: {:?}",
             spec.args
         );
     }

@@ -23,7 +23,7 @@
 //! # Container Runtime Abstraction
 //!
 //! This module provides a trait-based abstraction for container runtimes,
-//! allowing DevCon to work with different container CLIs (Apple's container,
+//! allowing DevCon to work with different container CLIs (container,
 //! Docker, Podman, etc.).
 
 use std::{
@@ -39,7 +39,7 @@ use crate::error::Result;
 use console::Style;
 use indicatif::{ProgressBar, ProgressStyle};
 
-pub mod apple;
+pub mod container;
 pub mod docker;
 
 /// Stream build output from a child process with a rolling window display.

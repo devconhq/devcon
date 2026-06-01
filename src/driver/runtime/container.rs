@@ -20,9 +20,9 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! # Apple Container Runtime
+//! # Container CLI Runtime
 //!
-//! Implementation of ContainerRuntime trait for Apple's `container` CLI.
+//! Implementation of ContainerRuntime trait for the `container` CLI.
 
 use std::{
     path::Path,
@@ -33,7 +33,7 @@ use std::{
 use crate::error::Error;
 use crate::error::Result;
 
-use crate::config::AppleRuntimeConfig;
+use crate::config::ContainerRuntimeConfig;
 use crate::driver::runtime::RuntimeParameters;
 use tracing::{debug, trace};
 
@@ -56,30 +56,30 @@ fn extract_container_port(port: &crate::devcontainer::ForwardPort) -> Option<u16
     }
 }
 
-/// Apple's container CLI runtime implementation.
-pub struct AppleRuntime {
-    config: AppleRuntimeConfig,
+/// `container` CLI runtime implementation.
+pub struct ContainerCliRuntime {
+    config: ContainerRuntimeConfig,
 }
 
-/// Handle for an Apple container instance.
-pub struct AppleContainerHandle {
+/// Handle for a container instance.
+pub struct ContainerCliHandle {
     id: String,
 }
 
-impl super::ContainerHandle for AppleContainerHandle {
+impl super::ContainerHandle for ContainerCliHandle {
     fn id(&self) -> &str {
         &self.id
     }
 }
 
-impl AppleRuntime {
-    pub fn new(config: AppleRuntimeConfig) -> Self {
+impl ContainerCliRuntime {
+    pub fn new(config: ContainerRuntimeConfig) -> Self {
         Self { config }
     }
 
     /// Extracts `remoteUser` from the `devcontainer.metadata` OCI label embedded in the image.
     ///
-    /// The Apple container runtime's inspect JSON uses both lowercase (`config.labels`) and
+    /// The container runtime's inspect JSON uses both lowercase (`config.labels`) and
     /// Docker-style (`Config.Labels`) key names — we check both.
     fn remote_user_from_metadata_label(inspect: &serde_json::Value) -> Option<String> {
         let label_str = inspect
@@ -298,7 +298,7 @@ impl AppleRuntime {
                     .to_string();
 
                 let container_name = format!("devcon.{}", project_name);
-                let handle = AppleContainerHandle { id };
+                let handle = ContainerCliHandle { id };
                 Some((
                     container_name,
                     image_tag,
@@ -311,7 +311,7 @@ impl AppleRuntime {
     }
 }
 
-impl ContainerRuntime for AppleRuntime {
+impl ContainerRuntime for ContainerCliRuntime {
     fn build(
         &self,
         dockerfile_path: &Path,
@@ -491,7 +491,7 @@ impl ContainerRuntime for AppleRuntime {
         }
         std::thread::sleep(Duration::from_secs(10));
 
-        Ok(Box::new(AppleContainerHandle {
+        Ok(Box::new(ContainerCliHandle {
             id: String::from_utf8_lossy(&result.stdout).trim().to_string(),
         }))
     }
@@ -571,7 +571,7 @@ impl ContainerRuntime for AppleRuntime {
             )));
         }
 
-        Ok(Box::new(AppleContainerHandle {
+        Ok(Box::new(ContainerCliHandle {
             id: container_id.to_string(),
         }))
     }
@@ -687,7 +687,7 @@ impl ContainerRuntime for AppleRuntime {
 
     fn image_label(&self, image_tag: &str, label_key: &str) -> Result<Option<String>> {
         let inspect = self.inspect_image(image_tag)?;
-        // Apple's inspect JSON uses both lowercase and Docker-style key names.
+        // Container's inspect JSON uses both lowercase and Docker-style key names.
         let value = inspect
             .as_ref()
             .and_then(|v| v.get("Config").or_else(|| v.get("config")))

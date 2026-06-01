@@ -4,7 +4,7 @@
 
 Do not use emojis in responses. Be direct and concise when addressing the user.
 
-DevCon is a Rust CLI tool for managing and launching development containers. It parses `devcontainer.json` configuration, downloads OCI features, and orchestrates container build/start/shell lifecycle against pluggable container runtimes (Docker, Apple Container).
+DevCon is a Rust CLI tool for managing and launching development containers. It parses `devcontainer.json` configuration, downloads OCI features, and orchestrates container build/start/shell lifecycle against pluggable container runtimes (Docker, container).
 
 ## Workspace structure
 
@@ -48,7 +48,7 @@ Integration tests skip automatically if the required runtime binary is not found
 | `command.rs` | Handler functions for each CLI subcommand; loads config, creates runtime/driver, delegates work |
 | `config.rs` | User config (YAML at `~/.config/devcon/config.yaml`); properties use camelCase dot-notation (e.g. `agents.binaryUrl`) |
 | `devcontainer.rs` | Parses `devcontainer.json`; `image` and `build.dockerfile` are mutually exclusive |
-| `driver/runtime.rs` | `ContainerRuntime` + `ContainerHandle` traits; impls in `driver/runtime/docker.rs` and `driver/runtime/apple.rs` |
+| `driver/runtime.rs` | `ContainerRuntime` + `ContainerHandle` traits; impls in `driver/runtime/docker.rs` and `driver/runtime/container.rs` |
 | `driver/container.rs` | `ContainerDriver` — orchestrates full build→start→lifecycle-hooks flow |
 | `driver/feature_process.rs` | Downloads and installs devcontainer features from OCI registries (ghcr.io) |
 | `driver/control_server.rs` | TCP server (default port 15000) started by `devcon serve`; manages agent connections |
@@ -72,5 +72,5 @@ Binary that runs inside the container. Communicates with the host control server
 - **Runtime selection**: `ContainerRuntime` is always `Box<dyn ContainerRuntime>`; the concrete type is resolved in `command.rs` via `get_runtime_specific_config()` from the user's config.
 - **Logging**: Use `tracing` macros (`trace!`, `debug!`, `warn!`). The `-d` flag maps to log level (1=INFO, 2=DEBUG, 3+=TRACE). Third-party crate logs are suppressed unless `-dddd`.
 - **Config property paths**: camelCase dot-notation strings (e.g., `agents.binaryUrl`, `dotfilesRepository`). This convention is enforced in config get/set/unset CLI commands.
-- **Integration test helpers**: All test setup goes through functions in `tests/test_utils.rs` (`create_test_devcontainer`, `create_test_config`, etc.). The `CONTAINER_RUNTIME` environment variable selects between `docker` (default) and `apple`.
+- **Integration test helpers**: All test setup goes through functions in `tests/test_utils.rs` (`create_test_devcontainer`, `create_test_config`, etc.). The `CONTAINER_RUNTIME` environment variable selects between `docker` (default) and `container`.
 - **Workspace edition**: `edition = "2024"` is set at the workspace level; all crates inherit it.
