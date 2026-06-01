@@ -253,6 +253,25 @@ fn detect_public_ssh_key() -> Option<String> {
     None
 }
 
+fn is_transient_agent_mount_start_error(error: &Error) -> bool {
+    let Error::Runtime(message) = error else {
+        return false;
+    };
+
+    let lower = message.to_ascii_lowercase();
+
+    let mount_related = lower.contains("error mounting")
+        || lower.contains("mount src=")
+        || lower.contains(" mount ");
+    let agent_related = lower.contains("/ssh-agent")
+        || lower.contains("s.gpg-agent")
+        || lower.contains("ssh_auth_sock");
+    let missing_or_invalid_source =
+        lower.contains("not a directory") || lower.contains("no such file or directory");
+
+    mount_related && agent_related && missing_or_invalid_source
+}
+
 /// Applies a manual override to the feature installation order.
 ///
 /// Reorders features according to the specified feature IDs, keeping any
@@ -1027,8 +1046,28 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
 
             if is_current {
                 info!("Restarting stopped container with latest image");
-                let restarted = self.runtime.start_container(handle.id())?;
-                return Ok(restarted.id().to_string());
+                match self.runtime.start_container(handle.id()) {
+                    Ok(restarted) => return Ok(restarted.id().to_string()),
+                    Err(err) => {
+                        let agent_forwarding_enabled = self
+                            .config
+                            .agent_forwarding
+                            .as_ref()
+                            .map(|cfg| {
+                                cfg.ssh_enabled.unwrap_or(false) || cfg.gpg_enabled.unwrap_or(false)
+                            })
+                            .unwrap_or(false);
+
+                        if agent_forwarding_enabled && is_transient_agent_mount_start_error(&err) {
+                            warn!(
+                                "Restart failed due to stale forwarded agent socket mount, creating a fresh container: {}",
+                                err
+                            );
+                        } else {
+                            return Err(err);
+                        }
+                    }
+                }
             }
 
             debug!(
@@ -2586,6 +2625,22 @@ mod tests {
             .rfind("&&")
             .expect("&& before touch not found");
         assert!(and_pos < touch_pos, "&& must precede touch");
+    }
+
+    #[test]
+    fn test_is_transient_agent_mount_start_error_matches_stale_ssh_mount() {
+        let err = Error::runtime(
+            "docker start failed: error during container init: error mounting '/private/var/run/com.apple.launchd.ABC/Listeners' to '/ssh-agent': not a directory",
+        );
+
+        assert!(is_transient_agent_mount_start_error(&err));
+    }
+
+    #[test]
+    fn test_is_transient_agent_mount_start_error_ignores_unrelated_start_error() {
+        let err = Error::runtime("docker start failed: port is already allocated");
+
+        assert!(!is_transient_agent_mount_start_error(&err));
     }
 
     #[test]
