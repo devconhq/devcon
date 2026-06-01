@@ -56,6 +56,69 @@ fn extract_container_port(port: &crate::devcontainer::ForwardPort) -> Option<u16
     }
 }
 
+fn parse_host_port_from_text(output: &str) -> Option<u16> {
+    output.lines().find_map(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        // Handles formats such as:
+        // - 0.0.0.0:49152
+        // - :::49152
+        // - 127.0.0.1:49152->22/tcp
+        let candidate = trimmed
+            .split_once("->")
+            .map(|(left, _)| left)
+            .unwrap_or(trimmed);
+
+        candidate
+            .rsplit(':')
+            .next()
+            .and_then(|port| port.parse::<u16>().ok())
+    })
+}
+
+fn extract_mapped_port_from_value(value: &serde_json::Value, container_port: u16) -> Option<u16> {
+    match value {
+        serde_json::Value::Object(map) => {
+            // Match common schema keys used by container runtimes.
+            if let (Some(container), Some(host)) = (
+                map.get("containerPort")
+                    .or_else(|| map.get("container_port")),
+                map.get("hostPort").or_else(|| map.get("host_port")),
+            ) {
+                let container = container
+                    .as_u64()
+                    .and_then(|v| u16::try_from(v).ok())
+                    .or_else(|| container.as_str().and_then(|v| v.parse::<u16>().ok()));
+                let host = host
+                    .as_u64()
+                    .and_then(|v| u16::try_from(v).ok())
+                    .or_else(|| host.as_str().and_then(|v| v.parse::<u16>().ok()));
+
+                if container == Some(container_port) {
+                    return host;
+                }
+            }
+
+            map.values()
+                .find_map(|nested| extract_mapped_port_from_value(nested, container_port))
+        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .find_map(|item| extract_mapped_port_from_value(item, container_port)),
+        serde_json::Value::String(s) => {
+            if s.contains("->") && s.ends_with(&format!("{}{}", container_port, "/tcp")) {
+                parse_host_port_from_text(s)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 /// `container` CLI runtime implementation.
 pub struct ContainerCliRuntime {
     config: ContainerRuntimeConfig,
@@ -471,9 +534,7 @@ impl ContainerRuntime for ContainerCliRuntime {
         // Add port forwards
         for port in runtime_parameters.ports {
             let port_number = match port {
-                crate::devcontainer::ForwardPort::Port(port_number) => {
-                    format!("{}:{}", port_number, port_number)
-                }
+                crate::devcontainer::ForwardPort::Port(port_number) => port_number.to_string(),
                 crate::devcontainer::ForwardPort::HostPort(port) => port,
             };
             cmd.arg("-p").arg(port_number);
@@ -548,6 +609,50 @@ impl ContainerRuntime for ContainerCliRuntime {
         }
 
         Ok(())
+    }
+
+    fn mapped_host_port(&self, container_id: &str, container_port: u16) -> Result<Option<u16>> {
+        let direct = Command::new("container")
+            .arg("port")
+            .arg(container_id)
+            .arg(format!("{}/tcp", container_port))
+            .output();
+
+        if let Ok(output) = direct
+            && output.status.success()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Some(port) = parse_host_port_from_text(&stdout) {
+                return Ok(Some(port));
+            }
+        }
+
+        let output = Command::new("container")
+            .arg("list")
+            .arg("--format")
+            .arg("json")
+            .output()?;
+
+        if !output.status.success() {
+            return Ok(None);
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let parsed: serde_json::Value = serde_json::from_str(&stdout)?;
+
+        let container = parsed.as_array().and_then(|items| {
+            items.iter().find(|item| {
+                item.get("configuration")
+                    .and_then(|cfg| cfg.get("id"))
+                    .and_then(|id| id.as_str())
+                    .map(|id| id == container_id)
+                    .unwrap_or(false)
+            })
+        });
+
+        let mapped =
+            container.and_then(|item| extract_mapped_port_from_value(item, container_port));
+        Ok(mapped)
     }
 
     fn list(&self) -> Result<Vec<(String, String, Box<dyn super::ContainerHandle>)>> {
@@ -700,5 +805,29 @@ impl ContainerRuntime for ContainerCliRuntime {
 
     fn get_host_address(&self) -> String {
         "host.container.internal".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_host_port_from_text_arrow_format() {
+        assert_eq!(
+            parse_host_port_from_text("127.0.0.1:49152->22/tcp"),
+            Some(49152)
+        );
+    }
+
+    #[test]
+    fn test_extract_mapped_port_from_value_common_shape() {
+        let value = serde_json::json!({
+            "ports": [
+                {"containerPort": 22, "hostPort": 49152}
+            ]
+        });
+
+        assert_eq!(extract_mapped_port_from_value(&value, 22), Some(49152));
     }
 }

@@ -55,6 +55,20 @@ fn extract_container_port(port: &crate::devcontainer::ForwardPort) -> Option<u16
     }
 }
 
+fn parse_host_port(output: &str) -> Option<u16> {
+    output.lines().find_map(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        trimmed
+            .rsplit(':')
+            .next()
+            .and_then(|port| port.parse::<u16>().ok())
+    })
+}
+
 /// Docker CLI runtime implementation.
 pub struct DockerRuntime {
     config: DockerRuntimeConfig,
@@ -529,6 +543,21 @@ impl ContainerRuntime for DockerRuntime {
         Ok(())
     }
 
+    fn mapped_host_port(&self, container_id: &str, container_port: u16) -> Result<Option<u16>> {
+        let output = Command::new("docker")
+            .arg("port")
+            .arg(container_id)
+            .arg(format!("{}/tcp", container_port))
+            .output()?;
+
+        if !output.status.success() {
+            return Ok(None);
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(parse_host_port(&stdout))
+    }
+
     fn list(&self) -> Result<Vec<(String, String, Box<dyn super::ContainerHandle>)>> {
         self.list_containers(false)
     }
@@ -680,6 +709,21 @@ impl ContainerRuntime for DockerRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_host_port_ipv4() {
+        assert_eq!(parse_host_port("0.0.0.0:49152\n"), Some(49152));
+    }
+
+    #[test]
+    fn test_parse_host_port_ipv6() {
+        assert_eq!(parse_host_port(":::49152\n"), Some(49152));
+    }
+
+    #[test]
+    fn test_parse_host_port_empty() {
+        assert_eq!(parse_host_port(""), None);
+    }
 
     /// Images like `mcr.microsoft.com/devcontainers/base:ubuntu` have `Config.User` set to
     /// `"root"` but embed the intended remote user (`vscode`) in the OCI label

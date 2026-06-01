@@ -25,4 +25,3 @@ pub mod container;
 pub mod control_server;
 pub mod feature_process;
 pub mod runtime;
-pub mod ssh_proxy;

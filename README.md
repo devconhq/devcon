@@ -22,7 +22,7 @@ A blazingly fast CLI tool for managing and launching development containers. Dev
 - **Dotfiles Integration**: Clone and set up your dotfiles repository automatically inside containers
 - **Agent Forwarding**: Forward SSH, GPG, and GitHub CLI credentials into running containers
 - **Port Forwarding**: Automatic port forwarding with configurable display modes
-- **SSH Access**: Connect to containers via SSH, including `ProxyCommand` support for use in `~/.ssh/config`
+- **SSH Access**: Connect to containers via in-container OpenSSH with automatic random host-port mapping and `ProxyCommand` support for `~/.ssh/config`
 - **Flexible Configuration**: User-level YAML config with XDG directory support
 
 ## Installation
@@ -101,15 +101,17 @@ devcon shell --env EDITOR=vim --env LANG=en_US.UTF-8
 
 ```bash
 # Use as an SSH ProxyCommand (for ~/.ssh/config integration)
-devcon ssh --proxy
+devcon ssh connect --proxy
 ```
 
 Example `~/.ssh/config` entry:
 
 ```
 Host myproject
-  ProxyCommand devcon ssh /path/to/project --proxy
+  ProxyCommand devcon ssh connect /path/to/project --proxy
 ```
+
+DevCon ensures container port `22/tcp` is always published to a random host port when starting containers. The `devcon-agent` feature installs and starts OpenSSH server inside supported Linux distributions, and `devcon ssh connect` discovers the mapped host port and connects directly.
 
 ## The control server and agent (`devcon serve`)
 
