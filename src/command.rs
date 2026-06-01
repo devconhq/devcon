@@ -36,6 +36,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
+use std::{io, io::IsTerminal};
 
 use dirs;
 
@@ -44,7 +45,6 @@ use crate::output::OutputFormat;
 use crate::{
     config::Config,
     driver::{
-        self,
         container::ContainerDriver,
         control_server,
         runtime::{container::ContainerCliRuntime, docker::DockerRuntime},
@@ -663,14 +663,21 @@ pub fn handle_ssh_command(
         &devcontainer_workspace,
         "Multiple containers running — select one to connect via SSH",
     )?;
-
-    let shell = config.default_shell.as_deref().unwrap_or("zsh").to_string();
-    let proxy = driver::ssh_proxy::SshProxyServer::start(&runtime_name, &container_id, &shell)?;
+    let remote_user = driver.resolve_remote_user_for_workspace(&devcontainer_workspace);
+    let mapped_port = driver
+        .runtime
+        .mapped_host_port(&container_id, 22)?
+        .ok_or_else(|| {
+            Error::runtime(
+                "Container SSH port 22 is not mapped. Recreate the container with devcon up/start."
+                    .to_string(),
+            )
+        })?;
 
     if proxy_mode {
         let status = Command::new("nc")
             .arg("127.0.0.1")
-            .arg(proxy.port().to_string())
+            .arg(mapped_port.to_string())
             .status()?;
 
         if !status.success() {
@@ -683,17 +690,22 @@ pub fn handle_ssh_command(
         return Ok(());
     }
 
-    let status = Command::new("ssh")
-        .arg("-o")
+    let mut ssh = Command::new("ssh");
+    ssh.arg("-o")
         .arg("StrictHostKeyChecking=no")
         .arg("-o")
         .arg("UserKnownHostsFile=/dev/null")
         .arg("-o")
-        .arg("LogLevel=ERROR")
-        .arg("-tt")
+        .arg("LogLevel=ERROR");
+
+    if io::stdin().is_terminal() && io::stdout().is_terminal() {
+        ssh.arg("-tt");
+    }
+
+    let status = ssh
         .arg("-p")
-        .arg(proxy.port().to_string())
-        .arg("devcon@127.0.0.1")
+        .arg(mapped_port.to_string())
+        .arg(format!("{}@127.0.0.1", remote_user))
         .status()?;
 
     if !status.success() {
@@ -709,19 +721,22 @@ pub fn handle_ssh_command(
 /// Handles the `ssh create-config` command.
 ///
 /// Writes (or replaces) a `Host devcon-<name>` block in `~/.ssh/config` so that
-/// `ssh devcon-<name>` transparently proxies through `devcon ssh connect --proxy`.
-pub fn handle_ssh_create_config_command(
-    path: PathBuf,
-    _config_path: Option<PathBuf>,
-) -> Result<()> {
+/// `ssh devcon-<name>` transparently streams through `devcon ssh connect --proxy`.
+pub fn handle_ssh_create_config_command(path: PathBuf, config_path: Option<PathBuf>) -> Result<()> {
+    let config = Config::load(config_path)?;
+    let runtime_name = config.resolve_runtime()?;
+    let runtime = get_runtime_specific_config(&config, &runtime_name)?;
     let workspace = Workspace::try_from(path.clone())?;
+    let driver = ContainerDriver::new(config, runtime);
+    let remote_user = driver.resolve_remote_user_for_workspace(&workspace);
+
     let host_alias = format!("devcon-{}", workspace.get_sanitized_name());
     let canonical_path = workspace.path.display().to_string();
 
     let block = format!(
         "Host {host_alias}\n\
          \tHostName 127.0.0.1\n\
-         \tUser devcon\n\
+         	User {remote_user}\n\
          \tStrictHostKeyChecking no\n\
          \tUserKnownHostsFile /dev/null\n\
          \tLogLevel ERROR\n\
@@ -960,14 +975,14 @@ pub fn handle_serve_command(
     }
 
     // Create status callback based on mode
-    let status_callback: Option<driver::control_server::StatusCallback> = status_mode.map(|mode| {
+    let status_callback: Option<control_server::StatusCallback> = status_mode.map(|mode| {
         use crate::StatusMode;
-        let callback: driver::control_server::StatusCallback = match mode {
+        let callback: control_server::StatusCallback = match mode {
             StatusMode::Inline => Arc::new(|forwards| {
-                driver::control_server::display_forwards_inline(forwards);
+                control_server::display_forwards_inline(forwards);
             }),
             StatusMode::Fullscreen => Arc::new(|forwards| {
-                driver::control_server::display_forwards_fullscreen(forwards);
+                control_server::display_forwards_fullscreen(forwards);
             }),
         };
         callback

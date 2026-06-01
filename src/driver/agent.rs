@@ -52,6 +52,22 @@ impl AgentConfig {
 set -e
 echo "Installing DevCon Agent..."
 
+echo "Installing OpenSSH server..."
+if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends openssh-server curl ca-certificates
+elif command -v apk >/dev/null 2>&1; then
+    apk add --no-cache openssh curl ca-certificates
+elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y openssh-server curl ca-certificates
+elif command -v yum >/dev/null 2>&1; then
+    yum install -y openssh-server curl ca-certificates
+else
+    echo "Unsupported distribution: could not find apt-get, apk, dnf, or yum"
+    exit 1
+fi
+
 {% if use_binary %}
 # Download precompiled binary
 
@@ -96,6 +112,26 @@ rm -rf /tmp/devcon
 echo '#!/bin/bash' > /usr/local/bin/devcon-browser
 echo 'devcon-agent open-url $1' >> /usr/local/bin/devcon-browser
 chmod +x /usr/local/bin/devcon-browser
+
+cat <<'EOF' > /usr/local/bin/devcon-agent-start
+#!/usr/bin/env bash
+set -e
+
+mkdir -p /var/run/sshd
+ssh-keygen -A >/dev/null 2>&1 || true
+
+if command -v /usr/sbin/sshd >/dev/null 2>&1; then
+    /usr/sbin/sshd
+elif command -v sshd >/dev/null 2>&1; then
+    sshd
+else
+    echo "Unable to start sshd: executable not found"
+    exit 1
+fi
+
+exec /usr/local/bin/devcon-agent daemon
+EOF
+chmod +x /usr/local/bin/devcon-agent-start
 
 echo "DevCon Agent installed successfully."
 "###,
@@ -183,7 +219,7 @@ impl Agent {
                 "DEVCON_AGENT": "1",
                 "BROWSER": "/usr/local/bin/devcon-browser"
             },
-            "entrypoint": "/usr/local/bin/devcon-agent daemon",
+            "entrypoint": "/usr/local/bin/devcon-agent-start",
         });
 
         if compile_needed {
@@ -305,6 +341,18 @@ mod tests {
         assert!(config.git_repository.is_none());
         assert!(config.git_branch.is_none());
         assert!(config.install_script.contains("curl"));
+        assert!(config.install_script.contains("openssh-server"));
+    }
+
+    #[test]
+    fn test_agent_feature_entrypoint_uses_wrapper() {
+        let config = AgentConfig::default();
+        let mut agent = Agent::new(config);
+        let path = agent.generate().expect("Failed to generate configuration");
+        let content = std::fs::read_to_string(path.join("devcontainer-feature.json"))
+            .expect("Failed to read feature JSON");
+
+        assert!(content.contains("/usr/local/bin/devcon-agent-start"));
     }
 
     #[test]

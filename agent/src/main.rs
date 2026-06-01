@@ -17,6 +17,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
 use std::time::Duration;
 
+const AUTO_FORWARD_DENY_PORTS: [u16; 1] = [22];
+
 #[derive(Parser)]
 #[command(name = "devcon-agent")]
 #[command(about = "DevCon agent", long_about = None)]
@@ -550,6 +552,9 @@ fn main() {
                 }
             }
 
+            // Never auto-forward container SSH.
+            excluded_ports.extend(AUTO_FORWARD_DENY_PORTS);
+
             if !excluded_ports.is_empty() {
                 eprintln!("Excluding ports from auto-forwarding: {:?}", excluded_ports);
             }
@@ -846,5 +851,10 @@ mod tests {
             recv3.message,
             Some(agent_message::Message::OpenUrl(_))
         ));
+    }
+
+    #[test]
+    fn test_auto_forward_denylist_includes_ssh_port() {
+        assert!(AUTO_FORWARD_DENY_PORTS.contains(&22));
     }
 }

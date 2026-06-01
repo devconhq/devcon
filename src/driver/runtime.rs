@@ -313,6 +313,18 @@ pub trait ContainerRuntime: Send {
         attach_stdout: bool,
     ) -> Result<()>;
 
+    /// Returns the mapped host port for a container TCP port.
+    ///
+    /// # Arguments
+    ///
+    /// * `container_id` - The runtime-specific container identifier
+    /// * `container_port` - The container-side TCP port (for example 22)
+    ///
+    /// # Returns
+    ///
+    /// `Ok(Some(port))` when mapped, `Ok(None)` when not mapped.
+    fn mapped_host_port(&self, container_id: &str, container_port: u16) -> Result<Option<u16>>;
+
     /// Lists running containers.
     ///
     /// # Returns

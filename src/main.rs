@@ -135,8 +135,8 @@ enum SshAction {
         )]
         path: Option<PathBuf>,
 
-        /// Run in ProxyCommand mode (for use in ~/.ssh/config)
-        #[arg(long, help = "Use stdio proxy mode for ssh ProxyCommand")]
+        /// Run in ProxyCommand mode (stdio passthrough to mapped container SSH port)
+        #[arg(long, help = "Use stdio passthrough mode for ssh ProxyCommand")]
         proxy: bool,
     },
 

@@ -204,6 +204,55 @@ fn detect_gh_config() -> Option<PathBuf> {
     Some(gh_config_dir)
 }
 
+fn extract_container_port(port: &crate::devcontainer::ForwardPort) -> Option<u16> {
+    use crate::devcontainer::ForwardPort;
+    match port {
+        ForwardPort::Port(p) => Some(*p),
+        ForwardPort::HostPort(mapping) => mapping.split(':').nth(1).and_then(|s| s.parse().ok()),
+    }
+}
+
+fn ensure_ssh_port_forwarded(ports: &mut Vec<crate::devcontainer::ForwardPort>) {
+    let has_ssh = ports
+        .iter()
+        .filter_map(extract_container_port)
+        .any(|container_port| container_port == 22);
+
+    if !has_ssh {
+        ports.push(crate::devcontainer::ForwardPort::Port(22));
+    }
+}
+
+fn shell_single_quote(input: &str) -> String {
+    input.replace('\'', "'\"'\"'")
+}
+
+fn detect_public_ssh_key() -> Option<String> {
+    if let Ok(value) = std::env::var("DEVCON_SSH_PUBLIC_KEY") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    let home = dirs::home_dir()?;
+    let candidates = ["id_ed25519.pub", "id_ecdsa.pub", "id_rsa.pub", "id_dsa.pub"];
+
+    for candidate in candidates {
+        let path = home.join(".ssh").join(candidate);
+        let content = match fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+        let trimmed = content.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    None
+}
+
 /// Applies a manual override to the feature installation order.
 ///
 /// Reorders features according to the specified feature IDs, keeping any
@@ -360,6 +409,13 @@ impl ContainerDriver {
             .map_err(|e| Error::new(format!("Selection cancelled: {e}")))?;
 
         Ok(matching[selection].1.clone())
+    }
+
+    /// Resolves the remote SSH user for a workspace using devcontainer/image metadata.
+    pub fn resolve_remote_user_for_workspace(&self, workspace: &Workspace) -> String {
+        let latest_tag = format!("{}:latest", self.get_image_tag(workspace));
+        self.resolve_users_for_image(workspace, &latest_tag)
+            .remote_user
     }
 
     /// Prepares features for building or starting a container.
@@ -1253,11 +1309,12 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
         }
 
         // Handle port forward requests
-        let ports = devcontainer_workspace
+        let mut ports = devcontainer_workspace
             .devcontainer
             .forward_ports
             .clone()
             .unwrap_or_default();
+        ensure_ssh_port_forwarded(&mut ports);
 
         match self.runtime.inspect_image(&latest_tag)? {
             Some(inspect) => {
@@ -1284,6 +1341,8 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                 requires_privileged,
             },
         )?;
+
+        self.ensure_ssh_authorized_key(handle.as_ref(), &resolved_users)?;
 
         match &devcontainer_workspace.devcontainer.on_create_command {
             Some(LifecycleCommand::String(cmd)) => {
@@ -1545,6 +1604,34 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
         };
 
         Ok(handle.id().to_string())
+    }
+
+    fn ensure_ssh_authorized_key(
+        &self,
+        handle: &dyn crate::driver::runtime::ContainerHandle,
+        users: &ResolvedUsers,
+    ) -> Result<()> {
+        let Some(public_key) = detect_public_ssh_key() else {
+            warn!(
+                "No host SSH public key found. Set DEVCON_SSH_PUBLIC_KEY or create ~/.ssh/id_ed25519.pub to use devcon ssh."
+            );
+            return Ok(());
+        };
+
+        let home = shell_single_quote(&users.remote_user_home);
+        let key = shell_single_quote(&public_key);
+
+        let command = format!(
+            "set -e; \
+            mkdir -p '{home}/.ssh'; \
+            chmod 700 '{home}/.ssh'; \
+            touch '{home}/.ssh/authorized_keys'; \
+            grep -qxF '{key}' '{home}/.ssh/authorized_keys' || printf '%s\\n' '{key}' >> '{home}/.ssh/authorized_keys'; \
+            chmod 600 '{home}/.ssh/authorized_keys'"
+        );
+
+        self.runtime
+            .exec(handle, vec!["sh", "-lc", &command], &[], false, false)
     }
 
     /// Shells into a started container.
