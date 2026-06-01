@@ -265,11 +265,58 @@ fn is_transient_agent_mount_start_error(error: &Error) -> bool {
         || lower.contains(" mount ");
     let agent_related = lower.contains("/ssh-agent")
         || lower.contains("s.gpg-agent")
-        || lower.contains("ssh_auth_sock");
+        || lower.contains("ssh_auth_sock")
+        || lower.contains("/run/devcon-agents");
     let missing_or_invalid_source =
         lower.contains("not a directory") || lower.contains("no such file or directory");
 
     mount_related && agent_related && missing_or_invalid_source
+}
+
+/// Returns the path to the stable agent socket directory, creating it if necessary.
+///
+/// The directory `$HOME/.local/share/devcon/agent-sockets` survives reboots, unlike
+/// the ephemeral macOS launchd socket directories. Devcon keeps symlinks inside this
+/// directory that point to the current real socket paths, refreshed on every `start`.
+fn agent_socket_stable_dir() -> Option<PathBuf> {
+    let dir = dirs::home_dir()?.join(".local/share/devcon/agent-sockets");
+    if let Err(e) = fs::create_dir_all(&dir) {
+        warn!("Failed to create agent socket stable dir {:?}: {}", dir, e);
+        return None;
+    }
+    Some(dir)
+}
+
+/// Creates or atomically replaces the symlink `stable_dir/link_name → target`.
+///
+/// Returns `true` on success. On failure, logs a warning and returns `false` so
+/// callers can fall back to a direct socket bind-mount.
+fn update_agent_socket_symlink(stable_dir: &Path, link_name: &str, target: &Path) -> bool {
+    use std::os::unix::fs::symlink;
+    let link_path = stable_dir.join(link_name);
+    // No-op when the symlink already points to the correct target.
+    if fs::read_link(&link_path).is_ok_and(|existing| existing == target) {
+        debug!("Agent socket symlink {:?} already up-to-date", link_path);
+        return true;
+    }
+    // Remove any existing file or symlink (ignore ENOENT).
+    let _ = fs::remove_file(&link_path);
+    match symlink(target, &link_path) {
+        Ok(()) => {
+            debug!(
+                "Updated agent socket symlink {:?} → {:?}",
+                link_path, target
+            );
+            true
+        }
+        Err(e) => {
+            warn!(
+                "Failed to create agent socket symlink {:?} → {:?}: {}",
+                link_path, target, e
+            );
+            false
+        }
+    }
 }
 
 /// Applies a manual override to the feature installation order.
@@ -1194,11 +1241,16 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
 
         // Track whether agent forwarding mounts were added (for environment variables later)
         let mut ssh_agent_mounted = false;
+        let mut ssh_via_stable_dir = false;
         let mut gpg_agent_mounted = false;
+        let mut gpg_via_stable_dir = false;
         let mut gpg_public_keyring_path: Option<PathBuf> = None;
 
         // Add agent forwarding mounts if configured
         if let Some(ref agent_fwd) = self.config.agent_forwarding {
+            // Resolve the stable agent socket directory once; shared by SSH and GPG forwarding.
+            let stable_agent_dir = agent_socket_stable_dir();
+
             // SSH agent forwarding
             if agent_fwd.ssh_enabled.unwrap_or(false) {
                 let ssh_socket = if let Some(ref override_path) = agent_fwd.ssh_socket_path {
@@ -1218,11 +1270,27 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
 
                 if let Some(socket) = ssh_socket {
                     info!("Forwarding SSH agent socket into container");
-                    all_mounts.push(crate::devcontainer::Mount::String(format!(
-                        "{}:/ssh-agent",
-                        socket.display()
-                    )));
-                    ssh_agent_mounted = true;
+                    if let Some(ref stable_dir) = stable_agent_dir {
+                        if update_agent_socket_symlink(stable_dir, "ssh-agent", &socket) {
+                            ssh_agent_mounted = true;
+                            ssh_via_stable_dir = true;
+                        } else {
+                            warn!(
+                                "Stable dir symlink failed; falling back to direct SSH socket mount"
+                            );
+                            all_mounts.push(crate::devcontainer::Mount::String(format!(
+                                "{}:/ssh-agent",
+                                socket.display()
+                            )));
+                            ssh_agent_mounted = true;
+                        }
+                    } else {
+                        all_mounts.push(crate::devcontainer::Mount::String(format!(
+                            "{}:/ssh-agent",
+                            socket.display()
+                        )));
+                        ssh_agent_mounted = true;
+                    }
                 } else {
                     info!("SSH agent forwarding enabled but no socket found");
                 }
@@ -1247,14 +1315,28 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
 
                 if let Some(socket) = gpg_socket {
                     info!("Forwarding GPG agent socket into container");
-                    all_mounts.push(crate::devcontainer::Mount::String(format!(
-                        "{}:{}/.gnupg/S.gpg-agent",
-                        socket.display(),
-                        &resolved_users.remote_user_home
-                    )));
+                    if let Some(ref stable_dir) = stable_agent_dir {
+                        if update_agent_socket_symlink(stable_dir, "S.gpg-agent", &socket) {
+                            gpg_via_stable_dir = true;
+                        } else {
+                            warn!(
+                                "Stable dir symlink failed; falling back to direct GPG socket mount"
+                            );
+                            all_mounts.push(crate::devcontainer::Mount::String(format!(
+                                "{}:{}/.gnupg/S.gpg-agent",
+                                socket.display(),
+                                &resolved_users.remote_user_home
+                            )));
+                        }
+                    } else {
+                        all_mounts.push(crate::devcontainer::Mount::String(format!(
+                            "{}:{}/.gnupg/S.gpg-agent",
+                            socket.display(),
+                            &resolved_users.remote_user_home
+                        )));
+                    }
 
                     // Export public keyring
-                    info!("Exporting GPG public keyring");
                     let temp_dir = TempDir::new()?;
                     let keyring_file = temp_dir.path().join("gpg-public-keys.asc");
 
@@ -1319,6 +1401,16 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                     info!("GitHub CLI forwarding enabled but no configuration found");
                 }
             }
+            // Mount the stable agent socket directory once for SSH and/or GPG forwarding.
+            if (ssh_via_stable_dir || gpg_via_stable_dir)
+                && let Some(ref stable_dir) = stable_agent_dir
+            {
+                all_mounts.push(crate::devcontainer::Mount::String(format!(
+                    "{}:/run/devcon-agents",
+                    stable_dir.display()
+                )));
+                debug!("Mounted stable agent socket directory at /run/devcon-agents");
+            }
         }
 
         // Check if container needs to run in privileged mode
@@ -1341,7 +1433,11 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
 
         // Add environment variables for agent forwarding
         if ssh_agent_mounted {
-            processed_env_vars.push("SSH_AUTH_SOCK=/ssh-agent".to_string());
+            if ssh_via_stable_dir {
+                processed_env_vars.push("SSH_AUTH_SOCK=/run/devcon-agents/ssh-agent".to_string());
+            } else {
+                processed_env_vars.push("SSH_AUTH_SOCK=/ssh-agent".to_string());
+            }
         }
         if gpg_agent_mounted {
             processed_env_vars.push("GPG_TTY=$(tty)".to_string());
@@ -1434,6 +1530,14 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                 "sudo chmod -R 0700 {home}/.gnupg && sudo chown -R $(id -u):$(id -g) {home}/.gnupg",
                 home = &resolved_users.remote_user_home
             );
+            if gpg_via_stable_dir {
+                // Create the in-container symlink from ~/.gnupg/S.gpg-agent to the stable dir.
+                // This runs once (guarded); the host symlink is refreshed on every start.
+                gpg_cmd.push_str(&format!(
+                    " && ln -sf /run/devcon-agents/S.gpg-agent {home}/.gnupg/S.gpg-agent",
+                    home = &resolved_users.remote_user_home
+                ));
+            }
             if gpg_public_keyring_path.is_some() {
                 info!("Importing GPG public keyring into container");
                 gpg_cmd.push_str(" && gpg --import /tmp/gpg-public-keys.asc 2>&1 || true");
@@ -1451,8 +1555,16 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
         // Fix file permissions on ssh agent socket
         if ssh_agent_mounted {
             debug!("Setting permissions on SSH agent socket inside container");
-            let cmd = "sudo chmod 600 /ssh-agent && sudo chown $(id -u):$(id -g) /ssh-agent";
-            let guarded = Self::guard_with_marker(cmd, "sshAgentSetup");
+            let ssh_sock_in_container = if ssh_via_stable_dir {
+                "/run/devcon-agents/ssh-agent"
+            } else {
+                "/ssh-agent"
+            };
+            let cmd = format!(
+                "sudo chmod 600 {p} && sudo chown $(id -u):$(id -g) {p}",
+                p = ssh_sock_in_container
+            );
+            let guarded = Self::guard_with_marker(&cmd, "sshAgentSetup");
             self.runtime.exec(
                 handle.as_ref(),
                 vec!["bash", "-c", &guarded],
@@ -2641,6 +2753,73 @@ mod tests {
         let err = Error::runtime("docker start failed: port is already allocated");
 
         assert!(!is_transient_agent_mount_start_error(&err));
+    }
+
+    #[test]
+    fn test_is_transient_agent_mount_start_error_matches_stable_dir_missing() {
+        let err = Error::runtime(
+            "error mounting /home/user/.local/share/devcon/agent-sockets to /run/devcon-agents: \
+             no such file or directory",
+        );
+        assert!(is_transient_agent_mount_start_error(&err));
+    }
+
+    #[test]
+    fn test_update_agent_socket_symlink_creates_new() {
+        let tmp = TempDir::new().unwrap();
+        let stable_dir = tmp.path();
+
+        // Create a fake socket file to point at
+        let socket = stable_dir.join("real.sock");
+        std::fs::write(&socket, "").unwrap();
+
+        let ok = update_agent_socket_symlink(stable_dir, "ssh-agent", &socket);
+        assert!(ok);
+        let target = std::fs::read_link(stable_dir.join("ssh-agent")).unwrap();
+        assert_eq!(target, socket);
+    }
+
+    #[test]
+    fn test_update_agent_socket_symlink_replaces_stale() {
+        let tmp = TempDir::new().unwrap();
+        let stable_dir = tmp.path();
+
+        let old_socket = stable_dir.join("old.sock");
+        let new_socket = stable_dir.join("new.sock");
+        std::fs::write(&old_socket, "").unwrap();
+        std::fs::write(&new_socket, "").unwrap();
+
+        // Create the initial symlink pointing to old socket
+        update_agent_socket_symlink(stable_dir, "ssh-agent", &old_socket);
+        // Now update to new socket
+        let ok = update_agent_socket_symlink(stable_dir, "ssh-agent", &new_socket);
+        assert!(ok);
+        let target = std::fs::read_link(stable_dir.join("ssh-agent")).unwrap();
+        assert_eq!(target, new_socket);
+    }
+
+    #[test]
+    fn test_update_agent_socket_symlink_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let stable_dir = tmp.path();
+
+        let socket = stable_dir.join("real.sock");
+        std::fs::write(&socket, "").unwrap();
+
+        // First call
+        assert!(update_agent_socket_symlink(
+            stable_dir,
+            "ssh-agent",
+            &socket
+        ));
+        // Second call with same target — should still return true without error
+        assert!(update_agent_socket_symlink(
+            stable_dir,
+            "ssh-agent",
+            &socket
+        ));
+        let target = std::fs::read_link(stable_dir.join("ssh-agent")).unwrap();
+        assert_eq!(target, socket);
     }
 
     #[test]
