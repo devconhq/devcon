@@ -15,7 +15,7 @@ A blazingly fast CLI tool for managing and launching development containers. Dev
 
 ## Features
 
-- **Multi-Runtime Support**: Works with Docker and Apple's native container runtime (macOS)
+- **Multi-Runtime Support**: Works with Docker and the native `container` runtime (macOS)
 - **Full Lifecycle Management**: Build, start, shell, SSH, and serve — all from one tool
 - **Devcontainer Feature Support**: Automatic download and installation of features from OCI registries (ghcr.io)
 - **Lifecycle Hooks**: Full support for `onCreate`, `postCreate`, `postStart`, and `postAttach` commands
@@ -53,7 +53,7 @@ Download the latest binary for your platform from the [releases page](https://gi
 DevCon requires a container runtime:
 
 - **Docker**: [Docker Desktop](https://www.docker.com/products/docker-desktop/) or Docker Engine
-- **Apple Container** (macOS only): [Apple container](https://www.github.com/apple/container)
+- **Container CLI** (macOS only): `container`
 
 ## Quick Start
 
@@ -179,7 +179,7 @@ Properties use camelCase dot-notation (e.g., `agents.binaryUrl`).
 | `dotfilesRepository` | string | URL of a dotfiles repository to clone into containers |
 | `dotfilesInstallCommand` | string | Command used to install dotfiles after cloning |
 | `defaultShell` | string | Shell to use when running `devcon shell` |
-| `runtime` | string | Container runtime: `auto` (default), `docker`, or `apple` |
+| `runtime` | string | Container runtime: `auto` (default), `docker`, or `container` |
 | `buildPath` | string | Default build directory path |
 | `additionalFeatures` | map | Extra devcontainer features added to every container |
 | `envVariables` | list | Environment variables passed to every container (`KEY=value` or bare `KEY`) |
@@ -205,12 +205,12 @@ Properties use camelCase dot-notation (e.g., `agents.binaryUrl`).
 | `agentForwarding.gpgSocketPath` | string | Override the GPG socket path (auto-detected by default) |
 | `agentForwarding.ghConfigPath` | string | Override the GitHub CLI config directory (auto-detected by default) |
 
-#### Apple runtime (`runtimeConfig.apple.*`)
+#### Container runtime (`runtimeConfig.container.*`)
 
 | Property | Type | Description |
 |---|---|---|
-| `runtimeConfig.apple.buildMemory` | string | Memory limit for builds, e.g. `4g`, `512m` (default: `4g`) |
-| `runtimeConfig.apple.buildCpu` | string | CPU limit for builds, e.g. `2`, `0.5` |
+| `runtimeConfig.container.buildMemory` | string | Memory limit for builds, e.g. `4g`, `512m` (default: `4g`) |
+| `runtimeConfig.container.buildCpu` | string | CPU limit for builds, e.g. `2`, `0.5` |
 
 ### Example config file
 
@@ -235,32 +235,32 @@ agents:
 ```bash
 devcon config set dotfilesRepository https://github.com/user/dotfiles
 devcon config set agentForwarding.sshEnabled true
-devcon config set runtimeConfig.apple.buildMemory 8g
+devcon config set runtimeConfig.container.buildMemory 8g
 ```
 
-## Using the Apple container runtime
+## Using the container runtime
 
-DevCon supports Apple's native `container` CLI as an alternative to Docker on macOS. This runtime uses lightweight virtual machines and supports Rosetta 2 for running x86_64 images on Apple Silicon.
+DevCon supports the native `container` CLI as an alternative to Docker on macOS. This runtime uses lightweight virtual machines and supports Rosetta 2 for running x86_64 images on ARM64 Macs.
 
 ### Prerequisites
 
-Apple's `container` CLI must be installed and available on your `PATH`. Refer to Apple's documentation for installation instructions.
+The `container` CLI must be installed and available on your `PATH`.
 
-### Selecting the Apple runtime
+### Selecting the container runtime
 
 ```bash
-devcon config set runtime apple
+devcon config set runtime container
 ```
 
 Or explicitly per-invocation via the config file:
 
 ```yaml
-runtime: apple
+runtime: container
 ```
 
 ### Required: set a build path outside /tmp
 
-When building a container image, DevCon creates a temporary build context directory. By default this lands in `/tmp`, but Apple's container runtime runs inside a virtual machine that cannot access macOS's `/tmp` filesystem. The build will fail unless you configure a `buildPath` that resolves to a directory the runtime can reach — any path under your home directory works.
+When building a container image, DevCon creates a temporary build context directory. By default this lands in `/tmp`, but the container runtime runs inside a virtual machine that cannot access macOS's `/tmp` filesystem. The build will fail unless you configure a `buildPath` that resolves to a directory the runtime can reach — any path under your home directory works.
 
 ```bash
 devcon config set buildPath ~/.devcon/build
@@ -270,35 +270,35 @@ Or in `~/.config/devcon/config.yaml`:
 
 ```yaml
 buildPath: ~/.devcon/build
-runtime: apple
+runtime: container
 ```
 
 DevCon creates the directory automatically if it does not exist.
 
 ### Tuning resource limits
 
-By default the Apple runtime uses 4 GB of memory per build. You can raise or lower this and optionally cap CPU usage:
+By default the container runtime uses 4 GB of memory per build. You can raise or lower this and optionally cap CPU usage:
 
 ```bash
-devcon config set runtimeConfig.apple.buildMemory 8g
-devcon config set runtimeConfig.apple.buildCpu 4
+devcon config set runtimeConfig.container.buildMemory 8g
+devcon config set runtimeConfig.container.buildCpu 4
 ```
 
 Accepted memory suffixes are `k`, `m`, and `g`. CPU is a decimal number of cores (e.g. `2` or `0.5`).
 
-### Minimal Apple runtime config
+### Minimal container runtime config
 
 ```yaml
-runtime: apple
+runtime: container
 buildPath: ~/.devcon/build
 runtimeConfig:
-  apple:
+  container:
     buildMemory: 8g
 ```
 
 ### Notes
 
-- The runtime always passes `--rosetta` when starting containers, enabling Rosetta 2 translation for x86_64 images on Apple Silicon automatically.
+- The runtime always passes `--rosetta` when starting containers, enabling Rosetta 2 translation for x86_64 images on ARM64 Macs automatically.
 - Privileged containers use `--virtualization` instead of Docker's `--privileged` flag.
 - The host is reachable from inside the container at `host.container.internal`.
 

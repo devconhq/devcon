@@ -547,10 +547,10 @@ impl_property_registry! {
     }
 }
 
-/// Apple runtime-specific configuration.
+/// Container runtime-specific configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AppleRuntimeConfig {
+pub struct ContainerRuntimeConfig {
     /// Memory limit for container builds (e.g., "4g", "512m").
     ///
     /// Defaults to "4g" if not specified.
@@ -576,7 +576,7 @@ pub struct AppleRuntimeConfig {
     pub run_cpu: Option<String>,
 }
 
-impl Default for AppleRuntimeConfig {
+impl Default for ContainerRuntimeConfig {
     fn default() -> Self {
         Self {
             build_memory: Some("4g".to_string()),
@@ -588,29 +588,29 @@ impl Default for AppleRuntimeConfig {
 }
 
 impl_property_registry! {
-    AppleRuntimeConfig {
+    ContainerRuntimeConfig {
         build_memory: Option<String> => {
             path: "buildMemory",
             property_type: PropertyType::String,
-            description: "Memory limit for Apple builds (default: 4g)",
+            description: "Memory limit for container builds (default: 4g)",
             validator: PropertyValidator::Memory,
         },
         build_cpu: Option<String> => {
             path: "buildCpu",
             property_type: PropertyType::String,
-            description: "CPU limit for Apple builds (e.g., 2, 0.5)",
+            description: "CPU limit for container builds (e.g., 2, 0.5)",
             validator: PropertyValidator::Cpu,
         },
         run_memory: Option<String> => {
             path: "runMemory",
             property_type: PropertyType::String,
-            description: "Memory limit for Apple containers (default: 8g)",
+            description: "Memory limit for running containers (default: 8g)",
             validator: PropertyValidator::Memory,
         },
         run_cpu: Option<String> => {
             path: "runCpu",
             property_type: PropertyType::String,
-            description: "CPU limit for Apple containers (default: 2)",
+            description: "CPU limit for running containers (default: 2)",
             validator: PropertyValidator::Cpu,
         },
     }
@@ -624,9 +624,9 @@ pub struct RuntimeConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub docker: Option<DockerRuntimeConfig>,
 
-    /// Apple runtime configuration.
+    /// Container runtime configuration.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub apple: Option<AppleRuntimeConfig>,
+    pub container: Option<ContainerRuntimeConfig>,
 }
 
 /// Agent forwarding configuration.
@@ -758,7 +758,7 @@ pub struct Config {
 
     /// Container runtime to use.
     ///
-    /// Valid values: "auto", "docker", "apple"
+    /// Valid values: "auto", "docker", "container"
     /// If set to "auto" (default), the runtime will be auto-detected.
     #[serde(
         default = "default_runtime",
@@ -780,7 +780,7 @@ pub struct Config {
 
     /// Runtime-specific configuration settings.
     ///
-    /// Contains runtime-specific options for Docker and Apple container runtimes.
+    /// Contains runtime-specific options for Docker and the container CLI runtime.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_config: Option<RuntimeConfig>,
 
@@ -986,8 +986,8 @@ impl Config {
 
     /// Detects which container runtime is available.
     ///
-    /// Checks for Docker and Apple's container CLI in order.
-    /// Returns "docker" if docker is available, "apple" if container is available,
+    /// Checks for Docker and the container CLI in order.
+    /// Returns "docker" if docker is available, "container" if container is available,
     /// or an error if neither is found.
     pub fn detect_runtime() -> Result<String> {
         // Check for docker
@@ -1000,18 +1000,18 @@ impl Config {
             return Ok("docker".to_string());
         }
 
-        // Check for Apple container CLI
+        // Check for container CLI
         if Command::new("container")
             .arg("--version")
             .output()
             .map(|output| output.status.success())
             .unwrap_or(false)
         {
-            return Ok("apple".to_string());
+            return Ok("container".to_string());
         }
 
         Err(Error::runtime(
-            "No container runtime found. Please install Docker or Apple's container CLI.",
+            "No container runtime found. Please install Docker or the container CLI.",
         ))
     }
 
@@ -1078,12 +1078,12 @@ impl Config {
             return self.agents.as_ref()?.get_property(rest);
         }
 
-        // Handle nested runtimeConfig.apple properties
-        if let Some(rest) = property.strip_prefix("runtimeConfig.apple.") {
+        // Handle nested runtimeConfig.container properties
+        if let Some(rest) = property.strip_prefix("runtimeConfig.container.") {
             return self
                 .runtime_config
                 .as_ref()?
-                .apple
+                .container
                 .as_ref()?
                 .get_property(rest);
         }
@@ -1134,7 +1134,7 @@ impl Config {
             }
             "runtime" => {
                 let validated = validate_property_value(
-                    &PropertyValidator::Enum(&["auto", "docker", "apple"]),
+                    &PropertyValidator::Enum(&["auto", "docker", "container"]),
                     &value,
                 )?;
                 self.runtime = validated;
@@ -1149,11 +1149,13 @@ impl Config {
             return agents.set_property(rest, value);
         }
 
-        // Handle nested runtimeConfig.apple properties
-        if let Some(rest) = property.strip_prefix("runtimeConfig.apple.") {
+        // Handle nested runtimeConfig.container properties
+        if let Some(rest) = property.strip_prefix("runtimeConfig.container.") {
             let runtime_config = self.runtime_config.get_or_insert_with(Default::default);
-            let apple = runtime_config.apple.get_or_insert_with(Default::default);
-            return apple.set_property(rest, value);
+            let container = runtime_config
+                .container
+                .get_or_insert_with(Default::default);
+            return container.set_property(rest, value);
         }
 
         // Handle nested runtimeConfig.docker properties
@@ -1209,12 +1211,12 @@ impl Config {
             return Ok(());
         }
 
-        // Handle nested runtimeConfig.apple properties
-        if let Some(rest) = property.strip_prefix("runtimeConfig.apple.")
+        // Handle nested runtimeConfig.container properties
+        if let Some(rest) = property.strip_prefix("runtimeConfig.container.")
             && let Some(runtime_config) = self.runtime_config.as_mut()
         {
-            if let Some(apple) = runtime_config.apple.as_mut() {
-                return apple.unset_property(rest);
+            if let Some(container) = runtime_config.container.as_mut() {
+                return container.unset_property(rest);
             }
             return Ok(());
         }
@@ -1270,7 +1272,7 @@ impl Config {
             (
                 "runtime".to_string(),
                 "string".to_string(),
-                "Container runtime: auto, docker, or apple (default: auto)".to_string(),
+                "Container runtime: auto, docker, or container (default: auto)".to_string(),
             ),
         ];
 
@@ -1286,10 +1288,10 @@ impl Config {
             ));
         }
 
-        // Add runtimeConfig.apple properties with prefix
-        for meta in AppleRuntimeConfig::PROPERTIES {
+        // Add runtimeConfig.container properties with prefix
+        for meta in ContainerRuntimeConfig::PROPERTIES {
             all_properties.push((
-                format!("runtimeConfig.apple.{}", meta.path),
+                format!("runtimeConfig.container.{}", meta.path),
                 match meta.property_type {
                     PropertyType::String => "string".to_string(),
                     PropertyType::Boolean => "boolean".to_string(),
@@ -1349,23 +1351,23 @@ impl Config {
 
         // Validate runtime
         validate_property_value(
-            &PropertyValidator::Enum(&["auto", "docker", "apple"]),
+            &PropertyValidator::Enum(&["auto", "docker", "container"]),
             &self.runtime,
         )?;
 
         // Validate runtime config
         if let Some(rc) = &self.runtime_config {
-            if let Some(apple) = &rc.apple {
-                if let Some(mem) = &apple.build_memory {
+            if let Some(container) = &rc.container {
+                if let Some(mem) = &container.build_memory {
                     validate_property_value(&PropertyValidator::Memory, mem)?;
                 }
-                if let Some(cpu) = &apple.build_cpu {
+                if let Some(cpu) = &container.build_cpu {
                     validate_property_value(&PropertyValidator::Cpu, cpu)?;
                 }
-                if let Some(mem) = &apple.run_memory {
+                if let Some(mem) = &container.run_memory {
                     validate_property_value(&PropertyValidator::Memory, mem)?;
                 }
-                if let Some(cpu) = &apple.run_cpu {
+                if let Some(cpu) = &container.run_cpu {
                     validate_property_value(&PropertyValidator::Cpu, cpu)?;
                 }
             }

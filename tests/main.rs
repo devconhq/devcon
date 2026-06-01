@@ -669,25 +669,25 @@ fn test_up_force_rebuild() {
 
 #[test]
 #[cfg(target_os = "macos")]
-fn test_build_apple_runtime() {
-    let runtime = Runtime::Apple;
+fn test_build_container_runtime() {
+    let runtime = Runtime::Container;
     if !is_runtime_available(runtime) {
-        println!("Skipping test: Apple runtime not available");
+        println!("Skipping test: Container runtime not available");
         return;
     }
 
     unsafe {
-        std::env::set_var("CONTAINER_RUNTIME", "apple");
+        std::env::set_var("CONTAINER_RUNTIME", "container");
     }
 
     let test_config = create_test_config();
     let temp_dir = create_test_devcontainer(
-        "test-apple",
+        "test-container",
         "mcr.microsoft.com/devcontainers/base:ubuntu",
         None,
     );
 
-    // Apple container runtime has a bug with default temp directories
+    // The container runtime has a bug with default temp directories
     // Use home directory as build path
     let home_dir = std::env::var("HOME").expect("HOME env var not set");
 
@@ -716,26 +716,26 @@ fn test_build_apple_runtime() {
 
 #[test]
 #[cfg(target_os = "macos")]
-fn test_build_apple_runtime_with_features() {
-    let runtime = Runtime::Apple;
+fn test_build_container_runtime_with_features() {
+    let runtime = Runtime::Container;
     if !is_runtime_available(runtime) {
-        println!("Skipping test: Apple runtime not available");
+        println!("Skipping test: Container runtime not available");
         return;
     }
     let test_config = create_test_config();
 
     unsafe {
-        std::env::set_var("CONTAINER_RUNTIME", "apple");
+        std::env::set_var("CONTAINER_RUNTIME", "container");
     }
 
     let features = r#"{"ghcr.io/devcontainers/features/git": {}}"#;
     let temp_dir = create_test_devcontainer(
-        "test-apple-features",
+        "test-container-features",
         "mcr.microsoft.com/devcontainers/base:ubuntu",
         Some(features),
     );
 
-    // Apple container runtime has a bug with default temp directories
+    // The container runtime has a bug with default temp directories
     // Use home directory as build path
     let home_dir = std::env::var("HOME").expect("HOME env var not set");
 

@@ -47,7 +47,7 @@ use crate::{
         self,
         container::ContainerDriver,
         control_server,
-        runtime::{apple::AppleRuntime, docker::DockerRuntime},
+        runtime::{container::ContainerCliRuntime, docker::DockerRuntime},
     },
     workspace::Workspace,
 };
@@ -68,9 +68,9 @@ fn get_runtime_specific_config(
             let docker_config = runtime_config.docker.unwrap_or_default();
             Box::new(DockerRuntime::new(docker_config))
         }
-        "apple" => {
-            let apple_config = runtime_config.apple.unwrap_or_default();
-            Box::new(AppleRuntime::new(apple_config))
+        "container" => {
+            let container_config = runtime_config.container.unwrap_or_default();
+            Box::new(ContainerCliRuntime::new(container_config))
         }
         _ => return Err(Error::runtime(format!("Unknown runtime: {}", runtime_name))),
     };
@@ -241,7 +241,7 @@ pub fn handle_config_show(config_path: Option<PathBuf>, output: OutputFormat) ->
 #   dotfilesInstallCommand: Custom install command for dotfiles
 #   defaultShell: Default shell for shell command (e.g., /bin/zsh)
 #   buildPath: Default build path for container builds
-#   runtime: Container runtime (auto, docker, apple) - default: auto
+#   runtime: Container runtime (auto, docker, container) - default: auto
 #
 # Agent Settings (under 'agents'):
 #   binaryUrl: URL to precompiled agent binary
@@ -252,8 +252,8 @@ pub fn handle_config_show(config_path: Option<PathBuf>, output: OutputFormat) ->
 # Runtime Settings (under 'runtimeConfig'):
 #   docker.buildMemory: Memory limit for Docker builds (e.g., 4g, 512m)
 #   docker.buildCpu: CPU limit for Docker builds (e.g., 2, 0.5)
-#   apple.buildMemory: Memory limit for Apple builds (default: 4g)
-#   apple.buildCpu: CPU limit for Apple builds (e.g., 2, 0.5)
+#   container.buildMemory: Memory limit for container builds (default: 4g)
+#   container.buildCpu: CPU limit for container builds (e.g., 2, 0.5)
 #
 # Agent Forwarding Settings (under 'agentForwarding'):
 #   sshEnabled: Enable SSH agent forwarding (true/false)
@@ -948,7 +948,7 @@ pub fn handle_serve_command(
     let runtime_name = config.resolve_runtime()?;
     debug!("Using runtime {:?}", runtime_name);
 
-    if runtime_name == "apple" {
+    if runtime_name == "container" {
         println!(
             "⚠️  Warning: For the connection to work, you have to register the dns entry 'host.container.internal' for localhost."
         );
@@ -956,9 +956,7 @@ pub fn handle_serve_command(
         println!(
             "     sudo container system dns create --localhost 192.168.2.10 host.container.internal"
         );
-        println!(
-            "   More info: https://github.com/apple/container/blob/main/docs/how-to.md#access-a-host-service-from-a-container"
-        );
+        println!("   More info: refer to the container CLI documentation for host DNS setup.");
     }
 
     // Create status callback based on mode

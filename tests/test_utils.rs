@@ -5,7 +5,7 @@ use tempfile::TempDir;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Runtime {
     Docker,
-    Apple,
+    Container,
 }
 
 /// Get the runtime to use for tests from environment variable
@@ -14,7 +14,7 @@ pub fn get_runtime() -> Runtime {
         .unwrap_or_else(|_| "docker".to_string())
         .as_str()
     {
-        "apple" => Runtime::Apple,
+        "container" => Runtime::Container,
         _ => Runtime::Docker,
     }
 }
@@ -23,7 +23,7 @@ pub fn get_runtime() -> Runtime {
 pub fn runtime_cmd(runtime: Runtime) -> &'static str {
     match runtime {
         Runtime::Docker => "docker",
-        Runtime::Apple => "container",
+        Runtime::Container => "container",
     }
 }
 
@@ -146,7 +146,7 @@ pub fn verify_image_exists(runtime: Runtime, image_name: &str) -> bool {
     let cmd = runtime_cmd(runtime);
     let format = match runtime {
         Runtime::Docker => "{{.Repository}}:{{.Tag}}",
-        Runtime::Apple => "json",
+        Runtime::Container => "json",
     };
 
     let output = Command::new(cmd)
@@ -232,8 +232,8 @@ pub fn cleanup_test_artifacts(runtime: Runtime, project_name: &str) {
                 }
             }
         }
-        Runtime::Apple => {
-            // Apple: list all containers and filter by name prefix
+        Runtime::Container => {
+            // Container: list all containers and filter by name prefix
             let ls_output = Command::new(cmd)
                 .args(["container", "list", "--all", "--format", "json"])
                 .output();
@@ -289,13 +289,13 @@ pub fn cleanup_image(runtime: Runtime, image_name: &str) {
     let cmd = runtime_cmd(runtime);
     let subcommand = match runtime {
         Runtime::Docker => "rmi",
-        Runtime::Apple => "image",
+        Runtime::Container => "image",
     };
 
     let mut cmd_builder = Command::new(cmd);
     cmd_builder.arg(subcommand);
 
-    if runtime == Runtime::Apple {
+    if runtime == Runtime::Container {
         cmd_builder.arg("rm");
     }
 
@@ -392,6 +392,6 @@ mod tests {
     #[test]
     fn test_runtime_cmd() {
         assert_eq!(runtime_cmd(Runtime::Docker), "docker");
-        assert_eq!(runtime_cmd(Runtime::Apple), "container");
+        assert_eq!(runtime_cmd(Runtime::Container), "container");
     }
 }
