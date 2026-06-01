@@ -109,6 +109,10 @@ mv target/release/devcon-agent /usr/local/bin/devcon-agent
 rm -rf /tmp/devcon
 {% endif %}
 
+mkdir -p /var/run/sshd /run/sshd
+chmod 0755 /run/sshd
+ssh-keygen -A >/dev/null 2>&1 || true
+
 echo '#!/bin/bash' > /usr/local/bin/devcon-browser
 echo 'devcon-agent open-url $1' >> /usr/local/bin/devcon-browser
 chmod +x /usr/local/bin/devcon-browser
@@ -117,17 +121,32 @@ cat <<'EOF' > /usr/local/bin/devcon-agent-start
 #!/usr/bin/env bash
 set -e
 
-mkdir -p /var/run/sshd /run/sshd
-chmod 0755 /run/sshd
-ssh-keygen -A >/dev/null 2>&1 || true
+start_sshd() {
+    if command -v /usr/sbin/sshd >/dev/null 2>&1; then
+        /usr/sbin/sshd
+    elif command -v sshd >/dev/null 2>&1; then
+        sshd
+    else
+        return 127
+    fi
+}
 
+if [ "$(id -u)" -eq 0 ]; then
+    start_sshd || echo "Warning: failed to start sshd as root"
+elif command -v sudo >/dev/null 2>&1; then
+    if ! sudo -n bash -c '
 if command -v /usr/sbin/sshd >/dev/null 2>&1; then
-    /usr/sbin/sshd
+    exec /usr/sbin/sshd
 elif command -v sshd >/dev/null 2>&1; then
-    sshd
+    exec sshd
 else
-    echo "Unable to start sshd: executable not found"
-    exit 1
+    exit 127
+fi
+'; then
+        echo "Warning: unable to start sshd (sudo unavailable, sshd missing, or insufficient privileges)"
+    fi
+else
+    echo "Warning: unable to start sshd as non-root user (sudo not available)"
 fi
 
 exec /usr/local/bin/devcon-agent daemon
