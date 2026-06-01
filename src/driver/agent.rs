@@ -117,7 +117,8 @@ cat <<'EOF' > /usr/local/bin/devcon-agent-start
 #!/usr/bin/env bash
 set -e
 
-mkdir -p /var/run/sshd
+mkdir -p /var/run/sshd /run/sshd
+chmod 0755 /run/sshd
 ssh-keygen -A >/dev/null 2>&1 || true
 
 if command -v /usr/sbin/sshd >/dev/null 2>&1; then
