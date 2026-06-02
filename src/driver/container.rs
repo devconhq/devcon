@@ -1476,8 +1476,9 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
             )
             .ok()
             .flatten()
-            .unwrap_or_else(|| "amd64".to_string());
-        let host_is_arm = std::env::consts::ARCH == "aarch64";
+            .map(|arch| Self::canonical_image_architecture(&arch))
+            .unwrap_or_else(Self::host_image_architecture);
+        let host_is_arm = Self::host_image_architecture() == "arm64";
         let enable_rosetta = host_is_arm && image_arch == "amd64";
 
         let handle = self.runtime.run(
@@ -1953,6 +1954,23 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
         }
     }
 
+    fn host_image_architecture() -> String {
+        match std::env::consts::ARCH {
+            "x86_64" => "amd64".to_string(),
+            "aarch64" => "arm64".to_string(),
+            other => other.to_string(),
+        }
+    }
+
+    fn canonical_image_architecture(arch: &str) -> String {
+        let normalized = arch.trim().to_lowercase();
+        match normalized.as_str() {
+            "x86_64" => "amd64".to_string(),
+            "aarch64" => "arm64".to_string(),
+            _ => normalized,
+        }
+    }
+
     fn extract_architecture_from_inspect(inspect: &serde_json::Value) -> Option<String> {
         let from_key = |path: &[&str]| {
             let mut current = inspect;
@@ -1966,7 +1984,9 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                 .map(ToString::to_string)
         };
 
-        from_key(&["Architecture"]).or_else(|| from_key(&["architecture"]))
+        from_key(&["Architecture"])
+            .or_else(|| from_key(&["architecture"]))
+            .map(|arch| Self::canonical_image_architecture(&arch))
     }
 
     fn extract_user_from_inspect(inspect: &serde_json::Value) -> Option<String> {
@@ -2031,7 +2051,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
         let image_architecture = inspect
             .as_ref()
             .and_then(Self::extract_architecture_from_inspect)
-            .unwrap_or_else(|| "amd64".to_string());
+            .unwrap_or_else(Self::host_image_architecture);
 
         let remote_user_override = workspace.devcontainer.remote_user.clone();
         let container_user_override = workspace.devcontainer.container_user.clone();
