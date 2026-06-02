@@ -212,14 +212,14 @@ fn extract_container_port(port: &crate::devcontainer::ForwardPort) -> Option<u16
     }
 }
 
-fn ensure_ssh_port_forwarded(ports: &mut Vec<crate::devcontainer::ForwardPort>) {
+fn ensure_ssh_port_forwarded(ports: &mut Vec<crate::devcontainer::ForwardPort>, ssh_port: u16) {
     let has_ssh = ports
         .iter()
         .filter_map(extract_container_port)
-        .any(|container_port| container_port == 22);
+        .any(|container_port| container_port == ssh_port);
 
     if !has_ssh {
-        ports.push(crate::devcontainer::ForwardPort::Port(22));
+        ports.push(crate::devcontainer::ForwardPort::Port(ssh_port));
     }
 }
 
@@ -535,6 +535,8 @@ impl ContainerDriver {
                 self.config.get_agent_binary_url().cloned(),
                 self.config.get_agent_git_repository().cloned(),
                 self.config.get_agent_git_branch().cloned(),
+                self.config.get_agent_ssh_port(),
+                self.config.should_skip_agent_ssh_setup(),
             );
             debug!("Using agent configuration: {:?}", agent_config);
             let agent_path = agent::Agent::new(agent_config).generate()?;
@@ -1452,7 +1454,9 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
             .forward_ports
             .clone()
             .unwrap_or_default();
-        ensure_ssh_port_forwarded(&mut ports);
+        if !self.config.should_skip_agent_ssh_setup() {
+            ensure_ssh_port_forwarded(&mut ports, self.config.get_agent_ssh_port());
+        }
 
         match self.runtime.inspect_image(&latest_tag)? {
             Some(inspect) => {
@@ -1494,7 +1498,9 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
             },
         )?;
 
-        self.ensure_ssh_authorized_key(handle.as_ref(), &resolved_users)?;
+        if !self.config.should_skip_agent_ssh_setup() {
+            self.ensure_ssh_authorized_key(handle.as_ref(), &resolved_users)?;
+        }
 
         if let Some(command) = &devcontainer_workspace.devcontainer.on_create_command {
             self.run_lifecycle_command(

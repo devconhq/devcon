@@ -121,7 +121,7 @@ DevCon writes managed start/end marker comments around workspace SSH entries so 
 
 DevCon also updates `~/.ssh/config` automatically after `devcon start` and `devcon up` successfully start the container.
 
-DevCon ensures container port `22/tcp` is always published to a random host port when starting containers. The `devcon-agent` feature installs and starts OpenSSH server inside supported Linux distributions, and `devcon ssh connect` discovers the mapped host port and connects directly.
+DevCon ensures the configured container SSH port is published to a random host port when starting containers. By default this is `22/tcp`, configurable via `agents.sshPort`. The `devcon-agent` feature installs and starts OpenSSH server inside supported Linux distributions (unless `agents.skipSshSetup` is enabled), and `devcon ssh connect` discovers the mapped host port and connects directly.
 
 ## The control server and agent (`devcon serve`)
 
@@ -195,6 +195,8 @@ Properties use camelCase dot-notation (e.g., `agents.binaryUrl`).
 | `agents.gitRepository` | string | Git repository URL to build the agent from source |
 | `agents.gitBranch` | string | Branch to use when building from source (default: `main`) |
 | `agents.disable` | bool | Disable agent installation entirely |
+| `agents.sshPort` | number | SSH port to run inside the container (default: `22`) |
+| `agents.skipSshSetup` | bool | Skip installing/starting OpenSSH and skip SSH port auto-forwarding |
 
 #### Agent forwarding (`agentForwarding.*`)
 

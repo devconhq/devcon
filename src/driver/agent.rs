@@ -28,11 +28,15 @@ pub struct AgentConfig {
     pub git_repository: Option<String>,
     /// Git branch to checkout
     pub git_branch: Option<String>,
+    /// SSH port used by sshd inside the container
+    pub ssh_port: u16,
+    /// Skip installing and starting sshd
+    pub skip_ssh_setup: bool,
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
-        Self::new(true, None, None, None)
+        Self::new(true, None, None, None, 22, false)
     }
 }
 
@@ -43,6 +47,8 @@ impl AgentConfig {
         binary_url: Option<String>,
         git_repository: Option<String>,
         git_branch: Option<String>,
+        ssh_port: u16,
+        skip_ssh_setup: bool,
     ) -> Self {
         let env = Environment::new();
         let template = env
@@ -52,6 +58,7 @@ impl AgentConfig {
 set -e
 echo "Installing DevCon Agent..."
 
+{% if not skip_ssh_setup %}
 echo "Installing OpenSSH server..."
 if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
@@ -67,6 +74,7 @@ else
     echo "Unsupported distribution: could not find apt-get, apk, dnf, or yum"
     exit 1
 fi
+{% endif %}
 
 {% if use_binary %}
 # Download precompiled binary
@@ -109,9 +117,19 @@ mv target/release/devcon-agent /usr/local/bin/devcon-agent
 rm -rf /tmp/devcon
 {% endif %}
 
+{% if not skip_ssh_setup %}
 mkdir -p /var/run/sshd /run/sshd
 chmod 0755 /run/sshd
 ssh-keygen -A >/dev/null 2>&1 || true
+
+if [ -f /etc/ssh/sshd_config ]; then
+    if grep -Eq '^[[:space:]#]*Port[[:space:]]+' /etc/ssh/sshd_config; then
+        sed -i -E 's/^[[:space:]#]*Port[[:space:]]+.*/Port {{ ssh_port }}/' /etc/ssh/sshd_config
+    else
+        printf '\nPort {{ ssh_port }}\n' >> /etc/ssh/sshd_config
+    fi
+fi
+{% endif %}
 
 echo '#!/bin/bash' > /usr/local/bin/devcon-browser
 echo 'devcon-agent open-url $1' >> /usr/local/bin/devcon-browser
@@ -121,6 +139,7 @@ cat <<'EOF' > /usr/local/bin/devcon-agent-start
 #!/usr/bin/env bash
 set -e
 
+{% if not skip_ssh_setup %}
 start_sshd() {
     if command -v /usr/sbin/sshd >/dev/null 2>&1; then
         /usr/sbin/sshd
@@ -148,6 +167,7 @@ fi
 else
     echo "Warning: unable to start sshd as non-root user (sudo not available)"
 fi
+{% endif %}
 
 exec /usr/local/bin/devcon-agent daemon
 EOF
@@ -177,6 +197,8 @@ echo "DevCon Agent installed successfully."
                 binary_url => binary_url,
                 git_repository => git_repo,
                 git_branch => git_br,
+                ssh_port => ssh_port,
+                skip_ssh_setup => skip_ssh_setup,
             })
             .expect("Could not create install script");
 
@@ -191,6 +213,8 @@ echo "DevCon Agent installed successfully."
             binary_url,
             git_repository: git_repo,
             git_branch: git_br,
+            ssh_port,
+            skip_ssh_setup,
         }
     }
 }
@@ -237,7 +261,8 @@ impl Agent {
             "name": self.config.name,
             "containerEnv": {
                 "DEVCON_AGENT": "1",
-                "BROWSER": "/usr/local/bin/devcon-browser"
+                "BROWSER": "/usr/local/bin/devcon-browser",
+                "DEVCON_SSH_PORT": self.config.ssh_port.to_string()
             },
             "entrypoint": "/usr/local/bin/devcon-agent-start",
         });
@@ -306,6 +331,8 @@ mod tests {
             binary_url: None,
             git_repository: None,
             git_branch: None,
+            ssh_port: 22,
+            skip_ssh_setup: false,
         };
 
         let mut agent = Agent::new(config);
@@ -323,6 +350,8 @@ mod tests {
             Some("https://example.com/devcon-agent".to_string()),
             None,
             None,
+            22,
+            false,
         );
 
         assert!(config.binary_url.is_some());
@@ -341,6 +370,8 @@ mod tests {
             None,
             Some("https://github.com/custom/repo.git".to_string()),
             Some("develop".to_string()),
+            22,
+            false,
         );
 
         assert!(config.binary_url.is_none());
@@ -382,6 +413,8 @@ mod tests {
             Some("https://example.com/devcon-agent".to_string()),
             None,
             None,
+            22,
+            false,
         );
 
         assert!(config.binary_url.is_some());
@@ -396,7 +429,7 @@ mod tests {
 
     #[test]
     fn test_agent_with_agent_compile_will_install_dependencies() {
-        let config = AgentConfig::new(false, None, None, None);
+        let config = AgentConfig::new(false, None, None, None, 22, false);
 
         assert!(config.binary_url.is_none());
         let mut agent = Agent::new(config);

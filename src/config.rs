@@ -94,6 +94,19 @@ pub struct AgentConfig {
     /// If set to true, the agent will not be installed in the container.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disable: Option<bool>,
+
+    /// Override the SSH port used inside the container.
+    ///
+    /// If not set, defaults to 22.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_port: Option<u16>,
+
+    /// Skip OpenSSH setup and SSH port forwarding.
+    ///
+    /// If set to true, devcon will not install or start sshd and will not
+    /// auto-forward the configured SSH port.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_ssh_setup: Option<bool>,
 }
 
 /// Docker runtime-specific configuration.
@@ -512,6 +525,23 @@ impl Config {
             .unwrap_or(false)
     }
 
+    /// Gets the SSH port used inside the container for `devcon ssh`.
+    pub fn get_agent_ssh_port(&self) -> u16 {
+        self.agents
+            .as_ref()
+            .and_then(|a| a.ssh_port)
+            .filter(|p| *p != 0)
+            .unwrap_or(22)
+    }
+
+    /// Checks if OpenSSH setup should be skipped for the in-container agent.
+    pub fn should_skip_agent_ssh_setup(&self) -> bool {
+        self.agents
+            .as_ref()
+            .and_then(|a| a.skip_ssh_setup)
+            .unwrap_or(false)
+    }
+
     /// Gets the runtime config, using defaults if not configured.
     pub fn get_runtime_config(&self) -> RuntimeConfig {
         self.runtime_config.clone().unwrap_or_default()
@@ -594,5 +624,27 @@ envVariables:
             merged.get("ghcr.io/devcontainers/features/git:1").unwrap()["version"],
             "latest"
         );
+    }
+
+    #[test]
+    fn test_agent_ssh_settings_defaults() {
+        let config = Config::default();
+        assert_eq!(config.get_agent_ssh_port(), 22);
+        assert!(!config.should_skip_agent_ssh_setup());
+    }
+
+    #[test]
+    fn test_agent_ssh_settings_from_config() {
+        let config = Config {
+            agents: Some(AgentConfig {
+                ssh_port: Some(2222),
+                skip_ssh_setup: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(config.get_agent_ssh_port(), 2222);
+        assert!(config.should_skip_agent_ssh_setup());
     }
 }

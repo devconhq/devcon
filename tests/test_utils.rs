@@ -39,12 +39,16 @@ pub fn is_runtime_available(runtime: Runtime) -> bool {
 /// Create an empty test config file in a temp directory
 /// Returns the path to the config file
 pub fn create_test_config() -> std::path::PathBuf {
+    create_test_config_with_contents("# Test config\nagents:\n    disable: true\n")
+}
+
+/// Create a test config file from YAML content in a temp directory.
+/// Returns the path to the config file.
+pub fn create_test_config_with_contents(contents: &str) -> std::path::PathBuf {
     let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
     let config_path = temp_dir.path().join("test-config.yaml");
 
-    // Create an empty or minimal config
-    std::fs::write(&config_path, "# Test config\nagents:\n    disable: true")
-        .expect("Failed to write test config");
+    std::fs::write(&config_path, contents).expect("Failed to write test config");
 
     // We need to leak the temp_dir to keep it alive for the test duration
     // This is acceptable for tests as they're short-lived
@@ -326,6 +330,59 @@ pub fn exec_in_container(
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     } else {
         Err(String::from_utf8_lossy(&output.stderr).to_string())
+    }
+}
+
+/// Get the running container ID for a DevCon project name.
+pub fn get_running_container_id(runtime: Runtime, project_name: &str) -> Option<String> {
+    let cmd = runtime_cmd(runtime);
+
+    match runtime {
+        Runtime::Docker => {
+            let label = format!("devcon.project={}", project_name);
+            let output = Command::new(cmd)
+                .args([
+                    "ps",
+                    "--filter",
+                    &format!("label={}", label),
+                    "--format",
+                    "{{.ID}}",
+                ])
+                .output()
+                .ok()?;
+
+            if !output.status.success() {
+                return None;
+            }
+
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .map(ToString::to_string)
+        }
+        Runtime::Container => {
+            let output = Command::new(cmd)
+                .args(["container", "list", "--format", "json"])
+                .output()
+                .ok()?;
+
+            if !output.status.success() {
+                return None;
+            }
+
+            let entries = serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout).ok()?;
+            let expected_name = format!("devcon.{}", project_name);
+
+            entries.iter().find_map(|entry| {
+                let name = entry["name"].as_str().unwrap_or("");
+                if name == expected_name {
+                    entry["id"].as_str().map(ToString::to_string)
+                } else {
+                    None
+                }
+            })
+        }
     }
 }
 
