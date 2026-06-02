@@ -136,9 +136,6 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cleanup hostedtools
-        run: rm -rf /opt/hostedtoolcache
-
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
         with:
