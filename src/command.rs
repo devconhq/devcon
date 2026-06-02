@@ -35,7 +35,6 @@
 
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Arc;
 use std::{io, io::IsTerminal};
 
 use dirs;
@@ -616,13 +615,13 @@ pub fn handle_up_command(
 ///
 /// ```no_run
 /// # use devcon::command::handle_serve_command;
-/// handle_serve_command(15000, None)?;
+/// handle_serve_command(15000, None, devcon::output::OutputFormat::Text)?;
 /// # Ok::<(), devcon::error::Error>(())
 /// ```
 pub fn handle_serve_command(
     port: u16,
     config_path: Option<PathBuf>,
-    status_mode: Option<crate::StatusMode>,
+    output: OutputFormat,
 ) -> Result<()> {
     let config = Config::load(config_path)?;
     trace!("Config loaded {:?}", config);
@@ -651,21 +650,7 @@ pub fn handle_serve_command(
         println!("   More info: refer to the container CLI documentation for host DNS setup.");
     }
 
-    // Create status callback based on mode
-    let status_callback: Option<control_server::StatusCallback> = status_mode.map(|mode| {
-        use crate::StatusMode;
-        let callback: control_server::StatusCallback = match mode {
-            StatusMode::Inline => Arc::new(|forwards| {
-                control_server::display_forwards_inline(forwards);
-            }),
-            StatusMode::Fullscreen => Arc::new(|forwards| {
-                control_server::display_forwards_fullscreen(forwards);
-            }),
-        };
-        callback
-    });
-
-    control_server::start_control_server(port, status_callback)
+    control_server::start_control_server(port, output)
 }
 
 /// Handles the info command to display devcontainer information.

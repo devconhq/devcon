@@ -130,12 +130,13 @@ The host-side counterpart is the **control server**, started with `devcon serve`
 ### Running the control server
 
 ```bash
-# Start on the default port (15000) with inline status output
+# Start on the default port (15000)
 devcon serve
-
-# Use fullscreen mode to display port forwarding status
-devcon serve --status-mode fullscreen
 ```
+
+When a container requests port forwarding, `devcon serve` prints a message on stdout showing the container port and allocated host port. When forwarding stops, it prints a corresponding stop message.
+
+If you run with `--output json`, these notifications are emitted as newline-delimited JSON events.
 
 The control server should be kept running in a separate terminal (or as a background service) while containers are active. Containers that cannot reach the control server will still start and function, but port forwarding and URL opening will not be available.
 

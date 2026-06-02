@@ -26,10 +26,11 @@
 //! container agents and manages port forwarding requests.
 
 use crate::error::{Error, Result};
-use comfy_table::{Cell, Color, Table};
+use crate::output::OutputFormat;
 use devcon_proto::AgentMessage;
 use devcon_proto::agent_message::Message as ProtoMessage;
 use prost::Message;
+use serde_json::json;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -38,19 +39,54 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use tracing::{debug, error, info, warn};
 
+const MAX_HOST_PORT_ALLOCATION_ATTEMPTS: u16 = 5;
+
+fn allocate_host_listener(
+    forwards: &HashMap<u16, ForwardEntry>,
+    requested_local_port: u16,
+    container_port: u16,
+) -> Result<(u16, TcpListener)> {
+    for attempt in 0..MAX_HOST_PORT_ALLOCATION_ATTEMPTS {
+        let candidate_port = requested_local_port
+            .checked_add(attempt)
+            .ok_or_else(|| Error::new("Host port allocation overflow".to_string()))?;
+
+        if forwards.contains_key(&candidate_port) {
+            debug!(
+                "Host port {} already tracked in active forwards map, trying next",
+                candidate_port
+            );
+            continue;
+        }
+
+        match TcpListener::bind(format!("0.0.0.0:{}", candidate_port)) {
+            Ok(listener) => return Ok((candidate_port, listener)),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                debug!(
+                    "Host port {} already in use on bind, trying next",
+                    candidate_port
+                );
+            }
+            Err(e) => {
+                return Err(Error::new(format!(
+                    "Failed to bind to host port {}: {}",
+                    candidate_port, e
+                )));
+            }
+        }
+    }
+
+    Err(Error::new(format!(
+        "Failed to allocate a host port for container port {} after {} attempts starting at {}",
+        container_port, MAX_HOST_PORT_ALLOCATION_ATTEMPTS, requested_local_port
+    )))
+}
+
 /// Container identification information
 #[derive(Debug, Clone)]
 struct ContainerInfo {
     container_name: String,
     workspace_name: String,
-}
-
-/// Display-friendly port forward information
-#[derive(Debug, Clone)]
-pub struct PortForwardInfo {
-    pub local_port: u16,
-    pub container_port: u16,
-    pub peer_address: String,
 }
 
 /// Type alias for a port forward entry containing the agent stream, container port, tunnel ID counter, data port, and container info
@@ -62,9 +98,6 @@ type ForwardEntry = (
     Option<ContainerInfo>,
 );
 
-/// Type alias for status change callback
-pub type StatusCallback = Arc<dyn Fn(&[PortForwardInfo]) + Send + Sync>;
-
 /// Manages active port forwarding sessions
 #[derive(Clone)]
 struct PortForwardManager {
@@ -72,62 +105,34 @@ struct PortForwardManager {
     forwards: Arc<Mutex<HashMap<u16, ForwardEntry>>>,
     /// Map of tunnel_id -> pending client stream
     pending_tunnels: Arc<Mutex<HashMap<u32, TcpStream>>>,
-    /// Optional callback for status updates
-    status_callback: Option<StatusCallback>,
+    /// Output format for user-facing notifications
+    output: OutputFormat,
 }
 
 impl PortForwardManager {
-    fn new(status_callback: Option<StatusCallback>) -> Self {
+    fn new(output: OutputFormat) -> Self {
         Self {
             forwards: Arc::new(Mutex::new(HashMap::new())),
             pending_tunnels: Arc::new(Mutex::new(HashMap::new())),
-            status_callback,
+            output,
         }
     }
 
-    /// Get current port forwards as display-friendly info
-    fn get_port_forwards(&self) -> Vec<PortForwardInfo> {
-        let forwards = self.forwards.lock().unwrap();
-        forwards
-            .iter()
-            .filter_map(|(local_port, (_, container_port, _, _, container_info))| {
-                container_info.as_ref().map(|info| PortForwardInfo {
-                    local_port: *local_port,
-                    container_port: *container_port,
-                    peer_address: format!("{}:{}", info.container_name, info.workspace_name),
-                })
-            })
-            .collect()
-    }
-
-    /// Notify status callback of current port forwards
-    fn notify_status(&self) {
-        if let Some(callback) = &self.status_callback {
-            let forwards = self.get_port_forwards();
-            callback(&forwards);
-        }
+    fn output_format(&self) -> OutputFormat {
+        self.output.clone()
     }
 
     /// Start forwarding a port through the control connection
     fn start_forward(
         &self,
-        local_port: u16,
+        requested_local_port: u16,
         container_port: u16,
         stream: Arc<Mutex<TcpStream>>,
         container_info: Option<ContainerInfo>,
-    ) -> Result<()> {
+    ) -> Result<u16> {
         let mut forwards = self.forwards.lock().unwrap();
-
-        if forwards.contains_key(&local_port) {
-            return Err(Error::new(format!(
-                "Port {} is already being forwarded",
-                local_port
-            )));
-        }
-
-        // Start the local listener for this port
-        let listener = TcpListener::bind(format!("0.0.0.0:{}", local_port))
-            .map_err(|e| Error::new(format!("Failed to bind to port {}: {}", local_port, e)))?;
+        let (local_port, listener) =
+            allocate_host_listener(&forwards, requested_local_port, container_port)?;
 
         info!(
             "Listening on 0.0.0.0:{} for connections to forward to container port {}",
@@ -256,26 +261,36 @@ impl PortForwardManager {
             );
         });
 
-        // Notify status callback
-        drop(forwards); // Release lock before calling callback
-        self.notify_status();
+        drop(forwards);
 
-        Ok(())
+        Ok(local_port)
     }
 
-    /// Stop forwarding a port
-    fn stop_forward(&self, local_port: u16) -> Result<()> {
+    /// Stop forwarding by container port for the current agent connection.
+    fn stop_forward(&self, container_port: u16, stream: &Arc<Mutex<TcpStream>>) -> Result<u16> {
         let mut forwards = self.forwards.lock().unwrap();
+        let local_port = forwards.iter().find_map(
+            |(host_port, (entry_stream, entry_container_port, _, _, _))| {
+                if *entry_container_port == container_port && Arc::ptr_eq(entry_stream, stream) {
+                    Some(*host_port)
+                } else {
+                    None
+                }
+            },
+        );
 
-        if forwards.remove(&local_port).is_some() {
-            drop(forwards); // Release lock before notification
-            info!("Stopped forwarding port {}", local_port);
-            self.notify_status();
-            Ok(())
+        if let Some(local_port) = local_port {
+            let _ = forwards.remove(&local_port);
+            drop(forwards);
+            info!(
+                "Stopped forwarding host port {} for container port {}",
+                local_port, container_port
+            );
+            Ok(local_port)
         } else {
             Err(Error::new(format!(
-                "Port {} is not being forwarded",
-                local_port
+                "Container port {} is not being forwarded for this agent",
+                container_port
             )))
         }
     }
@@ -469,10 +484,43 @@ fn handle_tunnel_connection(
     result.map(|_| ()).map_err(|e| e.into())
 }
 
+fn emit_port_forward_event(
+    output: &OutputFormat,
+    event: &str,
+    container_port: u16,
+    host_port: u16,
+    container_info: Option<&ContainerInfo>,
+) {
+    match output {
+        OutputFormat::Json => {
+            let payload = json!({
+                "event": event,
+                "containerPort": container_port,
+                "hostPort": host_port,
+                "containerName": container_info.map(|i| i.container_name.clone()),
+                "workspaceName": container_info.map(|i| i.workspace_name.clone())
+            });
+            println!("{}", payload);
+        }
+        OutputFormat::Text => {
+            let action = if event == "started" {
+                "started"
+            } else {
+                "stopped"
+            };
+            println!(
+                "port forward {}: container {} -> host {}",
+                action, container_port, host_port
+            );
+        }
+    }
+}
+
 /// Handle a single agent connection
 fn handle_agent_connection(mut stream: TcpStream, manager: PortForwardManager) -> Result<()> {
     let peer_addr = stream.peer_addr()?;
     info!("New agent connection from {}", peer_addr);
+    let output = manager.output_format();
 
     let stream_arc = Arc::new(Mutex::new(stream.try_clone()?));
 
@@ -490,21 +538,49 @@ fn handle_agent_connection(mut stream: TcpStream, manager: PortForwardManager) -
                     let port = fwd.port as u16;
                     info!("Agent requested port forward: {}", port);
 
-                    if let Err(e) = manager.start_forward(
+                    match manager.start_forward(
                         port,
                         port,
                         stream_arc.clone(),
                         container_info.clone(),
                     ) {
-                        error!("Failed to start port forward: {}", e);
+                        Ok(host_port) => {
+                            if host_port != port {
+                                info!(
+                                    "Allocated host port {} for requested container port {}",
+                                    host_port, port
+                                );
+                            }
+                            emit_port_forward_event(
+                                &output,
+                                "started",
+                                port,
+                                host_port,
+                                container_info.as_ref(),
+                            );
+                        }
+                        Err(e) => {
+                            error!("Failed to start port forward: {}", e);
+                        }
                     }
                 }
                 Some(ProtoMessage::StopPortForward(fwd)) => {
                     let port = fwd.port as u16;
                     info!("Agent requested stop port forward: {}", port);
 
-                    if let Err(e) = manager.stop_forward(port) {
-                        error!("Failed to stop port forward: {}", e);
+                    match manager.stop_forward(port, &stream_arc) {
+                        Ok(host_port) => {
+                            emit_port_forward_event(
+                                &output,
+                                "stopped",
+                                port,
+                                host_port,
+                                container_info.as_ref(),
+                            );
+                        }
+                        Err(e) => {
+                            error!("Failed to stop port forward: {}", e);
+                        }
                     }
                 }
                 Some(ProtoMessage::OpenUrl(url_msg)) => {
@@ -553,70 +629,14 @@ fn handle_agent_connection(mut stream: TcpStream, manager: PortForwardManager) -
     Ok(())
 }
 
-/// Display port forwards as an inline table
-pub fn display_forwards_inline(forwards: &[PortForwardInfo]) {
-    if forwards.is_empty() {
-        println!("No active port forwards");
-        return;
-    }
-
-    let mut table = Table::new();
-    table.set_header(vec![
-        Cell::new("Peer Address").fg(Color::Cyan),
-        Cell::new("Local Port").fg(Color::Cyan),
-        Cell::new("Container Port").fg(Color::Cyan),
-    ]);
-
-    for forward in forwards {
-        table.add_row(vec![
-            Cell::new(&forward.peer_address),
-            Cell::new(forward.local_port.to_string()).fg(Color::Green),
-            Cell::new(forward.container_port.to_string()).fg(Color::Yellow),
-        ]);
-    }
-
-    println!("{}", table);
-}
-
-/// Display port forwards in fullscreen mode (clears screen and redraws)
-pub fn display_forwards_fullscreen(forwards: &[PortForwardInfo]) {
-    // Clear screen and move cursor to top-left
-    print!("\x1B[2J\x1B[1;1H");
-
-    println!("=== DevCon Port Forwarding Status ===\n");
-
-    if forwards.is_empty() {
-        println!("No active port forwards");
-    } else {
-        let mut table = Table::new();
-        table.set_header(vec![
-            Cell::new("Peer Address").fg(Color::Cyan),
-            Cell::new("Local Port").fg(Color::Cyan),
-            Cell::new("Container Port").fg(Color::Cyan),
-        ]);
-
-        for forward in forwards {
-            table.add_row(vec![
-                Cell::new(&forward.peer_address),
-                Cell::new(forward.local_port.to_string()).fg(Color::Green),
-                Cell::new(forward.container_port.to_string()).fg(Color::Yellow),
-            ]);
-        }
-
-        println!("{}", table);
-    }
-
-    println!("\nPress Ctrl+C to stop the control server");
-}
-
 /// Start the control server on the specified port
-pub fn start_control_server(port: u16, status_callback: Option<StatusCallback>) -> Result<()> {
+pub fn start_control_server(port: u16, output: OutputFormat) -> Result<()> {
     let listener = TcpListener::bind(format!("0.0.0.0:{}", port))
         .map_err(|e| Error::new(format!("Failed to bind to port {}: {}", port, e)))?;
 
     info!("Control server listening on 0.0.0.0:{}", port);
 
-    let manager = PortForwardManager::new(status_callback);
+    let manager = PortForwardManager::new(output);
 
     for stream in listener.incoming() {
         match stream {
@@ -635,4 +655,109 @@ pub fn start_control_server(port: u16, status_callback: Option<StatusCallback>) 
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ops::RangeInclusive;
+
+    fn reserve_consecutive_ports(count: usize) -> (u16, Vec<TcpListener>) {
+        let max_start = u16::MAX - count as u16;
+        for start in 20000..=max_start {
+            let mut listeners = Vec::with_capacity(count);
+            let mut ok = true;
+            for port in RangeInclusive::new(start, start + count as u16 - 1) {
+                match TcpListener::bind(("0.0.0.0", port)) {
+                    Ok(listener) => listeners.push(listener),
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+
+            if ok {
+                return (start, listeners);
+            }
+        }
+
+        panic!(
+            "failed to reserve {} consecutive host ports for test",
+            count
+        );
+    }
+
+    fn stream_pair() -> (Arc<Mutex<TcpStream>>, Arc<Mutex<TcpStream>>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind pair listener");
+        let addr = listener.local_addr().expect("get pair listener addr");
+        let client = TcpStream::connect(addr).expect("connect pair client");
+        let (server, _) = listener.accept().expect("accept pair server");
+        (Arc::new(Mutex::new(server)), Arc::new(Mutex::new(client)))
+    }
+
+    #[test]
+    fn allocate_host_listener_uses_next_port_when_requested_is_busy() {
+        let (start, mut listeners) = reserve_consecutive_ports(2);
+        // Keep start busy, make start+1 available.
+        let next = listeners.pop();
+        assert!(next.is_some());
+
+        let forwards: HashMap<u16, ForwardEntry> = HashMap::new();
+        let (allocated, _listener) =
+            allocate_host_listener(&forwards, start, 3000).expect("allocate host listener");
+
+        assert!(
+            allocated > start,
+            "expected allocation to increment off busy port"
+        );
+        assert!(
+            allocated <= start + (MAX_HOST_PORT_ALLOCATION_ATTEMPTS - 1),
+            "allocation should stay within retry window"
+        );
+    }
+
+    #[test]
+    fn allocate_host_listener_fails_after_five_attempts() {
+        let (start, _listeners) =
+            reserve_consecutive_ports(MAX_HOST_PORT_ALLOCATION_ATTEMPTS as usize);
+        let forwards: HashMap<u16, ForwardEntry> = HashMap::new();
+
+        let err = allocate_host_listener(&forwards, start, 3000)
+            .expect_err("allocation should fail when five consecutive ports are busy");
+
+        assert!(
+            err.to_string().contains("after 5 attempts"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn stop_forward_removes_only_matching_agent_stream() {
+        let manager = PortForwardManager::new(OutputFormat::Text);
+        let (stream_a_server, stream_a_client) = stream_pair();
+        let (stream_b_server, stream_b_client) = stream_pair();
+        let counter = Arc::new(AtomicU32::new(1));
+
+        {
+            let mut forwards = manager.forwards.lock().expect("lock forwards");
+            forwards.insert(
+                41000,
+                (stream_a_server.clone(), 3000, counter.clone(), 45000, None),
+            );
+            forwards.insert(42000, (stream_b_server, 3000, counter, 46000, None));
+        }
+
+        let stopped = manager
+            .stop_forward(3000, &stream_a_server)
+            .expect("stop should match stream A");
+        assert_eq!(stopped, 41000);
+
+        let forwards = manager.forwards.lock().expect("lock forwards after stop");
+        assert!(!forwards.contains_key(&41000));
+        assert!(forwards.contains_key(&42000));
+
+        drop(stream_a_client);
+        drop(stream_b_client);
+    }
 }
