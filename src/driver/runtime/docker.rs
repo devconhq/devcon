@@ -482,7 +482,24 @@ impl ContainerRuntime for DockerRuntime {
         let result = cmd.output()?;
 
         if result.status.code() != Some(0) {
-            return Err(Error::runtime("Docker run command failed"));
+            let exit_code = result
+                .status
+                .code()
+                .map_or("terminated by signal".to_string(), |code| {
+                    format!("exit code {}", code)
+                });
+            let stderr = String::from_utf8_lossy(&result.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&result.stdout).trim().to_string();
+
+            let mut details = format!("Docker run command failed ({})", exit_code);
+            if !stderr.is_empty() {
+                details.push_str(&format!("\nstderr: {}", stderr));
+            }
+            if !stdout.is_empty() {
+                details.push_str(&format!("\nstdout: {}", stdout));
+            }
+
+            return Err(Error::runtime(details));
         }
 
         Ok(Box::new(DockerContainerHandle {

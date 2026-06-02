@@ -546,10 +546,24 @@ impl ContainerRuntime for ContainerCliRuntime {
         let result = cmd.output()?;
 
         if result.status.code() != Some(0) {
-            return Err(Error::runtime(format!(
-                "Container start command failed: {}",
-                &String::from_utf8(result.stderr).unwrap()
-            )));
+            let exit_code = result
+                .status
+                .code()
+                .map_or("terminated by signal".to_string(), |code| {
+                    format!("exit code {}", code)
+                });
+            let stderr = String::from_utf8_lossy(&result.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&result.stdout).trim().to_string();
+
+            let mut details = format!("Container start command failed ({})", exit_code);
+            if !stderr.is_empty() {
+                details.push_str(&format!("\nstderr: {}", stderr));
+            }
+            if !stdout.is_empty() {
+                details.push_str(&format!("\nstdout: {}", stdout));
+            }
+
+            return Err(Error::runtime(details));
         }
         std::thread::sleep(Duration::from_secs(10));
 
