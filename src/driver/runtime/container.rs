@@ -463,13 +463,13 @@ impl ContainerRuntime for ContainerCliRuntime {
         runtime_parameters: RuntimeParameters,
     ) -> Result<Box<dyn super::ContainerHandle>> {
         let mut cmd = Command::new("container");
-        cmd.arg("run")
-            .arg("-d")
-            .arg("--rosetta") // TODO: autodetect / cli param to set this argument
-            .arg("-v")
-            .arg(volume_mount)
-            .arg("-l")
-            .arg(label);
+        cmd.arg("run").arg("-d");
+
+        if runtime_parameters.platform_architecture_translation {
+            cmd.arg("--rosetta");
+        }
+
+        cmd.arg("-v").arg(volume_mount).arg("-l").arg(label);
 
         // Add CPU and memory limits from config
         let memory = self.config.run_memory.as_deref().unwrap_or("8g");

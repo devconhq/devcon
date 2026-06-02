@@ -209,6 +209,10 @@ pub struct RuntimeParameters {
 
     /// Whether the container requires privileged mode.
     pub requires_privileged: bool,
+
+    /// Whether to enable Rosetta (container CLI) or `--platform linux/amd64` (Docker).
+    /// True when the host is ARM and the image architecture is `amd64`.
+    pub platform_architecture_translation: bool,
 }
 
 /// Trait for container runtime implementations.
