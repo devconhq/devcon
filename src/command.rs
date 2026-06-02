@@ -53,7 +53,10 @@ use crate::{
 use comfy_table::{Cell, Color, ContentArrangement, Table, presets::UTF8_FULL};
 use pidlock::Pidlock;
 use serde::Serialize;
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
+
+const SSH_CONFIG_MARKER_START_PREFIX: &str = "# devcon-managed-start:";
+const SSH_CONFIG_MARKER_END_PREFIX: &str = "# devcon-managed-end:";
 
 /// Helper function to get runtime-specific config
 fn get_runtime_specific_config(
@@ -276,7 +279,16 @@ pub fn handle_start_command(
     let runtime = get_runtime_specific_config(&config, &runtime_name)?;
 
     let driver = ContainerDriver::new_silent(config, runtime, output == OutputFormat::Json);
-    let container_id = driver.start(devcontainer_workspace, &[])?;
+    let container_id = driver.start(devcontainer_workspace.clone(), &[])?;
+
+    let remote_user = driver.resolve_remote_user_for_workspace(&devcontainer_workspace);
+    if let Err(err) = write_ssh_config_entry(&devcontainer_workspace, &remote_user, false) {
+        warn!("failed to write SSH config entry: {}", err);
+        eprintln!(
+            "⚠️  Warning: Container started, but failed to update ~/.ssh/config: {}",
+            err
+        );
+    }
 
     if output == OutputFormat::Json {
         let response = StartResponse { container_id };
@@ -406,17 +418,30 @@ pub fn handle_ssh_create_config_command(path: PathBuf, config_path: Option<PathB
     let driver = ContainerDriver::new(config, runtime);
     let remote_user = driver.resolve_remote_user_for_workspace(&workspace);
 
+    write_ssh_config_entry(&workspace, &remote_user, true)?;
+    Ok(())
+}
+
+fn write_ssh_config_entry(
+    workspace: &Workspace,
+    remote_user: &str,
+    print_user_message: bool,
+) -> Result<()> {
     let host_alias = format!("devcon-{}", workspace.get_sanitized_name());
     let canonical_path = workspace.path.display().to_string();
+    let marker_start = format!("{} {}", SSH_CONFIG_MARKER_START_PREFIX, canonical_path);
+    let marker_end = format!("{} {}", SSH_CONFIG_MARKER_END_PREFIX, canonical_path);
 
     let block = format!(
-        "Host {host_alias}\n\
-         \tHostName 127.0.0.1\n\
-         	User {remote_user}\n\
-         \tStrictHostKeyChecking no\n\
-         \tUserKnownHostsFile /dev/null\n\
-         \tLogLevel ERROR\n\
-         \tProxyCommand devcon ssh connect {canonical_path} --proxy\n"
+        "{marker_start}\n\
+Host {host_alias}\n\
+	HostName 127.0.0.1\n\
+	User {remote_user}\n\
+	StrictHostKeyChecking no\n\
+	UserKnownHostsFile /dev/null\n\
+	LogLevel ERROR\n\
+	ProxyCommand devcon ssh connect {canonical_path} --proxy\n\
+{marker_end}\n"
     );
 
     let home = dirs::home_dir().ok_or_else(|| Error::runtime("Cannot determine home directory"))?;
@@ -440,7 +465,8 @@ pub fn handle_ssh_create_config_command(path: PathBuf, config_path: Option<PathB
         String::new()
     };
 
-    let updated = replace_or_append_host_block(&existing, &host_alias, &block);
+    let updated =
+        replace_or_append_host_block(&existing, &host_alias, &marker_start, &marker_end, &block);
 
     std::fs::write(&config_file, &updated)?;
 
@@ -450,15 +476,68 @@ pub fn handle_ssh_create_config_command(path: PathBuf, config_path: Option<PathB
         std::fs::set_permissions(&config_file, std::fs::Permissions::from_mode(0o600))?;
     }
 
-    println!("SSH config entry written for host: {host_alias}");
-    println!("You can now connect with: ssh {host_alias}");
+    if print_user_message {
+        println!("SSH config entry written for host: {host_alias}");
+        println!("You can now connect with: ssh {host_alias}");
+    }
+
     Ok(())
 }
 
 /// Replace an existing `Host <alias>` block in an SSH config string, or append if absent.
 ///
 /// A block is considered to end at the next `Host ` line (case-sensitive) or EOF.
-fn replace_or_append_host_block(existing: &str, host_alias: &str, new_block: &str) -> String {
+fn replace_or_append_host_block(
+    existing: &str,
+    host_alias: &str,
+    marker_start: &str,
+    marker_end: &str,
+    new_block: &str,
+) -> String {
+    if let Some(updated) = replace_marked_block(existing, marker_start, marker_end, new_block) {
+        return updated;
+    }
+
+    replace_or_append_host_block_by_alias(existing, host_alias, new_block)
+}
+
+fn replace_marked_block(
+    existing: &str,
+    marker_start: &str,
+    marker_end: &str,
+    new_block: &str,
+) -> Option<String> {
+    let mut result = String::new();
+    let mut skipping_managed_block = false;
+    let mut replaced = false;
+
+    for line in existing.lines() {
+        if !skipping_managed_block && line.trim() == marker_start.trim() {
+            result.push_str(new_block);
+            skipping_managed_block = true;
+            replaced = true;
+            continue;
+        }
+
+        if skipping_managed_block {
+            if line.trim() == marker_end.trim() {
+                skipping_managed_block = false;
+            }
+            continue;
+        }
+
+        result.push_str(line);
+        result.push('\n');
+    }
+
+    if replaced { Some(result) } else { None }
+}
+
+fn replace_or_append_host_block_by_alias(
+    existing: &str,
+    host_alias: &str,
+    new_block: &str,
+) -> String {
     let needle = format!("Host {host_alias}");
     let mut result = String::new();
     let mut inside_block = false;
@@ -582,8 +661,20 @@ pub fn handle_up_command(
     }
 
     // Start the container with pre-processed features
-    let container_id =
-        driver.start_with_features(devcontainer_workspace, &[], Some(processed_features))?;
+    let container_id = driver.start_with_features(
+        devcontainer_workspace.clone(),
+        &[],
+        Some(processed_features),
+    )?;
+
+    let remote_user = driver.resolve_remote_user_for_workspace(&devcontainer_workspace);
+    if let Err(err) = write_ssh_config_entry(&devcontainer_workspace, &remote_user, false) {
+        warn!("failed to write SSH config entry: {}", err);
+        eprintln!(
+            "⚠️  Warning: Container started, but failed to update ~/.ssh/config: {}",
+            err
+        );
+    }
 
     if output == OutputFormat::Json {
         let response = UpResponse { container_id };
@@ -1003,7 +1094,9 @@ mod test {
         let result = replace_or_append_host_block(
             "",
             "devcon-myproject",
-            "Host devcon-myproject\n\tUser devcon\n",
+            "# devcon-managed-start: /tmp/myproject",
+            "# devcon-managed-end: /tmp/myproject",
+            "# devcon-managed-start: /tmp/myproject\nHost devcon-myproject\n\tUser devcon\n# devcon-managed-end: /tmp/myproject\n",
         );
         assert!(result.contains("Host devcon-myproject"));
         assert!(result.contains("User devcon"));
@@ -1015,7 +1108,9 @@ mod test {
         let result = replace_or_append_host_block(
             existing,
             "devcon-myproject",
-            "Host devcon-myproject\n\tUser devcon\n",
+            "# devcon-managed-start: /tmp/myproject",
+            "# devcon-managed-end: /tmp/myproject",
+            "# devcon-managed-start: /tmp/myproject\nHost devcon-myproject\n\tUser devcon\n# devcon-managed-end: /tmp/myproject\n",
         );
         assert!(result.contains("Host other"));
         assert!(result.contains("Host devcon-myproject"));
@@ -1027,7 +1122,9 @@ mod test {
         let result = replace_or_append_host_block(
             existing,
             "devcon-myproject",
-            "Host devcon-myproject\n\tUser devcon\n",
+            "# devcon-managed-start: /tmp/myproject",
+            "# devcon-managed-end: /tmp/myproject",
+            "# devcon-managed-start: /tmp/myproject\nHost devcon-myproject\n\tUser devcon\n# devcon-managed-end: /tmp/myproject\n",
         );
         assert!(result.contains("User devcon"));
         assert!(!result.contains("User old"));
@@ -1041,11 +1138,38 @@ mod test {
         let result = replace_or_append_host_block(
             existing,
             "devcon-myproject",
-            "Host devcon-myproject\n\tUser devcon\n",
+            "# devcon-managed-start: /tmp/myproject",
+            "# devcon-managed-end: /tmp/myproject",
+            "# devcon-managed-start: /tmp/myproject\nHost devcon-myproject\n\tUser devcon\n# devcon-managed-end: /tmp/myproject\n",
         );
         assert!(result.contains("Host first"));
         assert!(result.contains("Host last"));
         assert!(result.contains("User devcon"));
+        assert!(!result.contains("User old"));
+    }
+
+    #[test]
+    fn test_replace_or_append_host_block_replaces_existing_marked_block() {
+        let marker_start = "# devcon-managed-start: /tmp/myproject";
+        let marker_end = "# devcon-managed-end: /tmp/myproject";
+        let existing = format!(
+            "Host first\n\tUser a\n{}\nHost devcon-old\n\tUser old\n{}\nHost last\n\tUser b\n",
+            marker_start, marker_end
+        );
+
+        let result = replace_or_append_host_block(
+            &existing,
+            "devcon-myproject",
+            marker_start,
+            marker_end,
+            "# devcon-managed-start: /tmp/myproject\nHost devcon-myproject\n\tUser devcon\n# devcon-managed-end: /tmp/myproject\n",
+        );
+
+        assert!(result.contains("Host first"));
+        assert!(result.contains("Host last"));
+        assert!(result.contains("Host devcon-myproject"));
+        assert!(result.contains("User devcon"));
+        assert!(!result.contains("Host devcon-old"));
         assert!(!result.contains("User old"));
     }
 }
