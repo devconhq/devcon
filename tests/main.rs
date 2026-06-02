@@ -169,6 +169,7 @@ RUN echo "Custom Dockerfile build" > /custom-marker.txt
         .arg(&test_config)
         .arg("--output")
         .arg("json")
+        .arg("-ddddd")
         .arg("up")
         .arg(temp_dir.path().to_str().unwrap())
         .output();
