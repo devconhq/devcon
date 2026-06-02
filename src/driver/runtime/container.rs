@@ -463,6 +463,7 @@ impl ContainerRuntime for ContainerCliRuntime {
         runtime_parameters: RuntimeParameters,
     ) -> Result<Box<dyn super::ContainerHandle>> {
         let mut cmd = Command::new("container");
+
         cmd.arg("run").arg("-d");
 
         if runtime_parameters.platform_architecture_translation {
