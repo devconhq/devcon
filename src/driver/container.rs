@@ -42,8 +42,8 @@
 //! use std::path::PathBuf;
 //!
 //! # fn example() -> devcon::error::Result<()> {
-//! let config = Config::load()?;
-//! let runtime = Box::new(DockerRuntime::new(DockerRuntimeConfig{}));
+//! let config = Config::load(None)?;
+//! let runtime = Box::new(DockerRuntime::new(DockerRuntimeConfig::default()));
 //! let driver = ContainerDriver::new(config, runtime);
 //!
 //! let workspace = Workspace::try_from(PathBuf::from("/path/to/project"))?;
@@ -394,8 +394,8 @@ impl ContainerDriver {
     /// # use devcon::driver::container::ContainerDriver;
     /// # use devcon::config::{Config, DockerRuntimeConfig};
     /// # use devcon::driver::runtime::docker::DockerRuntime;
-    /// let config = Config::load()?;
-    /// let runtime = Box::new(DockerRuntime::new(DockerRuntimeConfig{}));
+    /// let config = Config::load(None)?;
+    /// let runtime = Box::new(DockerRuntime::new(DockerRuntimeConfig::default()));
     /// let driver = ContainerDriver::new(config, runtime);
     /// # Ok::<(), devcon::error::Error>(())
     /// ```
@@ -602,8 +602,8 @@ impl ContainerDriver {
     /// # use devcon::driver::runtime::docker::DockerRuntime;
     /// # use std::path::PathBuf;
     /// # fn example() -> devcon::error::Result<()> {
-    /// let config = Config::load()?;
-    /// let runtime = Box::new(DockerRuntime::new(DockerRuntimeConfig{}));
+    /// let config = Config::load(None)?;
+    /// let runtime = Box::new(DockerRuntime::new(DockerRuntimeConfig::default()));
     /// let driver = ContainerDriver::new(config, runtime);
     /// let workspace = Workspace::try_from(PathBuf::from("/path/to/project"))?;
     ///
@@ -1007,8 +1007,8 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
     /// # use devcon::driver::runtime::docker::DockerRuntime;
     /// # use std::path::PathBuf;
     /// # fn example() -> devcon::error::Result<()> {
-    /// let config = Config::load()?;
-    /// let runtime = Box::new(DockerRuntime::new(DockerRuntimeConfig{}));
+    /// let config = Config::load(None)?;
+    /// let runtime = Box::new(DockerRuntime::new(DockerRuntimeConfig::default()));
     /// let driver = ContainerDriver::new(config, runtime);
     /// let workspace = Workspace::try_from(PathBuf::from("/project"))?;
     /// driver.build(workspace.clone(), &[], None)?;
@@ -1734,8 +1734,8 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
     /// # use devcon::driver::runtime::docker::DockerRuntime;
     /// # use std::path::PathBuf;
     /// # fn example() -> devcon::error::Result<()> {
-    /// let config = Config::load()?;
-    /// let runtime = Box::new(DockerRuntime::new(DockerRuntimeConfig{}));
+    /// let config = Config::load(None)?;
+    /// let runtime = Box::new(DockerRuntime::new(DockerRuntimeConfig::default()));
     /// let driver = ContainerDriver::new(config, runtime);
     /// let workspace = Workspace::try_from(PathBuf::from("/project"))?;
     /// driver.build(workspace.clone(), &[], None)?;
