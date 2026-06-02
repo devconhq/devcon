@@ -486,6 +486,170 @@ fn test_up_microsoft_devcontainer_base_resolves_remote_user() {
     drop(temp_dir);
 }
 
+#[test]
+fn test_up_with_custom_agent_ssh_port_uses_2222() {
+    let runtime = get_runtime();
+    if !is_runtime_available(runtime) {
+        println!("Skipping test: {:?} runtime not available", runtime);
+        return;
+    }
+
+    cleanup_test_artifacts(runtime, "test-ssh-port-override");
+    let test_config = create_test_config_with_contents(
+        "agents:\n  disable: false\n  sshPort: 2222\n  skipSshSetup: false\n",
+    );
+    let temp_dir = create_test_devcontainer(
+        "test-ssh-port-override",
+        "mcr.microsoft.com/devcontainers/base:ubuntu",
+        None,
+    );
+
+    let mut up_cmd = cargo_bin_cmd!("devcon");
+    let up_result = up_cmd
+        .arg("--config")
+        .arg(&test_config)
+        .arg("--output")
+        .arg("json")
+        .arg("up")
+        .arg(temp_dir.path().to_str().unwrap())
+        .output();
+
+    assert!(up_result.is_ok(), "Failed to execute up command");
+    let up_output = up_result.unwrap();
+    assert!(
+        up_output.status.success(),
+        "Up command failed: {}",
+        String::from_utf8_lossy(&up_output.stderr)
+    );
+
+    let mut ssh_proxy_ok_cmd = cargo_bin_cmd!("devcon");
+    let ssh_proxy_ok = ssh_proxy_ok_cmd
+        .arg("--config")
+        .arg(&test_config)
+        .arg("ssh")
+        .arg("connect")
+        .arg(temp_dir.path().to_str().unwrap())
+        .arg("--proxy")
+        .output();
+
+    assert!(
+        ssh_proxy_ok.is_ok(),
+        "Failed to execute ssh connect --proxy"
+    );
+    let ssh_proxy_ok_output = ssh_proxy_ok.unwrap();
+    assert!(
+        ssh_proxy_ok_output.status.success(),
+        "ssh connect --proxy with sshPort=2222 failed: {}",
+        String::from_utf8_lossy(&ssh_proxy_ok_output.stderr)
+    );
+
+    let wrong_port_config = create_test_config_with_contents("agents:\n  disable: false\n");
+    let mut ssh_proxy_fail_cmd = cargo_bin_cmd!("devcon");
+    let ssh_proxy_fail = ssh_proxy_fail_cmd
+        .arg("--config")
+        .arg(&wrong_port_config)
+        .arg("ssh")
+        .arg("connect")
+        .arg(temp_dir.path().to_str().unwrap())
+        .arg("--proxy")
+        .output();
+
+    assert!(
+        ssh_proxy_fail.is_ok(),
+        "Failed to execute ssh connect --proxy with wrong port config"
+    );
+    let ssh_proxy_fail_output = ssh_proxy_fail.unwrap();
+    assert!(
+        !ssh_proxy_fail_output.status.success(),
+        "ssh connect --proxy unexpectedly succeeded when looking for port 22"
+    );
+    assert!(
+        String::from_utf8_lossy(&ssh_proxy_fail_output.stderr)
+            .contains("Container SSH port 22 is not mapped"),
+        "Expected missing port 22 mapping error, got: {}",
+        String::from_utf8_lossy(&ssh_proxy_fail_output.stderr)
+    );
+
+    drop(temp_dir);
+}
+
+#[test]
+fn test_up_with_skip_agent_ssh_setup_skips_forwarding_and_sshd() {
+    let runtime = get_runtime();
+    if !is_runtime_available(runtime) {
+        println!("Skipping test: {:?} runtime not available", runtime);
+        return;
+    }
+
+    cleanup_test_artifacts(runtime, "test-skip-ssh-setup");
+    let test_config =
+        create_test_config_with_contents("agents:\n  disable: false\n  skipSshSetup: true\n");
+    let temp_dir = create_test_devcontainer(
+        "test-skip-ssh-setup",
+        "mcr.microsoft.com/devcontainers/base:ubuntu",
+        None,
+    );
+
+    let mut up_cmd = cargo_bin_cmd!("devcon");
+    let up_result = up_cmd
+        .arg("--config")
+        .arg(&test_config)
+        .arg("up")
+        .arg(temp_dir.path().to_str().unwrap())
+        .output();
+
+    assert!(up_result.is_ok(), "Failed to execute up command");
+    let up_output = up_result.unwrap();
+    let stdout = String::from_utf8_lossy(&up_output.stdout);
+    let stderr = String::from_utf8_lossy(&up_output.stderr);
+    assert!(
+        up_output.status.success(),
+        "Up command failed.\nStdout: {}\nStderr: {}",
+        stdout,
+        stderr
+    );
+    let container_id = get_running_container_id(runtime, "test-skip-ssh-setup")
+        .expect("Failed to resolve running container id for test-skip-ssh-setup");
+
+    let mut ssh_proxy_cmd = cargo_bin_cmd!("devcon");
+    let ssh_proxy_result = ssh_proxy_cmd
+        .arg("--config")
+        .arg(&test_config)
+        .arg("ssh")
+        .arg("connect")
+        .arg(temp_dir.path().to_str().unwrap())
+        .arg("--proxy")
+        .output();
+
+    assert!(
+        ssh_proxy_result.is_ok(),
+        "Failed to execute ssh connect --proxy"
+    );
+    let ssh_proxy_output = ssh_proxy_result.unwrap();
+    assert!(
+        !ssh_proxy_output.status.success(),
+        "ssh connect --proxy unexpectedly succeeded when SSH setup is skipped"
+    );
+    assert!(
+        String::from_utf8_lossy(&ssh_proxy_output.stderr)
+            .contains("Container SSH port 22 is not mapped"),
+        "Expected missing SSH mapping error, got: {}",
+        String::from_utf8_lossy(&ssh_proxy_output.stderr)
+    );
+
+    let sshd_running = exec_in_container(
+        runtime,
+        &container_id,
+        &["sh", "-lc", "ps -ef | grep -q '[s]shd'"],
+    );
+    assert!(
+        sshd_running.is_err(),
+        "sshd should not be running when agents.skipSshSetup=true"
+    );
+
+    drop(temp_dir);
+}
+
 /// Regression test for the `devcon start` command always creating a new container.
 ///
 /// `list()` calls `docker ps` (no `-a` flag), which only returns *running*

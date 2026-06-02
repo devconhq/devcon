@@ -17,7 +17,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
 use std::time::Duration;
 
-const AUTO_FORWARD_DENY_PORTS: [u16; 1] = [22];
+const DEFAULT_SSH_PORT: u16 = 22;
+
+fn get_configured_ssh_port() -> u16 {
+    std::env::var("DEVCON_SSH_PORT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u16>().ok())
+        .filter(|p| *p != 0)
+        .unwrap_or(DEFAULT_SSH_PORT)
+}
 
 #[derive(Parser)]
 #[command(name = "devcon-agent")]
@@ -552,8 +560,8 @@ fn main() {
                 }
             }
 
-            // Never auto-forward container SSH.
-            excluded_ports.extend(AUTO_FORWARD_DENY_PORTS);
+            // Never auto-forward the container SSH port.
+            excluded_ports.insert(get_configured_ssh_port());
 
             if !excluded_ports.is_empty() {
                 eprintln!("Excluding ports from auto-forwarding: {:?}", excluded_ports);
@@ -855,6 +863,18 @@ mod tests {
 
     #[test]
     fn test_auto_forward_denylist_includes_ssh_port() {
-        assert!(AUTO_FORWARD_DENY_PORTS.contains(&22));
+        unsafe {
+            std::env::remove_var("DEVCON_SSH_PORT");
+        }
+        assert_eq!(get_configured_ssh_port(), 22);
+
+        unsafe {
+            std::env::set_var("DEVCON_SSH_PORT", "2222");
+        }
+        assert_eq!(get_configured_ssh_port(), 2222);
+
+        unsafe {
+            std::env::remove_var("DEVCON_SSH_PORT");
+        }
     }
 }

@@ -19,6 +19,8 @@ agents:
   binaryUrl: https://example.com/devcon-agent
   useAgentBinary: true
   disable: false
+  sshPort: 22
+  skipSshSetup: false
 
 agentForwarding:
   sshEnabled: true

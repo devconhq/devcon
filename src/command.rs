@@ -349,6 +349,7 @@ pub fn handle_ssh_command(
     let runtime = get_runtime_specific_config(&config, &runtime_name)?;
 
     let driver = ContainerDriver::new(config.clone(), runtime);
+    let ssh_port = config.get_agent_ssh_port();
     let container_id = driver.resolve_running_container_id(
         &devcontainer_workspace,
         "Multiple containers running — select one to connect via SSH",
@@ -356,12 +357,12 @@ pub fn handle_ssh_command(
     let remote_user = driver.resolve_remote_user_for_workspace(&devcontainer_workspace);
     let mapped_port = driver
         .runtime
-        .mapped_host_port(&container_id, 22)?
+        .mapped_host_port(&container_id, ssh_port)?
         .ok_or_else(|| {
-            Error::runtime(
-                "Container SSH port 22 is not mapped. Recreate the container with devcon up/start."
-                    .to_string(),
-            )
+            Error::runtime(format!(
+                "Container SSH port {} is not mapped. Recreate the container with devcon up/start.",
+                ssh_port
+            ))
         })?;
 
     if proxy_mode {
