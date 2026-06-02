@@ -101,14 +101,25 @@ devcon shell --env EDITOR=vim --env LANG=en_US.UTF-8
 ```bash
 # Use as an SSH ProxyCommand (for ~/.ssh/config integration)
 devcon ssh connect --proxy
+
+# Write/update a managed SSH config entry for this workspace
+devcon ssh create-config
 ```
 
 Example `~/.ssh/config` entry:
 
 ```
-Host myproject
+# devcon-managed-start: /path/to/project
+Host devcon-myproject
+  HostName 127.0.0.1
+  User devcon
   ProxyCommand devcon ssh connect /path/to/project --proxy
+# devcon-managed-end: /path/to/project
 ```
+
+DevCon writes managed start/end marker comments around workspace SSH entries so repeated runs can replace the exact managed block instead of appending duplicates.
+
+DevCon also updates `~/.ssh/config` automatically after `devcon start` and `devcon up` successfully start the container.
 
 DevCon ensures container port `22/tcp` is always published to a random host port when starting containers. The `devcon-agent` feature installs and starts OpenSSH server inside supported Linux distributions, and `devcon ssh connect` discovers the mapped host port and connects directly.
 
