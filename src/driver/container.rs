@@ -1930,7 +1930,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
         }
 
         let result = hasher.finalize();
-        format!("{:x}", result)
+        result.iter().map(|byte| format!("{:02x}", byte)).collect()
     }
 
     /// Returns `true` when the existing image's config hash matches the current workspace config.
