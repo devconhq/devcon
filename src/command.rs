@@ -97,13 +97,15 @@ fn warn_if_serve_not_running() {
     let running = lock.exists() && lock.is_active().unwrap_or(false);
     if !running {
         info!("The devcon control server is not running.");
-        eprintln!(
-            "⚠️  Warning: The devcon control server is not running. \
-             Start it with 'devcon serve' in a seperate terminal to enable agent connections and port forwarding."
-        );
-        eprint!("Press Enter to continue...");
-        let mut input = String::new();
-        let _ = std::io::stdin().read_line(&mut input);
+        if io::stdin().is_terminal() && io::stdout().is_terminal() {
+            eprintln!(
+                "⚠️  Warning: The devcon control server is not running. \
+                 Start it with 'devcon serve' in a seperate terminal to enable agent connections and port forwarding."
+            );
+            eprint!("Press Enter to continue...");
+            let mut input = String::new();
+            let _ = std::io::stdin().read_line(&mut input);
+        }
     }
 }
 
