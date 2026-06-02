@@ -54,57 +54,6 @@ struct Cli {
     command: Commands,
 }
 
-#[derive(Subcommand, Debug)]
-enum ConfigAction {
-    /// Show the current configuration
-    #[command(about = "Display current configuration with all values")]
-    Show,
-
-    /// Get a configuration property value
-    #[command(about = "Get the value of a configuration property")]
-    Get {
-        /// Property path in camelCase dot-notation (e.g., agents.binaryUrl)
-        #[arg(help = "Property path to get")]
-        property: String,
-    },
-
-    /// Set a configuration property value
-    #[command(about = "Set a configuration property value")]
-    Set {
-        /// Property path in camelCase dot-notation (e.g., agents.binaryUrl)
-        #[arg(help = "Property path to set")]
-        property: String,
-
-        /// Value to set
-        #[arg(help = "Value to set")]
-        value: String,
-    },
-
-    /// Unset (remove) a configuration property value
-    #[command(about = "Unset a configuration property")]
-    Unset {
-        /// Property path in camelCase dot-notation (e.g., agents.binaryUrl)
-        #[arg(help = "Property path to unset")]
-        property: String,
-    },
-
-    /// Validate the configuration
-    #[command(about = "Validate all configuration values")]
-    Validate,
-
-    /// Show the configuration file path
-    #[command(about = "Show the configuration file location")]
-    Path,
-
-    /// List all available configuration properties
-    #[command(about = "List all configuration properties")]
-    List {
-        /// Filter properties by substring match
-        #[arg(help = "Filter properties by substring", long, short)]
-        filter: Option<String>,
-    },
-}
-
 /// Display mode for port forwarding status
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum StatusMode {
@@ -230,12 +179,6 @@ enum Commands {
         )]
         path: Option<PathBuf>,
     },
-    /// Prints the config file location path
-    #[command(about = "Manage DevCon configuration")]
-    Config {
-        #[command(subcommand)]
-        action: ConfigAction,
-    },
     /// Starts the control server for agent connections
     #[command(about = "Start the control server for managing agent connections")]
     Serve {
@@ -349,29 +292,6 @@ fn main() -> devcon::error::Result<()> {
                 output,
             )?;
         }
-        Commands::Config { action } => match action {
-            ConfigAction::Show => {
-                handle_config_show(config_path, output)?;
-            }
-            ConfigAction::Get { property } => {
-                handle_config_get(property, config_path, output)?;
-            }
-            ConfigAction::Set { property, value } => {
-                handle_config_set(property, value, config_path, output)?;
-            }
-            ConfigAction::Unset { property } => {
-                handle_config_unset(property, config_path, output)?;
-            }
-            ConfigAction::Validate => {
-                handle_config_validate(config_path, output)?;
-            }
-            ConfigAction::Path => {
-                handle_config_path(output)?;
-            }
-            ConfigAction::List { filter } => {
-                handle_config_list(filter.as_deref(), output)?;
-            }
-        },
         Commands::Serve { port, status_mode } => {
             handle_serve_command(*port, config_path, status_mode.map(|m| m.into()))?;
         }
