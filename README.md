@@ -78,7 +78,6 @@ devcon shell
 | `devcon ssh [PATH]` | Connect via SSH |
 | `devcon info [PATH]` | Display container status and configuration |
 | `devcon serve` | Start the control server for agent connections |
-| `devcon config <ACTION>` | Manage DevCon configuration |
 
 All commands default to the current directory when `PATH` is not specified.
 
@@ -142,32 +141,21 @@ The control server should be kept running in a separate terminal (or as a backgr
 
 ### Agent installation options
 
-By default, the agent binary is downloaded from GitHub Releases at container build time. You can customize this behaviour via the `agents.*` configuration properties:
+By default, the agent binary is downloaded from GitHub Releases at container build time. You can customize this behaviour in `~/.config/devcon/config.yaml` or by copying the checked-in example at [devcon.example.yaml](devcon.example.yaml):
 
-```bash
-# Point to a custom precompiled binary
-devcon config set agents.binaryUrl https://example.com/devcon-agent
-
-# Build the agent from source inside the container instead
-devcon config set agents.useAgentBinary false
-
-# Disable the agent entirely (disables port forwarding and URL opening)
-devcon config set agents.disable true
+```yaml
+agents:
+  binaryUrl: https://example.com/devcon-agent
+  useAgentBinary: true
+  disable: false
 ```
 
 ## Configuration
 
-The configuration file is stored at `~/.config/devcon/config.yaml` (XDG Base Directory). Use the `devcon config` subcommands to manage it without editing YAML by hand.
+The configuration file is stored at `~/.config/devcon/config.yaml` (XDG Base Directory). Copy [devcon.example.yaml](devcon.example.yaml) into that location and edit it directly, or pass a custom file with `--config`.
 
 ```bash
-devcon config show              # Display current configuration
-devcon config path              # Show the config file path
-devcon config list              # List all available properties
-devcon config list --filter ssh # Filter properties by name
-devcon config get <property>    # Read a property value
-devcon config set <property> <value>  # Set a property value
-devcon config unset <property>  # Remove a property value
-devcon config validate          # Validate the configuration
+devcon --config ./devcon.example.yaml up .
 ```
 
 Properties use camelCase dot-notation (e.g., `agents.binaryUrl`).
@@ -207,38 +195,29 @@ Properties use camelCase dot-notation (e.g., `agents.binaryUrl`).
 | `agentForwarding.gpgSocketPath` | string | Override the GPG socket path (auto-detected by default) |
 | `agentForwarding.ghConfigPath` | string | Override the GitHub CLI config directory (auto-detected by default) |
 
+#### Docker runtime (`runtimeConfig.docker.*`)
+
+| Property | Type | Description |
+|---|---|---|
+| `runtimeConfig.docker.buildMemory` | string | Memory limit for Docker builds, e.g. `4g`, `512m` |
+| `runtimeConfig.docker.buildCpu` | string | CPU limit for Docker builds, e.g. `2`, `0.5` |
+| `runtimeConfig.docker.runMemory` | string | Memory limit for Docker containers, e.g. `8g`, `512m` |
+| `runtimeConfig.docker.runCpu` | string | CPU limit for Docker containers, e.g. `2`, `0.5` |
+
 #### Container runtime (`runtimeConfig.container.*`)
 
 | Property | Type | Description |
 |---|---|---|
 | `runtimeConfig.container.buildMemory` | string | Memory limit for builds, e.g. `4g`, `512m` (default: `4g`) |
 | `runtimeConfig.container.buildCpu` | string | CPU limit for builds, e.g. `2`, `0.5` |
+| `runtimeConfig.container.runMemory` | string | Memory limit for running containers, e.g. `8g`, `512m` (default: `8g`) |
+| `runtimeConfig.container.runCpu` | string | CPU limit for running containers, e.g. `2`, `0.5` (default: `2`) |
 
 ### Example config file
 
-```yaml
-dotfilesRepository: https://github.com/user/dotfiles
-runtime: auto
-envVariables:
-  - EDITOR=vim
-  - LANG=en_US.UTF-8
-additionalFeatures:
-  ghcr.io/devcontainers/features/common-utils:2:
-    installZsh: true
-agentForwarding:
-  sshEnabled: true
-  gpgEnabled: true
-agents:
-  disable: false
-```
+The repository includes a complete sample at [devcon.example.yaml](devcon.example.yaml). Start there if you want a working baseline you can copy into your project or home config directory.
 
-### Set a value via CLI
-
-```bash
-devcon config set dotfilesRepository https://github.com/user/dotfiles
-devcon config set agentForwarding.sshEnabled true
-devcon config set runtimeConfig.container.buildMemory 8g
-```
+The sample shows the full shape of a practical config, including runtime selection, dotfiles, agent forwarding, and resource limits.
 
 ## Using the container runtime
 
@@ -250,11 +229,7 @@ The `container` CLI must be installed and available on your `PATH`.
 
 ### Selecting the container runtime
 
-```bash
-devcon config set runtime container
-```
-
-Or explicitly per-invocation via the config file:
+Set the runtime in your config file:
 
 ```yaml
 runtime: container
@@ -264,11 +239,7 @@ runtime: container
 
 When building a container image, DevCon creates a temporary build context directory. By default this lands in `/tmp`, but the container runtime runs inside a virtual machine that cannot access macOS's `/tmp` filesystem. The build will fail unless you configure a `buildPath` that resolves to a directory the runtime can reach — any path under your home directory works.
 
-```bash
-devcon config set buildPath ~/.devcon/build
-```
-
-Or in `~/.config/devcon/config.yaml`:
+Set it in your config file:
 
 ```yaml
 buildPath: ~/.devcon/build
@@ -281,9 +252,11 @@ DevCon creates the directory automatically if it does not exist.
 
 By default the container runtime uses 4 GB of memory per build. You can raise or lower this and optionally cap CPU usage:
 
-```bash
-devcon config set runtimeConfig.container.buildMemory 8g
-devcon config set runtimeConfig.container.buildCpu 4
+```yaml
+runtimeConfig:
+  container:
+    buildMemory: 8g
+    buildCpu: 4
 ```
 
 Accepted memory suffixes are `k`, `m`, and `g`. CPU is a decimal number of cores (e.g. `2` or `0.5`).

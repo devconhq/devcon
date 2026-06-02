@@ -1,0 +1,38 @@
+# DevCon example configuration
+# Copy this file to ~/.config/devcon/config.yaml or pass it with --config.
+
+dotfilesRepository: https://github.com/user/dotfiles
+dotfilesInstallCommand: ./install.sh
+defaultShell: /bin/zsh
+buildPath: ~/.devcon/build
+runtime: container
+
+envVariables:
+  - EDITOR=vim
+  - LANG=en_US.UTF-8
+
+additionalFeatures:
+  ghcr.io/devcontainers/features/common-utils:2:
+    installZsh: true
+
+agents:
+  binaryUrl: https://example.com/devcon-agent
+  useAgentBinary: true
+  disable: false
+
+agentForwarding:
+  sshEnabled: true
+  gpgEnabled: true
+  ghEnabled: true
+
+runtimeConfig:
+  docker:
+    buildMemory: 6g
+    buildCpu: 2
+    runMemory: 8g
+    runCpu: 4
+  container:
+    buildMemory: 8g
+    buildCpu: 4
+    runMemory: 12g
+    runCpu: 4
