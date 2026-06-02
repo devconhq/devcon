@@ -2287,7 +2287,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                 // Preserve direct argv execution for array values, but run the
                 // object entries sequentially for now.
                 let mut entries: Vec<_> = map.iter().collect();
-                entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+                entries.sort_by_key(|(left, _)| *left);
 
                 for (_, value) in entries {
                     self.exec_lifecycle_value(
