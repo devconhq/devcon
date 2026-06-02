@@ -464,9 +464,13 @@ impl ContainerRuntime for ContainerCliRuntime {
     ) -> Result<Box<dyn super::ContainerHandle>> {
         let mut cmd = Command::new("container");
         cmd.arg("run")
-            .arg("-d")
-            .arg("--rosetta") // TODO: autodetect / cli param to set this argument
-            .arg("-v")
+            .arg("-d");
+
+        if runtime_parameters.platform_architecture_translation {
+            cmd.arg("--rosetta");
+        }
+
+        cmd.arg("-v")
             .arg(volume_mount)
             .arg("-l")
             .arg(label);

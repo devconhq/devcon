@@ -401,8 +401,13 @@ impl ContainerRuntime for DockerRuntime {
         trace!("Running Docker container with image: {}", image_tag);
         let mut cmd = Command::new("docker");
         cmd.arg("run")
-            .arg("-d")
-            .arg("-v")
+            .arg("-d");
+
+        if runtime_parameters.platform_architecture_translation {
+            cmd.arg("--platform").arg("linux/amd64");
+        }
+
+        cmd.arg("-v")
             .arg(volume_mount)
             .arg("--label")
             .arg(label);

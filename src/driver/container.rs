@@ -382,6 +382,7 @@ struct ResolvedUsers {
     container_user: String,
     remote_user_home: String,
     container_user_home: String,
+    image_architecture: String,
 }
 
 impl ContainerDriver {
@@ -849,6 +850,7 @@ ENV _REMOTE_USER_HOME={{ remote_user_home }}
 ENV _CONTAINER_USER_HOME={{ container_user_home }}
 ENV DEVCON_CONTROL_HOST={{ runtime_host_address }}
 LABEL devcon.config-hash={{ config_hash }}
+LABEL devcon.image-architecture={{ image_architecture }}
 
 USER root
 RUN mkdir /tmp/features
@@ -880,6 +882,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
             workspace_name => devcontainer_workspace.path.file_name().unwrap().to_string_lossy(),
             runtime_host_address => self.runtime.get_host_address(),
             config_hash => &config_hash,
+            image_architecture => &resolved_users.image_architecture,
         })?;
 
         fs::write(&dockerfile, contents)?;
@@ -1465,6 +1468,18 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
 
         debug!("Starting container with ports: {:?}", ports);
 
+        let image_arch = self
+            .runtime
+            .image_label(
+                &format!("{}:latest", self.get_image_tag(&devcontainer_workspace)),
+                "devcon.image-architecture",
+            )
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "amd64".to_string());
+        let host_is_arm = std::env::consts::ARCH == "aarch64";
+        let enable_rosetta = host_is_arm && image_arch == "amd64";
+
         let handle = self.runtime.run(
             &format!("{}:latest", self.get_image_tag(&devcontainer_workspace)),
             &volume_mount,
@@ -1474,6 +1489,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                 additional_mounts: all_mounts,
                 ports,
                 requires_privileged,
+                platform_architecture_translation: enable_rosetta,
             },
         )?;
 
@@ -2054,6 +2070,22 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
         }
     }
 
+    fn extract_architecture_from_inspect(inspect: &serde_json::Value) -> Option<String> {
+        let from_key = |path: &[&str]| {
+            let mut current = inspect;
+            for key in path {
+                current = current.get(*key)?;
+            }
+            current
+                .as_str()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(ToString::to_string)
+        };
+
+        from_key(&["Architecture"]).or_else(|| from_key(&["architecture"]))
+    }
+
     fn extract_user_from_inspect(inspect: &serde_json::Value) -> Option<String> {
         let from_key = |path: &[&str]| {
             let mut current = inspect;
@@ -2113,6 +2145,10 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
         let inspect = self.runtime.inspect_image(image_tag).ok().flatten();
         let detected_user = inspect.as_ref().and_then(Self::extract_user_from_inspect);
         let detected_home = inspect.as_ref().and_then(Self::extract_home_from_inspect);
+        let image_architecture = inspect
+            .as_ref()
+            .and_then(Self::extract_architecture_from_inspect)
+            .unwrap_or_else(|| "amd64".to_string());
 
         let remote_user_override = workspace.devcontainer.remote_user.clone();
         let container_user_override = workspace.devcontainer.container_user.clone();
@@ -2150,6 +2186,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
             container_user_home,
             remote_user,
             container_user,
+            image_architecture,
         }
     }
 
@@ -2189,6 +2226,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
             container_user_home: Self::user_home(&container_user),
             remote_user,
             container_user,
+            image_architecture: "amd64".to_string(),
         };
 
         self.substitute_mount_variables_with_users(mount_str, devcontainer_workspace, &users)
