@@ -70,7 +70,7 @@ use tempfile::TempDir;
 use tracing::{Level, debug, info, trace, warn};
 
 use crate::devcontainer::{
-    FeatureRef, FeatureSource, resolve_context_path, resolve_dockerfile_path,
+    FeatureRef, FeatureSource, LifecycleCommandValue, resolve_context_path, resolve_dockerfile_path,
 };
 use crate::driver::agent::{self, AgentConfig};
 use crate::driver::feature_process::FeatureProcessResult;
@@ -1495,49 +1495,16 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
 
         self.ensure_ssh_authorized_key(handle.as_ref(), &resolved_users)?;
 
-        match &devcontainer_workspace.devcontainer.on_create_command {
-            Some(LifecycleCommand::String(cmd)) => {
-                let wrapped_cmd = self.wrap_once_lifecycle_command(
-                    &devcontainer_workspace,
-                    cmd,
-                    "onCreateCommand",
-                );
-                self.runtime.exec(
-                    handle.as_ref(),
-                    vec!["bash", "-c", "-i", &wrapped_cmd],
-                    &[],
-                    false,
-                    true,
-                )?
-            }
-            Some(LifecycleCommand::Array(cmds)) => cmds.iter().try_for_each(|c| {
-                let wrapped_cmd =
-                    self.wrap_once_lifecycle_command(&devcontainer_workspace, c, "onCreateCommand");
-                self.runtime.exec(
-                    handle.as_ref(),
-                    vec!["bash", "-c", "-i", &wrapped_cmd],
-                    &[],
-                    false,
-                    true,
-                )
-            })?,
-            Some(LifecycleCommand::Object(map)) => map.values().try_for_each(|cmd| {
-                let cmd_str = cmd.to_command_string();
-                let wrapped_cmd = self.wrap_once_lifecycle_command(
-                    &devcontainer_workspace,
-                    &cmd_str,
-                    "onCreateCommand",
-                );
-                self.runtime.exec(
-                    handle.as_ref(),
-                    vec!["bash", "-c", "-i", &wrapped_cmd],
-                    &[],
-                    false,
-                    true,
-                )
-            })?,
-            None => { /* No onCreateCommand specified */ }
-        };
+        if let Some(command) = &devcontainer_workspace.devcontainer.on_create_command {
+            self.run_lifecycle_command(
+                handle.as_ref(),
+                &devcontainer_workspace,
+                command,
+                "onCreateCommand",
+                false,
+                true,
+            )?;
+        }
 
         // Fix file permissions on gpg agent socket
         if gpg_agent_mounted {
@@ -1666,52 +1633,16 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
             }
         }
 
-        match &devcontainer_workspace.devcontainer.post_create_command {
-            Some(LifecycleCommand::String(cmd)) => {
-                let wrapped_cmd = self.wrap_once_lifecycle_command(
-                    &devcontainer_workspace,
-                    cmd,
-                    "postCreateCommand",
-                );
-                self.runtime.exec(
-                    handle.as_ref(),
-                    vec!["bash", "-c", "-i", &wrapped_cmd],
-                    &[],
-                    false,
-                    true,
-                )?
-            }
-            Some(LifecycleCommand::Array(cmds)) => cmds.iter().try_for_each(|c| {
-                let wrapped_cmd = self.wrap_once_lifecycle_command(
-                    &devcontainer_workspace,
-                    c,
-                    "postCreateCommand",
-                );
-                self.runtime.exec(
-                    handle.as_ref(),
-                    vec!["bash", "-c", "-i", &wrapped_cmd],
-                    &[],
-                    false,
-                    true,
-                )
-            })?,
-            Some(LifecycleCommand::Object(map)) => map.values().try_for_each(|cmd| {
-                let cmd_str = cmd.to_command_string();
-                let wrapped_cmd = self.wrap_once_lifecycle_command(
-                    &devcontainer_workspace,
-                    &cmd_str,
-                    "postCreateCommand",
-                );
-                self.runtime.exec(
-                    handle.as_ref(),
-                    vec!["bash", "-c", "-i", &wrapped_cmd],
-                    &[],
-                    false,
-                    true,
-                )
-            })?,
-            None => { /* No onCreateCommand specified */ }
-        };
+        if let Some(command) = &devcontainer_workspace.devcontainer.post_create_command {
+            self.run_lifecycle_command(
+                handle.as_ref(),
+                &devcontainer_workspace,
+                command,
+                "postCreateCommand",
+                false,
+                true,
+            )?;
+        }
 
         // Check if feature has entrypoint script which should start now
         processed_features
@@ -1735,40 +1666,16 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
                 Ok(())
             })?;
 
-        match &devcontainer_workspace.devcontainer.post_start_command {
-            Some(LifecycleCommand::String(cmd)) => {
-                let wrapped_cmd = self.wrap_lifecycle_command(&devcontainer_workspace, cmd);
-                self.runtime.exec(
-                    handle.as_ref(),
-                    vec!["bash", "-c", "-i", &wrapped_cmd],
-                    &[],
-                    false,
-                    true,
-                )?
-            }
-            Some(LifecycleCommand::Array(cmds)) => cmds.iter().try_for_each(|c| {
-                let wrapped_cmd = self.wrap_lifecycle_command(&devcontainer_workspace, c);
-                self.runtime.exec(
-                    handle.as_ref(),
-                    vec!["bash", "-c", "-i", &wrapped_cmd],
-                    &[],
-                    false,
-                    true,
-                )
-            })?,
-            Some(LifecycleCommand::Object(map)) => map.values().try_for_each(|cmd| {
-                let cmd_str = cmd.to_command_string();
-                let wrapped_cmd = self.wrap_lifecycle_command(&devcontainer_workspace, &cmd_str);
-                self.runtime.exec(
-                    handle.as_ref(),
-                    vec!["bash", "-c", "-i", &wrapped_cmd],
-                    &[],
-                    false,
-                    true,
-                )
-            })?,
-            None => { /* No onCreateCommand specified */ }
-        };
+        if let Some(command) = &devcontainer_workspace.devcontainer.post_start_command {
+            self.run_lifecycle_command(
+                handle.as_ref(),
+                &devcontainer_workspace,
+                command,
+                "postStartCommand",
+                false,
+                true,
+            )?;
+        }
 
         Ok(handle.id().to_string())
     }
@@ -1898,40 +1805,16 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
             }
         }
 
-        match &devcontainer_workspace.devcontainer.post_attach_command {
-            Some(LifecycleCommand::String(cmd)) => {
-                let wrapped_cmd = self.wrap_lifecycle_command(&devcontainer_workspace, cmd);
-                self.runtime.exec(
-                    handle,
-                    vec!["bash", "-c", "-i", &wrapped_cmd],
-                    &[],
-                    false,
-                    true,
-                )?
-            }
-            Some(LifecycleCommand::Array(cmds)) => cmds.iter().try_for_each(|c| {
-                let wrapped_cmd = self.wrap_lifecycle_command(&devcontainer_workspace, c);
-                self.runtime.exec(
-                    handle,
-                    vec!["bash", "-c", "-i", &wrapped_cmd],
-                    &[],
-                    false,
-                    true,
-                )
-            })?,
-            Some(LifecycleCommand::Object(map)) => map.values().try_for_each(|cmd| {
-                let cmd_str = cmd.to_command_string();
-                let wrapped_cmd = self.wrap_lifecycle_command(&devcontainer_workspace, &cmd_str);
-                self.runtime.exec(
-                    handle,
-                    vec!["bash", "-c", "-i", &wrapped_cmd],
-                    &[],
-                    false,
-                    true,
-                )
-            })?,
-            None => { /* No postAttachCommand specified */ }
-        };
+        if let Some(command) = &devcontainer_workspace.devcontainer.post_attach_command {
+            self.run_lifecycle_command(
+                handle,
+                &devcontainer_workspace,
+                command,
+                "postAttachCommand",
+                false,
+                true,
+            )?;
+        }
 
         self.runtime.exec(
             handle,
@@ -2276,6 +2159,152 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
         cmd.to_string()
     }
 
+    fn lifecycle_marker_path(marker_name: &str) -> String {
+        format!("/var/lib/devcon/lifecycle-markers/{}", marker_name)
+    }
+
+    fn lifecycle_marker_exists(
+        &self,
+        handle: &dyn crate::driver::runtime::ContainerHandle,
+        marker_name: &str,
+    ) -> bool {
+        let marker = Self::lifecycle_marker_path(marker_name);
+        self.runtime
+            .exec(
+                handle,
+                vec!["sudo", "test", "-f", &marker],
+                &[],
+                false,
+                false,
+            )
+            .is_ok()
+    }
+
+    fn create_lifecycle_marker(
+        &self,
+        handle: &dyn crate::driver::runtime::ContainerHandle,
+        marker_name: &str,
+    ) -> Result<()> {
+        let marker = Self::lifecycle_marker_path(marker_name);
+        let marker_dir = "/var/lib/devcon/lifecycle-markers";
+
+        self.runtime.exec(
+            handle,
+            vec!["sudo", "mkdir", "-p", marker_dir],
+            &[],
+            false,
+            false,
+        )?;
+        self.runtime
+            .exec(handle, vec!["sudo", "touch", &marker], &[], false, false)?;
+
+        Ok(())
+    }
+
+    fn exec_shell_lifecycle_command(
+        &self,
+        handle: &dyn crate::driver::runtime::ContainerHandle,
+        devcontainer_workspace: &Workspace,
+        cmd: &str,
+        env_vars: &[String],
+        attach_stdin: bool,
+        attach_stdout: bool,
+    ) -> Result<()> {
+        let wrapped_cmd = self.wrap_lifecycle_command(devcontainer_workspace, cmd);
+        self.runtime.exec(
+            handle,
+            vec!["bash", "-c", "-i", &wrapped_cmd],
+            env_vars,
+            attach_stdin,
+            attach_stdout,
+        )
+    }
+
+    fn exec_argv_lifecycle_command(
+        &self,
+        handle: &dyn crate::driver::runtime::ContainerHandle,
+        cmd: &[String],
+        env_vars: &[String],
+        attach_stdin: bool,
+        attach_stdout: bool,
+    ) -> Result<()> {
+        let args: Vec<&str> = cmd.iter().map(String::as_str).collect();
+        self.runtime
+            .exec(handle, args, env_vars, attach_stdin, attach_stdout)
+    }
+
+    fn exec_lifecycle_value(
+        &self,
+        handle: &dyn crate::driver::runtime::ContainerHandle,
+        devcontainer_workspace: &Workspace,
+        value: &LifecycleCommandValue,
+        env_vars: &[String],
+        attach_stdin: bool,
+        attach_stdout: bool,
+    ) -> Result<()> {
+        match value {
+            LifecycleCommandValue::String(cmd) => self.exec_shell_lifecycle_command(
+                handle,
+                devcontainer_workspace,
+                cmd,
+                env_vars,
+                attach_stdin,
+                attach_stdout,
+            ),
+            LifecycleCommandValue::Array(cmd) => {
+                self.exec_argv_lifecycle_command(handle, cmd, env_vars, attach_stdin, attach_stdout)
+            }
+        }
+    }
+
+    fn run_lifecycle_command(
+        &self,
+        handle: &dyn crate::driver::runtime::ContainerHandle,
+        devcontainer_workspace: &Workspace,
+        command: &LifecycleCommand,
+        marker_name: &str,
+        attach_stdin: bool,
+        attach_stdout: bool,
+    ) -> Result<()> {
+        if self.lifecycle_marker_exists(handle, marker_name) {
+            return Ok(());
+        }
+
+        match command {
+            LifecycleCommand::String(cmd) => self.exec_shell_lifecycle_command(
+                handle,
+                devcontainer_workspace,
+                cmd,
+                &[],
+                attach_stdin,
+                attach_stdout,
+            )?,
+            LifecycleCommand::Array(cmd) => {
+                self.exec_argv_lifecycle_command(handle, cmd, &[], attach_stdin, attach_stdout)?
+            }
+            LifecycleCommand::Object(map) => {
+                // Parallel object execution is a future enhancement.
+                // Preserve direct argv execution for array values, but run the
+                // object entries sequentially for now.
+                let mut entries: Vec<_> = map.iter().collect();
+                entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+                for (_, value) in entries {
+                    self.exec_lifecycle_value(
+                        handle,
+                        devcontainer_workspace,
+                        value,
+                        &[],
+                        attach_stdin,
+                        attach_stdout,
+                    )?;
+                }
+            }
+        }
+
+        self.create_lifecycle_marker(handle, marker_name)
+    }
+
     /// Wraps a shell command string so it runs at most once inside the container,
     /// guarded by a marker file at `/var/lib/devcon/lifecycle-markers/{marker_name}`.
     ///
@@ -2289,20 +2318,6 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
             "MARKER='{}'; if [ ! -f \"$MARKER\" ]; then {}; sudo mkdir -p \"$(dirname \"$MARKER\")\" && sudo touch \"$MARKER\"; fi",
             marker, cmd
         )
-    }
-
-    /// Wraps a lifecycle command with environment setup and a once-only marker guard.
-    ///
-    /// Combines `wrap_lifecycle_command` (environment/cwd) with `guard_with_marker`
-    /// (run-once semantics).
-    fn wrap_once_lifecycle_command(
-        &self,
-        devcontainer_workspace: &Workspace,
-        cmd: &str,
-        hook_name: &str,
-    ) -> String {
-        let inner = self.wrap_lifecycle_command(devcontainer_workspace, cmd);
-        Self::guard_with_marker(&inner, hook_name)
     }
 }
 
@@ -2579,74 +2594,9 @@ mod tests {
     }
 
     #[test]
-    fn test_wrap_once_lifecycle_command_contains_marker_path() {
-        use crate::config::Config;
-        use crate::driver::runtime::docker::DockerRuntime;
-        use std::fs;
-        use tempfile::TempDir;
-
-        let temp_dir = TempDir::new().unwrap();
-        fs::create_dir(temp_dir.path().join(".devcontainer")).unwrap();
-        fs::write(
-            temp_dir.path().join(".devcontainer/devcontainer.json"),
-            r#"{"image": "ubuntu:22.04"}"#,
-        )
-        .unwrap();
-        let workspace = Workspace::try_from(temp_dir.path().to_path_buf()).unwrap();
-        let driver = ContainerDriver::new(
-            Config::default(),
-            Box::new(DockerRuntime::new(DockerRuntimeConfig::default())),
-        );
-
-        let result =
-            driver.wrap_once_lifecycle_command(&workspace, "npm install", "onCreateCommand");
-
-        assert!(
-            result.contains("/var/lib/devcon/lifecycle-markers/onCreateCommand"),
-            "marker path missing: {result}"
-        );
-        assert!(result.contains("if [ ! -f"), "missing if guard: {result}");
-        assert!(result.contains("touch"), "missing touch: {result}");
-        assert!(
-            result.contains("npm install"),
-            "inner command missing: {result}"
-        );
-    }
-
-    #[test]
-    fn test_wrap_once_lifecycle_command_hook_name_in_marker() {
-        use crate::config::Config;
-        use crate::driver::runtime::docker::DockerRuntime;
-        use std::fs;
-        use tempfile::TempDir;
-
-        let temp_dir = TempDir::new().unwrap();
-        fs::create_dir(temp_dir.path().join(".devcontainer")).unwrap();
-        fs::write(
-            temp_dir.path().join(".devcontainer/devcontainer.json"),
-            r#"{"image": "ubuntu:22.04"}"#,
-        )
-        .unwrap();
-        let workspace = Workspace::try_from(temp_dir.path().to_path_buf()).unwrap();
-        let driver = ContainerDriver::new(
-            Config::default(),
-            Box::new(DockerRuntime::new(DockerRuntimeConfig::default())),
-        );
-
-        let oncreate = driver.wrap_once_lifecycle_command(&workspace, "echo hi", "onCreateCommand");
-        let postcreate =
-            driver.wrap_once_lifecycle_command(&workspace, "echo hi", "postCreateCommand");
-
-        assert!(
-            oncreate.contains("lifecycle-markers/onCreateCommand"),
-            "onCreateCommand marker missing"
-        );
-        assert!(
-            postcreate.contains("lifecycle-markers/postCreateCommand"),
-            "postCreateCommand marker missing"
-        );
-        // Markers must be distinct
-        assert_ne!(oncreate, postcreate);
+    fn test_lifecycle_marker_path_contains_marker_name() {
+        let marker = ContainerDriver::lifecycle_marker_path("onCreateCommand");
+        assert_eq!(marker, "/var/lib/devcon/lifecycle-markers/onCreateCommand");
     }
 
     #[test]
@@ -2697,36 +2647,6 @@ mod tests {
 
         let home = ContainerDriver::extract_home_from_inspect(&inspect);
         assert_eq!(home.as_deref(), Some("/home/node"));
-    }
-
-    #[test]
-    fn test_wrap_once_lifecycle_command_marker_created_only_on_success() {
-        use crate::config::Config;
-        use crate::driver::runtime::docker::DockerRuntime;
-        use std::fs;
-        use tempfile::TempDir;
-
-        let temp_dir = TempDir::new().unwrap();
-        fs::create_dir(temp_dir.path().join(".devcontainer")).unwrap();
-        fs::write(
-            temp_dir.path().join(".devcontainer/devcontainer.json"),
-            r#"{"image": "ubuntu:22.04"}"#,
-        )
-        .unwrap();
-        let workspace = Workspace::try_from(temp_dir.path().to_path_buf()).unwrap();
-        let driver = ContainerDriver::new(
-            Config::default(),
-            Box::new(DockerRuntime::new(DockerRuntimeConfig::default())),
-        );
-
-        let result = driver.wrap_once_lifecycle_command(&workspace, "false", "onCreateCommand");
-
-        // The touch must come after && so it only runs when the command succeeds
-        let touch_pos = result.find("touch").expect("touch not found");
-        let and_pos = result[..touch_pos]
-            .rfind("&&")
-            .expect("&& before touch not found");
-        assert!(and_pos < touch_pos, "&& must precede touch");
     }
 
     #[test]

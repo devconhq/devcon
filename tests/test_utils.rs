@@ -30,9 +30,10 @@ pub fn runtime_cmd(runtime: Runtime) -> &'static str {
 /// Check if a runtime is available
 pub fn is_runtime_available(runtime: Runtime) -> bool {
     Command::new(runtime_cmd(runtime))
-        .arg("--version")
+        .arg("info")
         .output()
-        .is_ok()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
 /// Create an empty test config file in a temp directory
@@ -109,8 +110,8 @@ pub fn create_test_devcontainer_with_dockerfile(name: &str, dockerfile_content: 
 pub fn create_test_devcontainer_with_hooks(
     name: &str,
     image: &str,
-    on_create: Option<&str>,
-    post_create: Option<&str>,
+    on_create: Option<serde_json::Value>,
+    post_create: Option<serde_json::Value>,
 ) -> TempDir {
     let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
     let devcontainer_path = temp_dir.path().join(".devcontainer");
@@ -122,11 +123,11 @@ pub fn create_test_devcontainer_with_hooks(
     });
 
     if let Some(cmd) = on_create {
-        config["onCreateCommand"] = serde_json::json!(cmd);
+        config["onCreateCommand"] = cmd;
     }
 
     if let Some(cmd) = post_create {
-        config["postCreateCommand"] = serde_json::json!(cmd);
+        config["postCreateCommand"] = cmd;
     }
 
     let container_content =

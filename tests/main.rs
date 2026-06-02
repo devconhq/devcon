@@ -1,6 +1,7 @@
 mod test_utils;
 
 use assert_cmd::cargo::cargo_bin_cmd;
+use serde_json::json;
 use test_utils::*;
 
 #[test]
@@ -218,8 +219,8 @@ fn test_build_with_lifecycle_hooks() {
     let temp_dir = create_test_devcontainer_with_hooks(
         "test-hooks",
         "mcr.microsoft.com/devcontainers/base:ubuntu",
-        Some("echo 'onCreate executed'"),
-        Some("echo 'postCreate executed'"),
+        Some(json!("echo 'onCreate executed'")),
+        Some(json!("echo 'postCreate executed'")),
     );
 
     let mut cmd = cargo_bin_cmd!("devcon");
@@ -242,6 +243,129 @@ fn test_build_with_lifecycle_hooks() {
         stdout,
         stderr
     );
+}
+
+#[test]
+fn test_up_on_create_array_command_executes_without_shell_joining() {
+    let runtime = get_runtime();
+    if !is_runtime_available(runtime) {
+        println!("Skipping test: {:?} runtime not available", runtime);
+        return;
+    }
+
+    cleanup_test_artifacts(runtime, "test-array-hook");
+    let test_config = create_test_config();
+    let temp_dir = create_test_devcontainer_with_hooks(
+        "test-array-hook",
+        "mcr.microsoft.com/devcontainers/base:ubuntu",
+        Some(json!(["touch", "/tmp/devcon-array-&&-literal"])),
+        None,
+    );
+
+    let mut cmd = cargo_bin_cmd!("devcon");
+    let result = cmd
+        .arg("--config")
+        .arg(&test_config)
+        .arg("--output")
+        .arg("json")
+        .arg("up")
+        .arg(temp_dir.path().to_str().unwrap())
+        .output();
+
+    assert!(result.is_ok(), "Failed to execute up command");
+    let output = result.unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "Up command failed.\nStdout: {}\nStderr: {}",
+        stdout,
+        stderr
+    );
+
+    let output_json =
+        serde_json::from_str::<serde_json::Value>(&stdout).expect("Output is not valid JSON");
+    let container_id = output_json["container_id"]
+        .as_str()
+        .expect("Output JSON does not contain container_id");
+
+    let file_check = exec_in_container(
+        runtime,
+        container_id,
+        &["test", "-f", "/tmp/devcon-array-&&-literal"],
+    );
+    assert!(
+        file_check.is_ok(),
+        "Array lifecycle command should be passed through as literal argv, not shell text"
+    );
+
+    drop(temp_dir);
+}
+
+#[test]
+fn test_up_on_create_object_array_values_execute_directly() {
+    let runtime = get_runtime();
+    if !is_runtime_available(runtime) {
+        println!("Skipping test: {:?} runtime not available", runtime);
+        return;
+    }
+
+    cleanup_test_artifacts(runtime, "test-object-hook");
+    let test_config = create_test_config();
+    let temp_dir = create_test_devcontainer_with_hooks(
+        "test-object-hook",
+        "mcr.microsoft.com/devcontainers/base:ubuntu",
+        Some(json!({
+            "first": ["touch", "/tmp/devcon-object-first-&&-literal"],
+            "second": ["touch", "/tmp/devcon-object-second-&&-literal"]
+        })),
+        None,
+    );
+
+    let mut cmd = cargo_bin_cmd!("devcon");
+    let result = cmd
+        .arg("--config")
+        .arg(&test_config)
+        .arg("--output")
+        .arg("json")
+        .arg("up")
+        .arg(temp_dir.path().to_str().unwrap())
+        .output();
+
+    assert!(result.is_ok(), "Failed to execute up command");
+    let output = result.unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "Up command failed.\nStdout: {}\nStderr: {}",
+        stdout,
+        stderr
+    );
+
+    let output_json =
+        serde_json::from_str::<serde_json::Value>(&stdout).expect("Output is not valid JSON");
+    let container_id = output_json["container_id"]
+        .as_str()
+        .expect("Output JSON does not contain container_id");
+
+    for path in [
+        "/tmp/devcon-object-first-&&-literal",
+        "/tmp/devcon-object-second-&&-literal",
+    ] {
+        let file_check = exec_in_container(runtime, container_id, &["test", "-f", path]);
+        assert!(
+            file_check.is_ok(),
+            "Object lifecycle array value should execute directly for path {}",
+            path
+        );
+    }
+
+    drop(temp_dir);
 }
 
 #[test]

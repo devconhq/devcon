@@ -43,13 +43,3 @@ pub enum LifecycleCommandValue {
     String(String),
     Array(Vec<String>),
 }
-
-impl LifecycleCommandValue {
-    /// Convert to a shell command string.
-    pub fn to_command_string(&self) -> String {
-        match self {
-            LifecycleCommandValue::String(s) => s.clone(),
-            LifecycleCommandValue::Array(arr) => arr.join(" && "),
-        }
-    }
-}
