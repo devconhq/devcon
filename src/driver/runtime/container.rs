@@ -234,254 +234,41 @@ impl ContainerCliRuntime {
         Self { config }
     }
 
-    fn probe_image_env_var_inner(image_tag: &str, key: &str) -> Option<String> {
-        let shell_probe = format!("printf '%s' \"${{{}}}\"", key);
-        let shell_probes: [Vec<&str>; 4] = [
-            vec![
-                "run",
-                "--rm",
-                "--entrypoint",
-                "sh",
-                image_tag,
-                "-lc",
-                &shell_probe,
-            ],
-            vec![
-                "run",
-                "--rm",
-                "--entrypoint",
-                "/bin/sh",
-                image_tag,
-                "-lc",
-                &shell_probe,
-            ],
-            vec![
-                "run",
-                "--rm",
-                "--entrypoint",
-                "bash",
-                image_tag,
-                "-lc",
-                &shell_probe,
-            ],
-            vec![
-                "run",
-                "--rm",
-                "--entrypoint",
-                "/bin/bash",
-                image_tag,
-                "-lc",
-                &shell_probe,
-            ],
-        ];
-
-        for probe in shell_probes {
-            let output = Command::new("container").args(probe).output().ok()?;
-
-            if !output.status.success() {
-                continue;
+    fn probe_image_info_inner(
+        image_tag: &str,
+        user: Option<&str>,
+    ) -> Option<super::ContainerProbeInfo> {
+        const PROBE_CMD: &str = "printf '%s\\n%s\\n%s' \"$(id -un)\" \"$HOME\" \"$PATH\"";
+        let shells = ["sh", "/bin/sh", "bash", "/bin/bash"];
+        for shell in shells {
+            let mut cmd = Command::new("container");
+            cmd.arg("run").arg("--rm");
+            if let Some(u) = user {
+                cmd.arg("--user").arg(u);
             }
-
-            let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !value.is_empty() {
-                return Some(value);
-            }
-        }
-
-        let env_entrypoints = ["env", "/usr/bin/env", "/bin/env"];
-        for entrypoint in env_entrypoints {
-            let output = Command::new("container")
-                .arg("run")
-                .arg("--rm")
-                .arg("--entrypoint")
-                .arg(entrypoint)
+            cmd.arg("--entrypoint")
+                .arg(shell)
                 .arg(image_tag)
-                .output()
-                .ok()?;
+                .arg("-lc")
+                .arg(PROBE_CMD);
 
+            let output = cmd.output().ok()?;
             if !output.status.success() {
                 continue;
             }
-
-            let prefix = format!("{}=", key);
-            if let Some(value) = String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .find_map(|line| line.strip_prefix(&prefix).map(str::trim))
-                .filter(|value| !value.is_empty())
-            {
-                return Some(value.to_string());
-            }
-        }
-
-        None
-    }
-
-    /// Extracts `remoteUser` from the `devcontainer.metadata` OCI label embedded in the image.
-    ///
-    /// The container runtime's inspect JSON uses both lowercase (`config.labels`) and
-    /// Docker-style (`Config.Labels`) key names — we check both.
-    fn remote_user_from_metadata_label(inspect: &serde_json::Value) -> Option<String> {
-        let label_str = inspect
-            .get("Config")
-            .or_else(|| inspect.get("config"))
-            .and_then(|v| v.get("Labels").or_else(|| v.get("labels")))
-            .and_then(|v| v.get("devcontainer.metadata"))
-            .and_then(|v| v.as_str())?;
-
-        let entries: serde_json::Value = serde_json::from_str(label_str).ok()?;
-        entries.as_array()?.iter().rev().find_map(|entry| {
-            entry
-                .get("remoteUser")
-                .and_then(|u| u.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(ToString::to_string)
-        })
-    }
-
-    /// Probes the home directory of `user` by running a throwaway container.
-    fn probe_home_for_user(image_tag: &str, user: &str) -> Option<String> {
-        let probe_cmd = "printf '%s' \"$HOME\"";
-        let probes: [Vec<&str>; 2] = [
-            vec![
-                "run",
-                "--rm",
-                "--user",
-                user,
-                "--entrypoint",
-                "sh",
-                image_tag,
-                "-lc",
-                probe_cmd,
-            ],
-            vec![
-                "run",
-                "--rm",
-                "--user",
-                user,
-                "--entrypoint",
-                "/bin/sh",
-                image_tag,
-                "-lc",
-                probe_cmd,
-            ],
-        ];
-
-        for probe in probes {
-            let output = Command::new("container").args(probe).output().ok()?;
-            if !output.status.success() {
-                continue;
-            }
-            let home = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !home.is_empty() {
-                return Some(home);
-            }
-        }
-
-        None
-    }
-
-    /// Returns the conventional home directory path for `user`.
-    fn default_home_for_user(user: &str) -> String {
-        if user == "root" {
-            "/root".to_string()
-        } else {
-            format!("/home/{}", user)
-        }
-    }
-
-    fn metadata_user(inspect: &serde_json::Value) -> Option<String> {
-        // The devcontainer.metadata OCI label takes precedence over config.user / Config.User.
-        Self::remote_user_from_metadata_label(inspect)
-            .or_else(|| {
-                inspect
-                    .get("config")
-                    .and_then(|v| v.get("user"))
-                    .and_then(|v| v.as_str())
-                    .map(str::trim)
-                    .filter(|v| !v.is_empty())
-                    .map(ToString::to_string)
-            })
-            .or_else(|| {
-                inspect
-                    .get("Config")
-                    .and_then(|v| v.get("User"))
-                    .and_then(|v| v.as_str())
-                    .map(str::trim)
-                    .filter(|v| !v.is_empty())
-                    .map(ToString::to_string)
-            })
-    }
-
-    fn metadata_home(inspect: &serde_json::Value) -> Option<String> {
-        let env_arrays = [
-            inspect
-                .get("config")
-                .and_then(|v| v.get("env"))
-                .and_then(|v| v.as_array()),
-            inspect
-                .get("Config")
-                .and_then(|v| v.get("Env"))
-                .and_then(|v| v.as_array()),
-        ];
-
-        for envs in env_arrays.into_iter().flatten() {
-            if let Some(home) = envs.iter().find_map(|v| {
-                let env = v.as_str()?;
-                env.strip_prefix("HOME=")
-                    .map(str::trim)
-                    .filter(|h| !h.is_empty())
-                    .map(ToString::to_string)
-            }) {
-                return Some(home);
-            }
-        }
-
-        None
-    }
-
-    fn probe_image_user_and_home(image_tag: &str) -> Option<(String, String)> {
-        let probe_cmd = "id -un; printf '\n'; printf '%s' \"$HOME\"";
-        let probes: [Vec<&str>; 2] = [
-            vec![
-                "run",
-                "--rm",
-                "--entrypoint",
-                "sh",
-                image_tag,
-                "-lc",
-                probe_cmd,
-            ],
-            vec![
-                "run",
-                "--rm",
-                "--entrypoint",
-                "/bin/sh",
-                image_tag,
-                "-lc",
-                probe_cmd,
-            ],
-        ];
-
-        for probe in probes {
-            let output = Command::new("container").args(probe).output().ok();
-            let Some(output) = output else {
-                continue;
-            };
-
-            if !output.status.success() {
-                continue;
-            }
-
             let stdout = String::from_utf8_lossy(&output.stdout);
             let mut lines = stdout.lines();
-            let user = lines.next().unwrap_or_default().trim().to_string();
+            let probe_user = lines.next().unwrap_or_default().trim().to_string();
             let home = lines.next().unwrap_or_default().trim().to_string();
-            if !user.is_empty() && !home.is_empty() {
-                return Some((user, home));
+            let path = lines.next().unwrap_or_default().trim().to_string();
+            if !probe_user.is_empty() {
+                return Some(super::ContainerProbeInfo {
+                    user: probe_user,
+                    home,
+                    path,
+                });
             }
         }
-
         None
     }
 
@@ -980,42 +767,7 @@ impl ContainerRuntime for ContainerCliRuntime {
             return Ok(None);
         }
 
-        let mut inspect: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-
-        let has_valid_user = Self::metadata_user(&inspect).is_some();
-        let has_valid_home = Self::metadata_home(&inspect).is_some();
-
-        if let serde_json::Value::Object(ref mut map) = inspect
-            && (!has_valid_user || !has_valid_home)
-            && let Some((user, home)) = Self::probe_image_user_and_home(image_tag)
-        {
-            map.insert(
-                "_devconDetectedUser".to_string(),
-                serde_json::Value::String(user),
-            );
-            map.insert(
-                "_devconDetectedHome".to_string(),
-                serde_json::Value::String(home),
-            );
-        }
-
-        // The devcontainer.metadata label is authoritative for the remote user.
-        // Override whatever the probe detected so that images with Config.User=root
-        // but a metadata label remoteUser resolve to the correct user and home.
-        if let Some(label_user) = Self::remote_user_from_metadata_label(&inspect)
-            && let serde_json::Value::Object(ref mut map) = inspect
-        {
-            let home = Self::probe_home_for_user(image_tag, &label_user)
-                .unwrap_or_else(|| Self::default_home_for_user(&label_user));
-            map.insert(
-                "_devconDetectedUser".to_string(),
-                serde_json::Value::String(label_user),
-            );
-            map.insert(
-                "_devconDetectedHome".to_string(),
-                serde_json::Value::String(home),
-            );
-        }
+        let inspect: serde_json::Value = serde_json::from_slice(&output.stdout)?;
 
         Ok(Some(inspect))
     }
@@ -1033,8 +785,12 @@ impl ContainerRuntime for ContainerCliRuntime {
         Ok(value)
     }
 
-    fn probe_image_env_var(&self, image_tag: &str, key: &str) -> Result<Option<String>> {
-        Ok(Self::probe_image_env_var_inner(image_tag, key))
+    fn probe_image_info(
+        &self,
+        image_tag: &str,
+        user: Option<&str>,
+    ) -> Result<Option<super::ContainerProbeInfo>> {
+        Ok(Self::probe_image_info_inner(image_tag, user))
     }
 
     fn get_host_address(&self) -> String {
