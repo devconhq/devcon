@@ -1423,18 +1423,9 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
             .iter()
             .any(|f| f.feature.privileged.unwrap_or(false));
 
-        // Process environment variables
-        let mut processed_env_vars = Vec::new();
-
-        for env_var in env_variables {
-            if env_var.contains("=") {
-                processed_env_vars.push(env_var.clone());
-            } else {
-                // Read host env variable
-                let host_value = std::env::var(env_var).unwrap_or_default();
-                processed_env_vars.push(format!("{}={}", env_var, host_value));
-            }
-        }
+        // Compose the startup environment from feature defaults and user-config overrides.
+        let mut processed_env_vars =
+            Self::compose_start_environment(&processed_features, env_variables);
 
         // Add environment variables for agent forwarding
         if ssh_agent_mounted {
@@ -1832,6 +1823,37 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
         )?;
 
         Ok(())
+    }
+
+    fn compose_start_environment(
+        processed_features: &[FeatureProcessResult],
+        env_variables: &[String],
+    ) -> Vec<String> {
+        let mut merged_env = HashMap::new();
+
+        // Feature-provided containerEnv values form the startup baseline.
+        for feature_result in processed_features {
+            if let Some(feature_env) = &feature_result.feature.container_env {
+                for (key, value) in feature_env {
+                    merged_env.insert(key.clone(), value.clone());
+                }
+            }
+        }
+
+        // Explicit env vars passed to start override feature defaults.
+        for env_var in env_variables {
+            if let Some((key, value)) = env_var.split_once('=') {
+                merged_env.insert(key.to_string(), value.to_string());
+            } else {
+                let host_value = std::env::var(env_var).unwrap_or_default();
+                merged_env.insert(env_var.clone(), host_value);
+            }
+        }
+
+        merged_env
+            .into_iter()
+            .map(|(key, value)| format!("{}={}", key, value))
+            .collect()
     }
 
     /// Returns the Docker image tag for this container.
@@ -2354,6 +2376,7 @@ mod tests {
     use crate::devcontainer::{FeatureRegistry, FeatureRegistryType, FeatureSource};
     use crate::driver::runtime::docker::DockerRuntime;
     use crate::feature::Feature;
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
     fn create_test_feature_result(id: &str) -> FeatureProcessResult {
@@ -2400,6 +2423,53 @@ mod tests {
             feature,
             path: PathBuf::from(format!("/tmp/{}", id)),
         }
+    }
+
+    fn env_vec_to_map(env_vars: Vec<String>) -> HashMap<String, String> {
+        env_vars
+            .into_iter()
+            .filter_map(|entry| {
+                entry
+                    .split_once('=')
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_compose_start_environment_includes_feature_container_env() {
+        let mut feature_a = create_test_feature_result("feature-a");
+        feature_a.feature.container_env = Some(HashMap::from([
+            ("GOPATH".to_string(), "/go".to_string()),
+            ("PATH".to_string(), "/usr/local/go/bin:${PATH}".to_string()),
+        ]));
+
+        let env = ContainerDriver::compose_start_environment(&[feature_a], &[]);
+        let env_map = env_vec_to_map(env);
+
+        assert_eq!(env_map.get("GOPATH"), Some(&"/go".to_string()));
+        assert_eq!(
+            env_map.get("PATH"),
+            Some(&"/usr/local/go/bin:${PATH}".to_string())
+        );
+    }
+
+    #[test]
+    fn test_compose_start_environment_config_overrides_feature_values() {
+        let mut feature_a = create_test_feature_result("feature-a");
+        feature_a.feature.container_env = Some(HashMap::from([(
+            "PATH".to_string(),
+            "/feature/bin".to_string(),
+        )]));
+
+        let env = ContainerDriver::compose_start_environment(
+            &[feature_a],
+            &["PATH=/config/bin".to_string(), "FOO=bar".to_string()],
+        );
+        let env_map = env_vec_to_map(env);
+
+        assert_eq!(env_map.get("PATH"), Some(&"/config/bin".to_string()));
+        assert_eq!(env_map.get("FOO"), Some(&"bar".to_string()));
     }
 
     #[test]
