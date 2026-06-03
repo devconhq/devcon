@@ -1,0 +1,345 @@
+// MIT License
+//
+// Copyright (c) 2025 DevCon Contributors
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+//! # Agent Socket Helpers
+//!
+//! Detection and management of forwarded agent sockets (SSH, GPG, GitHub CLI)
+//! and related utilities used during container start.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use tracing::{debug, info, warn};
+
+use crate::devcontainer::ForwardPort;
+use crate::error::Error;
+
+/// Detects the SSH agent socket path from the environment.
+///
+/// Attempts to find the SSH agent socket using the SSH_AUTH_SOCK environment variable.
+/// Validates that the socket file exists on the filesystem.
+///
+/// # Returns
+///
+/// Returns `Some(PathBuf)` with the socket path if found and valid, `None` otherwise.
+pub(crate) fn detect_ssh_socket() -> Option<PathBuf> {
+    let socket_path = std::env::var("SSH_AUTH_SOCK").ok()?;
+    let path = PathBuf::from(&socket_path);
+
+    if path.exists() {
+        debug!("Detected SSH agent socket at: {}", socket_path);
+        Some(path)
+    } else {
+        warn!(
+            "SSH_AUTH_SOCK is set to '{}' but socket does not exist",
+            socket_path
+        );
+        None
+    }
+}
+
+/// Detects the GPG agent socket path using gpgconf.
+///
+/// Attempts to find the GPG agent socket by running `gpgconf --list-dir agent-socket`.
+/// If the socket doesn't exist but GPG is configured, attempts to start the GPG agent.
+/// Validates that the socket file exists on the filesystem.
+///
+/// # Returns
+///
+/// Returns `Some(PathBuf)` with the socket path if found and valid, `None` otherwise.
+pub(crate) fn detect_gpg_socket() -> Option<PathBuf> {
+    let output = std::process::Command::new("gpgconf")
+        .arg("--list-dir")
+        .arg("agent-socket")
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        debug!("gpgconf command failed, GPG agent socket not detected");
+        return None;
+    }
+
+    let socket_path = String::from_utf8(output.stdout).ok()?;
+    let socket_path = socket_path.trim();
+    let path = PathBuf::from(socket_path);
+
+    if path.exists() {
+        debug!("Detected GPG agent socket at: {}", socket_path);
+        return Some(path);
+    }
+
+    // Socket doesn't exist - try to start the GPG agent
+    debug!(
+        "GPG socket not found at {}, attempting to start agent",
+        socket_path
+    );
+
+    let launch_result = std::process::Command::new("gpgconf")
+        .arg("--launch")
+        .arg("gpg-agent")
+        .status();
+
+    match launch_result {
+        Ok(status) if status.success() => {
+            info!("Started GPG agent");
+
+            // Wait briefly for socket to appear
+            std::thread::sleep(std::time::Duration::from_millis(500));
+
+            if path.exists() {
+                info!("GPG agent socket now available at: {}", socket_path);
+                return Some(path);
+            } else {
+                warn!("GPG agent started but socket not found at {}", socket_path);
+            }
+        }
+        Ok(_) => {
+            debug!("Failed to start GPG agent (non-zero exit)");
+        }
+        Err(e) => {
+            debug!("Failed to launch GPG agent: {}", e);
+        }
+    }
+
+    // Final check failed
+    warn!("GPG agent socket not available at {}", socket_path);
+    None
+}
+
+/// Detects the GitHub CLI configuration directory path.
+///
+/// Attempts to find the GitHub CLI config directory at `~/.config/gh`.
+/// Validates that the directory exists and contains a `hosts.yml` file.
+///
+/// # Returns
+///
+/// Returns `Some(PathBuf)` with the config directory path if found and valid, `None` otherwise.
+pub(crate) fn detect_gh_config() -> Option<PathBuf> {
+    let home_dir = std::env::var("HOME").ok()?;
+    let gh_config_dir = PathBuf::from(home_dir).join(".config").join("gh");
+
+    if !gh_config_dir.exists() {
+        debug!(
+            "GitHub CLI config directory not found at {:?}",
+            gh_config_dir
+        );
+        return None;
+    }
+
+    // Check if hosts.yml exists (this is where auth tokens are stored)
+    let hosts_file = gh_config_dir.join("hosts.yml");
+    if !hosts_file.exists() {
+        debug!("GitHub CLI hosts.yml not found, may not be authenticated");
+        return None;
+    }
+
+    debug!("Detected GitHub CLI config at: {:?}", gh_config_dir);
+    Some(gh_config_dir)
+}
+
+pub(crate) fn extract_container_port(port: &ForwardPort) -> Option<u16> {
+    match port {
+        ForwardPort::Port(p) => Some(*p),
+        ForwardPort::HostPort(mapping) => mapping.split(':').nth(1).and_then(|s| s.parse().ok()),
+    }
+}
+
+pub(crate) fn ensure_ssh_port_forwarded(ports: &mut Vec<ForwardPort>, ssh_port: u16) {
+    let has_ssh = ports
+        .iter()
+        .filter_map(extract_container_port)
+        .any(|container_port| container_port == ssh_port);
+
+    if !has_ssh {
+        ports.push(ForwardPort::Port(ssh_port));
+    }
+}
+
+pub(crate) fn shell_single_quote(input: &str) -> String {
+    input.replace('\'', "'\"'\"'")
+}
+
+pub(crate) fn detect_public_ssh_key() -> Option<String> {
+    if let Ok(value) = std::env::var("DEVCON_SSH_PUBLIC_KEY") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    let home = dirs::home_dir()?;
+    let candidates = ["id_ed25519.pub", "id_ecdsa.pub", "id_rsa.pub", "id_dsa.pub"];
+
+    for candidate in candidates {
+        let path = home.join(".ssh").join(candidate);
+        let content = match fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+        let trimmed = content.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    None
+}
+
+pub(crate) fn is_transient_agent_mount_start_error(error: &Error) -> bool {
+    let Error::Runtime(message) = error else {
+        return false;
+    };
+
+    let lower = message.to_ascii_lowercase();
+
+    let mount_related = lower.contains("error mounting")
+        || lower.contains("mount src=")
+        || lower.contains(" mount ");
+    let agent_related = lower.contains("/ssh-agent")
+        || lower.contains("s.gpg-agent")
+        || lower.contains("ssh_auth_sock")
+        || lower.contains("/run/devcon-agents");
+    let missing_or_invalid_source =
+        lower.contains("not a directory") || lower.contains("no such file or directory");
+
+    mount_related && agent_related && missing_or_invalid_source
+}
+
+/// Returns the path to the stable agent socket directory, creating it if necessary.
+///
+/// The directory `$HOME/.local/share/devcon/agent-sockets` survives reboots, unlike
+/// the ephemeral macOS launchd socket directories. Devcon keeps symlinks inside this
+/// directory that point to the current real socket paths, refreshed on every `start`.
+pub(crate) fn agent_socket_stable_dir() -> Option<PathBuf> {
+    let dir = dirs::home_dir()?.join(".local/share/devcon/agent-sockets");
+    if let Err(e) = fs::create_dir_all(&dir) {
+        warn!("Failed to create agent socket stable dir {:?}: {}", dir, e);
+        return None;
+    }
+    Some(dir)
+}
+
+/// Creates or atomically replaces the symlink `stable_dir/link_name → target`.
+///
+/// Returns `true` on success. On failure, logs a warning and returns `false` so
+/// callers can fall back to a direct socket bind-mount.
+pub(crate) fn update_agent_socket_symlink(
+    stable_dir: &Path,
+    link_name: &str,
+    target: &Path,
+) -> bool {
+    use std::os::unix::fs::symlink;
+    let link_path = stable_dir.join(link_name);
+    // No-op when the symlink already points to the correct target.
+    if fs::read_link(&link_path).is_ok_and(|existing| existing == target) {
+        debug!("Agent socket symlink {:?} already up-to-date", link_path);
+        return true;
+    }
+    // Remove any existing file or symlink (ignore ENOENT).
+    let _ = fs::remove_file(&link_path);
+    match symlink(target, &link_path) {
+        Ok(()) => {
+            debug!(
+                "Updated agent socket symlink {:?} → {:?}",
+                link_path, target
+            );
+            true
+        }
+        Err(e) => {
+            warn!(
+                "Failed to create agent socket symlink {:?} → {:?}: {}",
+                link_path, target, e
+            );
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::Error;
+
+    #[test]
+    fn test_is_transient_agent_mount_start_error_matches_stale_ssh_mount() {
+        let err =
+            Error::Runtime("error mounting: /ssh-agent: no such file or directory".to_string());
+        assert!(is_transient_agent_mount_start_error(&err));
+    }
+
+    #[test]
+    fn test_is_transient_agent_mount_start_error_ignores_unrelated_start_error() {
+        let err = Error::Runtime("permission denied opening file".to_string());
+        assert!(!is_transient_agent_mount_start_error(&err));
+    }
+
+    #[test]
+    fn test_is_transient_agent_mount_start_error_matches_stable_dir_missing() {
+        let err = Error::Runtime(
+            "error mounting: mount src=/run/devcon-agents not a directory".to_string(),
+        );
+        assert!(is_transient_agent_mount_start_error(&err));
+    }
+
+    #[test]
+    fn test_update_agent_socket_symlink_creates_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.sock");
+        std::fs::write(&target, b"").unwrap();
+
+        let stable = tempfile::tempdir().unwrap();
+        let result = update_agent_socket_symlink(stable.path(), "ssh-agent", &target);
+        assert!(result);
+        assert!(stable.path().join("ssh-agent").exists());
+    }
+
+    #[test]
+    fn test_update_agent_socket_symlink_replaces_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_target = dir.path().join("old.sock");
+        let new_target = dir.path().join("new.sock");
+        std::fs::write(&old_target, b"").unwrap();
+        std::fs::write(&new_target, b"").unwrap();
+
+        let stable = tempfile::tempdir().unwrap();
+        update_agent_socket_symlink(stable.path(), "ssh-agent", &old_target);
+        let result = update_agent_socket_symlink(stable.path(), "ssh-agent", &new_target);
+        assert!(result);
+
+        let link = std::fs::read_link(stable.path().join("ssh-agent")).unwrap();
+        assert_eq!(link, new_target);
+    }
+
+    #[test]
+    fn test_update_agent_socket_symlink_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.sock");
+        std::fs::write(&target, b"").unwrap();
+
+        let stable = tempfile::tempdir().unwrap();
+        update_agent_socket_symlink(stable.path(), "ssh-agent", &target);
+        let result = update_agent_socket_symlink(stable.path(), "ssh-agent", &target);
+        assert!(result);
+        let link = std::fs::read_link(stable.path().join("ssh-agent")).unwrap();
+        assert_eq!(link, target);
+    }
+}

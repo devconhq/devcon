@@ -21,7 +21,11 @@
 // SOFTWARE.
 
 pub mod agent;
-pub mod container;
+pub mod agent_socket;
 pub mod control_server;
+pub mod dockerfile;
+pub mod environment;
 pub mod feature_process;
+pub mod lifecycle;
+pub mod orchestrator;
 pub mod runtime;
