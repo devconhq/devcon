@@ -1466,6 +1466,18 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
             }
         }
 
+        let evaluated_path = processed_env_vars
+            .iter()
+            .rev()
+            .find_map(|entry| {
+                entry
+                    .split_once('=')
+                    .and_then(|(key, value)| (key == "PATH").then(|| value.to_string()))
+            })
+            .or_else(|| base_container_env.get("PATH").cloned())
+            .unwrap_or_else(|| "<unset>".to_string());
+        debug!("Evaluated container PATH before start: {}", evaluated_path);
+
         debug!("Starting container with ports: {:?}", ports);
 
         let image_arch = self
@@ -1833,38 +1845,54 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
     fn base_container_environment(&self, image_tag: &str) -> HashMap<String, String> {
         let mut env = HashMap::new();
 
-        let inspect = match self.runtime.inspect_image(image_tag) {
-            Ok(Some(inspect)) => inspect,
-            Ok(None) => return env,
+        match self.runtime.inspect_image(image_tag) {
+            Ok(Some(inspect)) => {
+                if let Some(config) = inspect.get("Config").or_else(|| inspect.get("config"))
+                    && let Some(entries) = config.get("Env").or_else(|| config.get("env"))
+                    && let Some(entries) = entries.as_array()
+                {
+                    for entry in entries {
+                        let Some(raw) = entry.as_str() else {
+                            continue;
+                        };
+                        let Some((key, value)) = raw.split_once('=') else {
+                            continue;
+                        };
+                        env.insert(key.to_string(), value.to_string());
+                    }
+                }
+            }
+            Ok(None) => {
+                debug!(
+                    "Image '{}' could not be inspected before PATH probing; using probe only",
+                    image_tag
+                );
+            }
             Err(err) => {
                 warn!(
                     "Failed to inspect image '{}' for base container environment: {}",
                     image_tag, err
                 );
-                return env;
             }
-        };
+        }
 
-        let Some(config) = inspect.get("Config").or_else(|| inspect.get("config")) else {
-            return env;
-        };
-
-        let Some(entries) = config.get("Env").or_else(|| config.get("env")) else {
-            return env;
-        };
-
-        let Some(entries) = entries.as_array() else {
-            return env;
-        };
-
-        for entry in entries {
-            let Some(raw) = entry.as_str() else {
-                continue;
-            };
-            let Some((key, value)) = raw.split_once('=') else {
-                continue;
-            };
-            env.insert(key.to_string(), value.to_string());
+        match self.runtime.probe_image_env_var(image_tag, "PATH") {
+            Ok(Some(path)) => {
+                debug!("Probed PATH from image runtime: {}", path);
+                env.insert("PATH".to_string(), path);
+            }
+            Ok(None) => {
+                debug!(
+                    "Could not probe PATH from image runtime for '{}'; falling back to inspected PATH if present",
+                    image_tag
+                );
+            }
+            Err(err) => {
+                warn!(
+                    "Failed to probe PATH from image '{}' via runtime: {}",
+                    image_tag, err
+                );
+            }
         }
 
         env

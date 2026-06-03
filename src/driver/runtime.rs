@@ -421,6 +421,16 @@ pub trait ContainerRuntime: Send {
     /// is not set.
     fn image_label(&self, image_tag: &str, label_key: &str) -> Result<Option<String>>;
 
+    /// Probe a single environment variable by running a temporary container from the image.
+    ///
+    /// This is useful when image inspect metadata lacks values that are initialized at runtime.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(Some(value))` if the variable was successfully read, `Ok(None)` if probing failed
+    /// or the value is not set.
+    fn probe_image_env_var(&self, image_tag: &str, key: &str) -> Result<Option<String>>;
+
     /// Get the host address for the runtime.
     ///
     /// This is used to configure containers to connect back to the host.

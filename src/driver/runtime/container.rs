@@ -234,6 +234,88 @@ impl ContainerCliRuntime {
         Self { config }
     }
 
+    fn probe_image_env_var_inner(image_tag: &str, key: &str) -> Option<String> {
+        let shell_probe = format!("printf '%s' \"${{{}}}\"", key);
+        let shell_probes: [Vec<&str>; 4] = [
+            vec![
+                "run",
+                "--rm",
+                "--entrypoint",
+                "sh",
+                image_tag,
+                "-lc",
+                &shell_probe,
+            ],
+            vec![
+                "run",
+                "--rm",
+                "--entrypoint",
+                "/bin/sh",
+                image_tag,
+                "-lc",
+                &shell_probe,
+            ],
+            vec![
+                "run",
+                "--rm",
+                "--entrypoint",
+                "bash",
+                image_tag,
+                "-lc",
+                &shell_probe,
+            ],
+            vec![
+                "run",
+                "--rm",
+                "--entrypoint",
+                "/bin/bash",
+                image_tag,
+                "-lc",
+                &shell_probe,
+            ],
+        ];
+
+        for probe in shell_probes {
+            let output = Command::new("container").args(probe).output().ok()?;
+
+            if !output.status.success() {
+                continue;
+            }
+
+            let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+
+        let env_entrypoints = ["env", "/usr/bin/env", "/bin/env"];
+        for entrypoint in env_entrypoints {
+            let output = Command::new("container")
+                .arg("run")
+                .arg("--rm")
+                .arg("--entrypoint")
+                .arg(entrypoint)
+                .arg(image_tag)
+                .output()
+                .ok()?;
+
+            if !output.status.success() {
+                continue;
+            }
+
+            let prefix = format!("{}=", key);
+            if let Some(value) = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .find_map(|line| line.strip_prefix(&prefix).map(str::trim))
+                .filter(|value| !value.is_empty())
+            {
+                return Some(value.to_string());
+            }
+        }
+
+        None
+    }
+
     /// Extracts `remoteUser` from the `devcontainer.metadata` OCI label embedded in the image.
     ///
     /// The container runtime's inspect JSON uses both lowercase (`config.labels`) and
@@ -949,6 +1031,10 @@ impl ContainerRuntime for ContainerCliRuntime {
             .and_then(|v| v.as_str())
             .map(ToString::to_string);
         Ok(value)
+    }
+
+    fn probe_image_env_var(&self, image_tag: &str, key: &str) -> Result<Option<String>> {
+        Ok(Self::probe_image_env_var_inner(image_tag, key))
     }
 
     fn get_host_address(&self) -> String {
