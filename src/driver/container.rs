@@ -866,7 +866,7 @@ FROM dotfiles_setup
 USER {{ remote_user }}
 WORKDIR /workspaces/{{ workspace_name }}
 ENTRYPOINT [ "/bin/sh" ]
-CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sleep 1 \u0026 wait $!; do :; done", "-"]
+CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\nif command -v sleep >/dev/null 2>&1; then\n  while sleep 1 \u0026 wait $!; do :; done\nelif command -v tail >/dev/null 2>&1; then\n  tail -f /dev/null\nelse\n  while :; do ( : ) \u0026 wait $!; done\nfi", "-"]
 "#,
         )?;
 
@@ -1424,8 +1424,13 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
             .any(|f| f.feature.privileged.unwrap_or(false));
 
         // Compose the startup environment from feature defaults and user-config overrides.
-        let mut processed_env_vars =
-            Self::compose_start_environment(&processed_features, env_variables);
+        let base_container_env = self.base_container_environment(&latest_tag);
+        let mut processed_env_vars = Self::compose_start_environment(
+            &processed_features,
+            devcontainer_workspace.devcontainer.container_env.as_ref(),
+            env_variables,
+            &base_container_env,
+        );
 
         // Add environment variables for agent forwarding
         if ssh_agent_mounted {
@@ -1825,27 +1830,121 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nwhile sle
         Ok(())
     }
 
+    fn base_container_environment(&self, image_tag: &str) -> HashMap<String, String> {
+        let mut env = HashMap::new();
+
+        let inspect = match self.runtime.inspect_image(image_tag) {
+            Ok(Some(inspect)) => inspect,
+            Ok(None) => return env,
+            Err(err) => {
+                warn!(
+                    "Failed to inspect image '{}' for base container environment: {}",
+                    image_tag, err
+                );
+                return env;
+            }
+        };
+
+        let Some(config) = inspect.get("Config").or_else(|| inspect.get("config")) else {
+            return env;
+        };
+
+        let Some(entries) = config.get("Env").or_else(|| config.get("env")) else {
+            return env;
+        };
+
+        let Some(entries) = entries.as_array() else {
+            return env;
+        };
+
+        for entry in entries {
+            let Some(raw) = entry.as_str() else {
+                continue;
+            };
+            let Some((key, value)) = raw.split_once('=') else {
+                continue;
+            };
+            env.insert(key.to_string(), value.to_string());
+        }
+
+        env
+    }
+
+    fn resolve_container_env_value(
+        raw_value: &str,
+        merged_env: &HashMap<String, String>,
+        host_env: &HashMap<String, String>,
+    ) -> String {
+        let mut resolved = String::new();
+        let mut index = 0;
+
+        while let Some(rel_start) = raw_value[index..].find("${") {
+            let start = index + rel_start;
+            resolved.push_str(&raw_value[index..start]);
+
+            let after_start = start + 2;
+            let Some(rel_end) = raw_value[after_start..].find('}') else {
+                resolved.push_str(&raw_value[start..]);
+                return resolved;
+            };
+            let end = after_start + rel_end;
+
+            let token = &raw_value[after_start..end];
+            let replacement = if let Some(name) = token.strip_prefix("containerEnv:") {
+                merged_env.get(name).cloned().unwrap_or_default()
+            } else if let Some(name) = token.strip_prefix("localEnv:") {
+                host_env.get(name).cloned().unwrap_or_default()
+            } else {
+                merged_env.get(token).cloned().unwrap_or_default()
+            };
+
+            resolved.push_str(&replacement);
+            index = end + 1;
+        }
+
+        resolved.push_str(&raw_value[index..]);
+        resolved
+    }
+
+    fn merge_container_env_map(
+        merged_env: &mut HashMap<String, String>,
+        source_env: &HashMap<String, String>,
+        host_env: &HashMap<String, String>,
+    ) {
+        for (key, value) in source_env {
+            let resolved = Self::resolve_container_env_value(value, merged_env, host_env);
+            merged_env.insert(key.clone(), resolved);
+        }
+    }
+
     fn compose_start_environment(
         processed_features: &[FeatureProcessResult],
+        devcontainer_container_env: Option<&HashMap<String, String>>,
         env_variables: &[String],
+        base_container_env: &HashMap<String, String>,
     ) -> Vec<String> {
-        let mut merged_env = HashMap::new();
+        let mut merged_env = base_container_env.clone();
+        let host_env: HashMap<String, String> = std::env::vars().collect();
 
-        // Feature-provided containerEnv values form the startup baseline.
+        // Feature-provided containerEnv values are merged first in feature order.
         for feature_result in processed_features {
             if let Some(feature_env) = &feature_result.feature.container_env {
-                for (key, value) in feature_env {
-                    merged_env.insert(key.clone(), value.clone());
-                }
+                Self::merge_container_env_map(&mut merged_env, feature_env, &host_env);
             }
         }
 
-        // Explicit env vars passed to start override feature defaults.
+        // Devcontainer containerEnv overrides feature defaults.
+        if let Some(container_env) = devcontainer_container_env {
+            Self::merge_container_env_map(&mut merged_env, container_env, &host_env);
+        }
+
+        // Explicit env vars passed to start override prior values.
         for env_var in env_variables {
             if let Some((key, value)) = env_var.split_once('=') {
-                merged_env.insert(key.to_string(), value.to_string());
+                let resolved = Self::resolve_container_env_value(value, &merged_env, &host_env);
+                merged_env.insert(key.to_string(), resolved);
             } else {
-                let host_value = std::env::var(env_var).unwrap_or_default();
+                let host_value = host_env.get(env_var).cloned().unwrap_or_default();
                 merged_env.insert(env_var.clone(), host_value);
             }
         }
@@ -2444,13 +2543,15 @@ mod tests {
             ("PATH".to_string(), "/usr/local/go/bin:${PATH}".to_string()),
         ]));
 
-        let env = ContainerDriver::compose_start_environment(&[feature_a], &[]);
+        let base_env = HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
+
+        let env = ContainerDriver::compose_start_environment(&[feature_a], None, &[], &base_env);
         let env_map = env_vec_to_map(env);
 
         assert_eq!(env_map.get("GOPATH"), Some(&"/go".to_string()));
         assert_eq!(
             env_map.get("PATH"),
-            Some(&"/usr/local/go/bin:${PATH}".to_string())
+            Some(&"/usr/local/go/bin:/usr/bin:/bin".to_string())
         );
     }
 
@@ -2462,14 +2563,47 @@ mod tests {
             "/feature/bin".to_string(),
         )]));
 
+        let base_env = HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
+
         let env = ContainerDriver::compose_start_environment(
             &[feature_a],
+            None,
             &["PATH=/config/bin".to_string(), "FOO=bar".to_string()],
+            &base_env,
         );
         let env_map = env_vec_to_map(env);
 
         assert_eq!(env_map.get("PATH"), Some(&"/config/bin".to_string()));
         assert_eq!(env_map.get("FOO"), Some(&"bar".to_string()));
+    }
+
+    #[test]
+    fn test_compose_start_environment_devcontainer_container_env_overrides_feature_values() {
+        let mut feature_a = create_test_feature_result("feature-a");
+        feature_a.feature.container_env = Some(HashMap::from([(
+            "PATH".to_string(),
+            "/feature/bin:${PATH}".to_string(),
+        )]));
+
+        let devcontainer_env = HashMap::from([(
+            "PATH".to_string(),
+            "${containerEnv:PATH}:/workspace/bin".to_string(),
+        )]);
+
+        let base_env = HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
+
+        let env = ContainerDriver::compose_start_environment(
+            &[feature_a],
+            Some(&devcontainer_env),
+            &[],
+            &base_env,
+        );
+        let env_map = env_vec_to_map(env);
+
+        assert_eq!(
+            env_map.get("PATH"),
+            Some(&"/feature/bin:/usr/bin:/bin:/workspace/bin".to_string())
+        );
     }
 
     #[test]
