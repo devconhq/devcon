@@ -39,17 +39,42 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use tracing::{debug, error, info, warn};
 
-const MAX_HOST_PORT_ALLOCATION_ATTEMPTS: u16 = 5;
+const MIN_AUTO_HOST_PORT: u16 = 30001;
+const HOST_PORT_ALLOCATION_PICK_ATTEMPTS: usize = 128;
 
 fn allocate_host_listener(
     forwards: &HashMap<u16, ForwardEntry>,
     requested_local_port: u16,
     container_port: u16,
 ) -> Result<(u16, TcpListener)> {
-    for attempt in 0..MAX_HOST_PORT_ALLOCATION_ATTEMPTS {
-        let candidate_port = requested_local_port
-            .checked_add(attempt)
-            .ok_or_else(|| Error::new("Host port allocation overflow".to_string()))?;
+    allocate_host_listener_with_picker(forwards, requested_local_port, container_port, || {
+        let start_port = requested_local_port.max(MIN_AUTO_HOST_PORT);
+        openport::pick_unused_port(start_port..=u16::MAX)
+    })
+}
+
+fn allocate_host_listener_with_picker<F>(
+    forwards: &HashMap<u16, ForwardEntry>,
+    requested_local_port: u16,
+    container_port: u16,
+    mut picker: F,
+) -> Result<(u16, TcpListener)>
+where
+    F: FnMut() -> Option<u16>,
+{
+    for _ in 0..HOST_PORT_ALLOCATION_PICK_ATTEMPTS {
+        let candidate_port = match picker() {
+            Some(port) => port,
+            None => continue,
+        };
+
+        if candidate_port < MIN_AUTO_HOST_PORT {
+            debug!(
+                "Host port {} below minimum {}, trying next",
+                candidate_port, MIN_AUTO_HOST_PORT
+            );
+            continue;
+        }
 
         if forwards.contains_key(&candidate_port) {
             debug!(
@@ -77,8 +102,8 @@ fn allocate_host_listener(
     }
 
     Err(Error::new(format!(
-        "Failed to allocate a host port for container port {} after {} attempts starting at {}",
-        container_port, MAX_HOST_PORT_ALLOCATION_ATTEMPTS, requested_local_port
+        "Failed to allocate a host port for container port {} after {} attempts (requested local port: {})",
+        container_port, HOST_PORT_ALLOCATION_PICK_ATTEMPTS, requested_local_port
     )))
 }
 
@@ -660,33 +685,6 @@ pub fn start_control_server(port: u16, output: OutputFormat) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ops::RangeInclusive;
-
-    fn reserve_consecutive_ports(count: usize) -> (u16, Vec<TcpListener>) {
-        let max_start = u16::MAX - count as u16;
-        for start in 20000..=max_start {
-            let mut listeners = Vec::with_capacity(count);
-            let mut ok = true;
-            for port in RangeInclusive::new(start, start + count as u16 - 1) {
-                match TcpListener::bind(("0.0.0.0", port)) {
-                    Ok(listener) => listeners.push(listener),
-                    Err(_) => {
-                        ok = false;
-                        break;
-                    }
-                }
-            }
-
-            if ok {
-                return (start, listeners);
-            }
-        }
-
-        panic!(
-            "failed to reserve {} consecutive host ports for test",
-            count
-        );
-    }
 
     fn stream_pair() -> (Arc<Mutex<TcpStream>>, Arc<Mutex<TcpStream>>) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind pair listener");
@@ -698,36 +696,33 @@ mod tests {
 
     #[test]
     fn allocate_host_listener_uses_next_port_when_requested_is_busy() {
-        let (start, mut listeners) = reserve_consecutive_ports(2);
-        // Keep start busy, make start+1 available.
-        let next = listeners.pop();
-        assert!(next.is_some());
-
         let forwards: HashMap<u16, ForwardEntry> = HashMap::new();
+        let mut picks = vec![Some(20000), Some(35001)].into_iter();
         let (allocated, _listener) =
-            allocate_host_listener(&forwards, start, 3000).expect("allocate host listener");
+            allocate_host_listener_with_picker(&forwards, 3000, 3000, || picks.next().flatten())
+                .expect("allocate host listener");
 
         assert!(
-            allocated > start,
-            "expected allocation to increment off busy port"
+            allocated >= MIN_AUTO_HOST_PORT,
+            "allocation should use high host ports"
         );
-        assert!(
-            allocated <= start + (MAX_HOST_PORT_ALLOCATION_ATTEMPTS - 1),
-            "allocation should stay within retry window"
-        );
+        assert_eq!(allocated, 35001);
     }
 
     #[test]
-    fn allocate_host_listener_fails_after_five_attempts() {
-        let (start, _listeners) =
-            reserve_consecutive_ports(MAX_HOST_PORT_ALLOCATION_ATTEMPTS as usize);
+    fn allocate_host_listener_fails_after_picker_exhaustion() {
         let forwards: HashMap<u16, ForwardEntry> = HashMap::new();
+        let mut picks = std::iter::repeat_n(None, HOST_PORT_ALLOCATION_PICK_ATTEMPTS + 1);
 
-        let err = allocate_host_listener(&forwards, start, 3000)
-            .expect_err("allocation should fail when five consecutive ports are busy");
+        let err =
+            allocate_host_listener_with_picker(&forwards, 3000, 3000, || picks.next().flatten())
+                .expect_err("allocation should fail when picker cannot provide ports");
 
         assert!(
-            err.to_string().contains("after 5 attempts"),
+            err.to_string().contains(&format!(
+                "after {} attempts",
+                HOST_PORT_ALLOCATION_PICK_ATTEMPTS
+            )),
             "unexpected error: {err}"
         );
     }
