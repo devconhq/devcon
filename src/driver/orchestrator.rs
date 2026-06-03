@@ -22,12 +22,12 @@
 
 //! # Container Driver
 //!
-//! This module provides the `ContainerDriver` for building and managing
+//! This module provides the `ContainerOrchestrator` for building and managing
 //! development container lifecycles.
 //!
 //! ## Overview
 //!
-//! The `ContainerDriver` handles:
+//! The `ContainerOrchestrator` handles:
 //! - Building container images from devcontainer configurations
 //! - Generating Dockerfiles with feature installations
 //! - Starting containers with appropriate volume mounts
@@ -37,14 +37,14 @@
 //! ```no_run
 //! use devcon::config::{Config, DockerRuntimeConfig};
 //! use devcon::workspace::Workspace;
-//! use devcon::driver::container::ContainerDriver;
+//! use devcon::driver::container::ContainerOrchestrator;
 //! use devcon::driver::runtime::docker::DockerRuntime;
 //! use std::path::PathBuf;
 //!
 //! # fn example() -> devcon::error::Result<()> {
 //! let config = Config::load(None)?;
 //! let runtime = Box::new(DockerRuntime::new(DockerRuntimeConfig::default()));
-//! let driver = ContainerDriver::new(config, runtime);
+//! let driver = ContainerOrchestrator::new(config, runtime);
 //!
 //! let workspace = Workspace::try_from(PathBuf::from("/path/to/project"))?;
 //!
@@ -58,319 +58,40 @@
 //! ```
 
 use std::collections::HashMap;
-use std::fs::{self, File};
-use std::path::Path;
+use std::fs;
+use std::path::PathBuf;
 
 use crate::error::{Error, Result};
 use dialoguer::Select;
 use dialoguer::theme::ColorfulTheme;
-use minijinja::Environment;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
-use tracing::{Level, debug, info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::devcontainer::{
-    FeatureRef, FeatureSource, LifecycleCommandValue, resolve_context_path, resolve_dockerfile_path,
+    FeatureRef, FeatureSource, resolve_context_path, resolve_dockerfile_path,
 };
 use crate::driver::agent::{self, AgentConfig};
+use crate::driver::agent_socket::{
+    agent_socket_stable_dir, detect_gh_config, detect_gpg_socket, detect_public_ssh_key,
+    detect_ssh_socket, ensure_ssh_port_forwarded, is_transient_agent_mount_start_error,
+    shell_single_quote, update_agent_socket_symlink,
+};
+use crate::driver::dockerfile::{BuildContext, DockerfileParams, apply_feature_order_override};
+use crate::driver::environment::{base_container_environment, compose_start_environment};
 use crate::driver::feature_process::FeatureProcessResult;
+use crate::driver::lifecycle::{guard_with_marker, run_lifecycle_command};
 use crate::driver::runtime::{ContainerImageInfo, ContainerProbeInfo, RuntimeParameters};
 use crate::{
-    config::Config, devcontainer::LifecycleCommand, driver::feature_process::process_features,
-    driver::runtime::ContainerRuntime, workspace::Workspace,
+    config::Config, driver::feature_process::process_features, driver::runtime::ContainerRuntime,
+    workspace::Workspace,
 };
-use std::path::PathBuf;
-
-/// Detects the SSH agent socket path from the environment.
-///
-/// Attempts to find the SSH agent socket using the SSH_AUTH_SOCK environment variable.
-/// Validates that the socket file exists on the filesystem.
-///
-/// # Returns
-///
-/// Returns `Some(PathBuf)` with the socket path if found and valid, `None` otherwise.
-fn detect_ssh_socket() -> Option<PathBuf> {
-    let socket_path = std::env::var("SSH_AUTH_SOCK").ok()?;
-    let path = PathBuf::from(&socket_path);
-
-    if path.exists() {
-        debug!("Detected SSH agent socket at: {}", socket_path);
-        Some(path)
-    } else {
-        warn!(
-            "SSH_AUTH_SOCK is set to '{}' but socket does not exist",
-            socket_path
-        );
-        None
-    }
-}
-
-/// Detects the GPG agent socket path using gpgconf.
-///
-/// Attempts to find the GPG agent socket by running `gpgconf --list-dir agent-socket`.
-/// If the socket doesn't exist but GPG is configured, attempts to start the GPG agent.
-/// Validates that the socket file exists on the filesystem.
-///
-/// # Returns
-///
-/// Returns `Some(PathBuf)` with the socket path if found and valid, `None` otherwise.
-fn detect_gpg_socket() -> Option<PathBuf> {
-    let output = std::process::Command::new("gpgconf")
-        .arg("--list-dir")
-        .arg("agent-socket")
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        debug!("gpgconf command failed, GPG agent socket not detected");
-        return None;
-    }
-
-    let socket_path = String::from_utf8(output.stdout).ok()?;
-    let socket_path = socket_path.trim();
-    let path = PathBuf::from(socket_path);
-
-    if path.exists() {
-        debug!("Detected GPG agent socket at: {}", socket_path);
-        return Some(path);
-    }
-
-    // Socket doesn't exist - try to start the GPG agent
-    debug!(
-        "GPG socket not found at {}, attempting to start agent",
-        socket_path
-    );
-
-    let launch_result = std::process::Command::new("gpgconf")
-        .arg("--launch")
-        .arg("gpg-agent")
-        .status();
-
-    match launch_result {
-        Ok(status) if status.success() => {
-            info!("Started GPG agent");
-
-            // Wait briefly for socket to appear
-            std::thread::sleep(std::time::Duration::from_millis(500));
-
-            if path.exists() {
-                info!("GPG agent socket now available at: {}", socket_path);
-                return Some(path);
-            } else {
-                warn!("GPG agent started but socket not found at {}", socket_path);
-            }
-        }
-        Ok(_) => {
-            debug!("Failed to start GPG agent (non-zero exit)");
-        }
-        Err(e) => {
-            debug!("Failed to launch GPG agent: {}", e);
-        }
-    }
-
-    // Final check failed
-    warn!("GPG agent socket not available at {}", socket_path);
-    None
-}
-
-/// Detects the GitHub CLI configuration directory path.
-///
-/// Attempts to find the GitHub CLI config directory at `~/.config/gh`.
-/// Validates that the directory exists and contains a `hosts.yml` file.
-///
-/// # Returns
-///
-/// Returns `Some(PathBuf)` with the config directory path if found and valid, `None` otherwise.
-fn detect_gh_config() -> Option<PathBuf> {
-    let home_dir = std::env::var("HOME").ok()?;
-    let gh_config_dir = PathBuf::from(home_dir).join(".config").join("gh");
-
-    if !gh_config_dir.exists() {
-        debug!(
-            "GitHub CLI config directory not found at {:?}",
-            gh_config_dir
-        );
-        return None;
-    }
-
-    // Check if hosts.yml exists (this is where auth tokens are stored)
-    let hosts_file = gh_config_dir.join("hosts.yml");
-    if !hosts_file.exists() {
-        debug!("GitHub CLI hosts.yml not found, may not be authenticated");
-        return None;
-    }
-
-    debug!("Detected GitHub CLI config at: {:?}", gh_config_dir);
-    Some(gh_config_dir)
-}
-
-fn extract_container_port(port: &crate::devcontainer::ForwardPort) -> Option<u16> {
-    use crate::devcontainer::ForwardPort;
-    match port {
-        ForwardPort::Port(p) => Some(*p),
-        ForwardPort::HostPort(mapping) => mapping.split(':').nth(1).and_then(|s| s.parse().ok()),
-    }
-}
-
-fn ensure_ssh_port_forwarded(ports: &mut Vec<crate::devcontainer::ForwardPort>, ssh_port: u16) {
-    let has_ssh = ports
-        .iter()
-        .filter_map(extract_container_port)
-        .any(|container_port| container_port == ssh_port);
-
-    if !has_ssh {
-        ports.push(crate::devcontainer::ForwardPort::Port(ssh_port));
-    }
-}
-
-fn shell_single_quote(input: &str) -> String {
-    input.replace('\'', "'\"'\"'")
-}
-
-fn detect_public_ssh_key() -> Option<String> {
-    if let Ok(value) = std::env::var("DEVCON_SSH_PUBLIC_KEY") {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
-        }
-    }
-
-    let home = dirs::home_dir()?;
-    let candidates = ["id_ed25519.pub", "id_ecdsa.pub", "id_rsa.pub", "id_dsa.pub"];
-
-    for candidate in candidates {
-        let path = home.join(".ssh").join(candidate);
-        let content = match fs::read_to_string(&path) {
-            Ok(content) => content,
-            Err(_) => continue,
-        };
-        let trimmed = content.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
-        }
-    }
-
-    None
-}
-
-fn is_transient_agent_mount_start_error(error: &Error) -> bool {
-    let Error::Runtime(message) = error else {
-        return false;
-    };
-
-    let lower = message.to_ascii_lowercase();
-
-    let mount_related = lower.contains("error mounting")
-        || lower.contains("mount src=")
-        || lower.contains(" mount ");
-    let agent_related = lower.contains("/ssh-agent")
-        || lower.contains("s.gpg-agent")
-        || lower.contains("ssh_auth_sock")
-        || lower.contains("/run/devcon-agents");
-    let missing_or_invalid_source =
-        lower.contains("not a directory") || lower.contains("no such file or directory");
-
-    mount_related && agent_related && missing_or_invalid_source
-}
-
-/// Returns the path to the stable agent socket directory, creating it if necessary.
-///
-/// The directory `$HOME/.local/share/devcon/agent-sockets` survives reboots, unlike
-/// the ephemeral macOS launchd socket directories. Devcon keeps symlinks inside this
-/// directory that point to the current real socket paths, refreshed on every `start`.
-fn agent_socket_stable_dir() -> Option<PathBuf> {
-    let dir = dirs::home_dir()?.join(".local/share/devcon/agent-sockets");
-    if let Err(e) = fs::create_dir_all(&dir) {
-        warn!("Failed to create agent socket stable dir {:?}: {}", dir, e);
-        return None;
-    }
-    Some(dir)
-}
-
-/// Creates or atomically replaces the symlink `stable_dir/link_name → target`.
-///
-/// Returns `true` on success. On failure, logs a warning and returns `false` so
-/// callers can fall back to a direct socket bind-mount.
-fn update_agent_socket_symlink(stable_dir: &Path, link_name: &str, target: &Path) -> bool {
-    use std::os::unix::fs::symlink;
-    let link_path = stable_dir.join(link_name);
-    // No-op when the symlink already points to the correct target.
-    if fs::read_link(&link_path).is_ok_and(|existing| existing == target) {
-        debug!("Agent socket symlink {:?} already up-to-date", link_path);
-        return true;
-    }
-    // Remove any existing file or symlink (ignore ENOENT).
-    let _ = fs::remove_file(&link_path);
-    match symlink(target, &link_path) {
-        Ok(()) => {
-            debug!(
-                "Updated agent socket symlink {:?} → {:?}",
-                link_path, target
-            );
-            true
-        }
-        Err(e) => {
-            warn!(
-                "Failed to create agent socket symlink {:?} → {:?}: {}",
-                link_path, target, e
-            );
-            false
-        }
-    }
-}
-
-/// Applies a manual override to the feature installation order.
-///
-/// Reorders features according to the specified feature IDs, keeping any
-/// features not mentioned in the override list at the end in their original order.
-///
-/// # Arguments
-///
-/// * `features` - The features in their dependency-sorted order
-/// * `override_order` - List of feature IDs specifying the desired order
-///
-/// # Returns
-///
-/// Reordered vector of features
-///
-/// # Errors
-///
-/// Returns an error if a feature ID in the override list is not found
-fn apply_feature_order_override(
-    features: Vec<FeatureProcessResult>,
-    override_order: &[String],
-) -> Result<Vec<FeatureProcessResult>> {
-    let mut ordered = Vec::new();
-    let mut remaining = features.clone();
-
-    // Process each ID in the override order
-    for feature_id in override_order {
-        if let Some(pos) = remaining.iter().position(|f| &f.feature.id == feature_id) {
-            ordered.push(remaining.remove(pos));
-        } else {
-            warn!(
-                "Feature '{}' specified in overrideFeatureInstallOrder not found",
-                feature_id
-            );
-        }
-    }
-
-    // Append any features not mentioned in the override order
-    ordered.extend(remaining);
-
-    debug!(
-        "Applied override order. Final feature order: {:?}",
-        ordered.iter().map(|f| &f.feature.id).collect::<Vec<_>>()
-    );
-
-    Ok(ordered)
-}
 
 /// Driver for managing container build and runtime operations.
 ///
 /// This struct encapsulates the logic for building container images
 /// and starting container instances based on devcontainer configurations.
-pub struct ContainerDriver {
+pub struct ContainerOrchestrator {
     config: Config,
     pub runtime: Box<dyn ContainerRuntime>,
     silent: bool,
@@ -385,18 +106,18 @@ struct ResolvedUsers {
     image_architecture: String,
 }
 
-impl ContainerDriver {
+impl ContainerOrchestrator {
     /// Creates a new container driver.
     ///
     /// # Examples
     ///
     /// ```no_run
-    /// # use devcon::driver::container::ContainerDriver;
+    /// # use devcon::driver::container::ContainerOrchestrator;
     /// # use devcon::config::{Config, DockerRuntimeConfig};
     /// # use devcon::driver::runtime::docker::DockerRuntime;
     /// let config = Config::load(None)?;
     /// let runtime = Box::new(DockerRuntime::new(DockerRuntimeConfig::default()));
-    /// let driver = ContainerDriver::new(config, runtime);
+    /// let driver = ContainerOrchestrator::new(config, runtime);
     /// # Ok::<(), devcon::error::Error>(())
     /// ```
     pub fn new(config: Config, runtime: Box<dyn ContainerRuntime>) -> Self {
@@ -606,13 +327,13 @@ impl ContainerDriver {
     /// ```no_run
     /// # use devcon::config::{Config, DockerRuntimeConfig};
     /// # use devcon::workspace::Workspace;
-    /// # use devcon::driver::container::ContainerDriver;
+    /// # use devcon::driver::container::ContainerOrchestrator;
     /// # use devcon::driver::runtime::docker::DockerRuntime;
     /// # use std::path::PathBuf;
     /// # fn example() -> devcon::error::Result<()> {
     /// let config = Config::load(None)?;
     /// let runtime = Box::new(DockerRuntime::new(DockerRuntimeConfig::default()));
-    /// let driver = ContainerDriver::new(config, runtime);
+    /// let driver = ContainerOrchestrator::new(config, runtime);
     /// let workspace = Workspace::try_from(PathBuf::from("/path/to/project"))?;
     ///
     /// driver.build(workspace, &["NODE_ENV=production".to_string()], None)?;
@@ -660,21 +381,10 @@ impl ContainerDriver {
         processed_features: Option<Vec<FeatureProcessResult>>,
         build_path: Option<PathBuf>,
     ) -> Result<()> {
-        let directory = match build_path {
-            Some(path) => {
-                std::fs::create_dir_all(&path)?;
-                TempDir::new_in(path)?
-            }
-            None => TempDir::new()?,
-        };
-        let directory_path = if tracing::event_enabled!(Level::DEBUG) {
-            directory.keep()
-        } else {
-            directory.path().to_path_buf()
-        };
+        let ctx = BuildContext::new(build_path)?;
         info!(
             "Building container in temporary directory: {}",
-            directory_path.to_string_lossy()
+            ctx.path().to_string_lossy()
         );
 
         trace!(
@@ -691,47 +401,7 @@ impl ContainerDriver {
             }
         };
 
-        let mut feature_install = String::new();
-
-        let mut i = 0;
-        for feature_result in processed_features {
-            let feature_path_name = self.copy_feature_to_build(&feature_result, &directory_path)?;
-            let feature_name = match &feature_result.feature_ref.source {
-                FeatureSource::Registry { registry } => &registry.name,
-                FeatureSource::Local { path } => &path
-                    .canonicalize()?
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .to_string(),
-            };
-            if i == 0 {
-                feature_install.push_str(&format!("FROM {} AS feature_0 \n", "base"));
-            } else {
-                feature_install.push_str(&format!("FROM feature_{} AS feature_{} \n", i - 1, i));
-            }
-            if let Some(env_vars) = &feature_result.feature.container_env {
-                for env_var in env_vars {
-                    feature_install.push_str(&format!("ENV {}={} \n", env_var.0, env_var.1));
-                }
-            }
-            feature_install.push_str(&format!(
-                "COPY {}/. /tmp/features/{}/ \n",
-                feature_path_name, feature_name
-            ));
-
-            feature_install.push_str(&format!(
-                "RUN chmod +x /tmp/features/{}/install.sh && . /tmp/features/{}/devcontainer-features.env && cd /tmp/features/{} && ./install.sh\n",
-                feature_name, feature_name, feature_name
-            ));
-
-            i += 1;
-        }
-        if i > 0 {
-            feature_install.push_str(&format!("FROM feature_{} AS feature_last \n", i - 1));
-        } else {
-            feature_install.push_str("FROM base AS feature_last \n");
-        }
+        let feature_install = ctx.generate_feature_install_snippet(&processed_features)?;
 
         // Add environment variables
         let mut env_setup = String::new();
@@ -739,40 +409,7 @@ impl ContainerDriver {
             env_setup.push_str(&format!("ENV {}\n", env_var));
         }
 
-        // Add dotfiles setup if repository is provided
-        let dotfiles_setup = {
-            let dotfiles_helper_path = directory_path.join("dotfiles_helper.sh");
-            let dotfiles_helper_content = r#"
-#!/bin/sh
-set -e
-cd && git clone $1 .dotfiles && cd .dotfiles
-if [ -n "$2" ]; then
-    chmod +x $2
-    ./$2 || true
-else
-    for f in install.sh setup.sh bootstrap.sh script/install.sh script/setup.sh script/bootstrap.sh
-    do
-        if [ -e $f ]
-        then
-            installCommand=$f
-            break
-        fi
-    done
-
-    if [ -n "$installCommand" ]; then
-        chmod +x $installCommand
-        ./$installCommand || true
-    fi
-fi
-"#;
-
-            fs::write(&dotfiles_helper_path, dotfiles_helper_content)?;
-            "COPY dotfiles_helper.sh /dotfiles_helper.sh \nRUN chmod +x /dotfiles_helper.sh"
-                .to_string()
-        };
-
-        let dockerfile = directory_path.join("Dockerfile");
-        File::create(&dockerfile)?;
+        let dotfiles_setup = ctx.write_dotfiles_helper()?;
 
         // Phase 1: Build user's Dockerfile if specified (otherwise use image)
         let base_image = if let Some(build_config) = &devcontainer_workspace.devcontainer.build {
@@ -881,55 +518,27 @@ fi
         };
 
         // Phase 2: Build features Dockerfile using base_image
-        let env = Environment::new();
-        let template = env.template_from_str(
-            r#"
-FROM {{ image }} AS base
-
-ENV DEVCON=true
-ENV DEVCON_WORKSPACE_NAME={{ workspace_name }}
-ENV _REMOTE_USER={{ remote_user }}
-ENV _CONTAINER_USER={{ container_user }}
-ENV _REMOTE_USER_HOME={{ remote_user_home }}
-ENV _CONTAINER_USER_HOME={{ container_user_home }}
-ENV DEVCON_CONTROL_HOST={{ runtime_host_address }}
-LABEL devcon.config-hash={{ config_hash }}
-LABEL devcon.image-architecture={{ image_architecture }}
-
-USER root
-RUN mkdir /tmp/features
-{{ feature_install }}
-{{ env_setup }}
-
-FROM feature_last AS dotfiles_setup
-{{ dotfiles_setup }}
-
-FROM dotfiles_setup
-USER {{ remote_user }}
-WORKDIR /workspaces/{{ workspace_name }}
-ENTRYPOINT [ "/bin/sh" ]
-CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\nif command -v sleep >/dev/null 2>&1; then\n  while sleep 1 \u0026 wait $!; do :; done\nelif command -v tail >/dev/null 2>&1; then\n  tail -f /dev/null\nelse\n  while :; do ( : ) \u0026 wait $!; done\nfi", "-"]
-"#,
-        )?;
-
         let config_hash = self.get_devcontainer_id(&devcontainer_workspace);
-
-        let contents = template.render(minijinja::context! {
-            image => &base_image,
-            remote_user => &resolved_users.remote_user,
-            container_user => &resolved_users.container_user,
-            remote_user_home => &resolved_users.remote_user_home,
-            container_user_home => &resolved_users.container_user_home,
-            feature_install => &feature_install,
-            dotfiles_setup => &dotfiles_setup,
-            env_setup => &env_setup,
-            workspace_name => devcontainer_workspace.path.file_name().unwrap().to_string_lossy(),
-            runtime_host_address => self.runtime.get_host_address(),
-            config_hash => &config_hash,
-            image_architecture => &resolved_users.image_architecture,
+        let workspace_name = devcontainer_workspace
+            .path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let dockerfile = ctx.write_dockerfile(&DockerfileParams {
+            base_image: &base_image,
+            remote_user: &resolved_users.remote_user,
+            container_user: &resolved_users.container_user,
+            remote_user_home: &resolved_users.remote_user_home,
+            container_user_home: &resolved_users.container_user_home,
+            workspace_name: &workspace_name,
+            runtime_host_address: &self.runtime.get_host_address(),
+            config_hash: &config_hash,
+            image_architecture: &resolved_users.image_architecture,
+            feature_install: &feature_install,
+            env_setup: &env_setup,
+            dotfiles_setup: &dotfiles_setup,
         })?;
-
-        fs::write(&dockerfile, contents)?;
 
         let base_tag = self.get_image_tag(&devcontainer_workspace);
         let latest_tag = format!("{}:latest", base_tag);
@@ -944,74 +553,12 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
 
         self.runtime.build(
             &dockerfile,
-            &directory_path,
+            ctx.path(),
             vec![&latest_tag, &build_tag],
             self.silent,
         )?;
 
         Ok(())
-    }
-
-    fn copy_feature_to_build(
-        &self,
-        process: &FeatureProcessResult,
-        build_directory: &Path,
-    ) -> Result<String> {
-        let feature_dest = build_directory.join(&process.feature.id);
-
-        let mut options = fs_extra::dir::CopyOptions::new();
-        options.overwrite = true;
-        options.copy_inside = true;
-        fs_extra::dir::copy(&process.path, &feature_dest, &options)
-            .map_err(|e| Error::new(format!("Failed to copy feature directory: {}", e)))?;
-
-        // Create env variable file with merged options (defaults + user overrides)
-        let mut feature_options = serde_json::json!({});
-
-        // Start with default values from feature definition
-        if let Some(options_map) = &process.feature.options {
-            for (key, option) in options_map {
-                feature_options
-                    .as_object_mut()
-                    .unwrap()
-                    .insert(key.clone(), option.default.clone());
-            }
-        }
-
-        // Override with user-specified options from feature_ref
-        if let Some(user_opts) = process.feature_ref.options.as_object() {
-            for (key, value) in user_opts {
-                feature_options
-                    .as_object_mut()
-                    .unwrap()
-                    .insert(key.clone(), value.clone());
-            }
-        }
-
-        // Create env variable file for feature installation
-        let env_file_path = feature_dest.join("devcontainer-features.env");
-        let mut env_file = File::create(&env_file_path)?;
-        for (key, value) in feature_options.as_object().unwrap() {
-            use std::io::Write;
-
-            let val = if let Some(str_value) = value.as_str() {
-                str_value
-            } else if let Some(bool_value) = value.as_bool() {
-                if bool_value { "true" } else { "false" }
-            } else if let Some(num_value) = value.as_number() {
-                &format!("{}", num_value)
-            } else {
-                ""
-            };
-
-            writeln!(env_file, "export {}={}", key.to_uppercase(), val)?;
-        }
-
-        Ok(feature_dest
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .to_string())
     }
 
     /// Starts a container from a built image.
@@ -1047,13 +594,13 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
     /// ```no_run
     /// # use devcon::config::{Config, DockerRuntimeConfig};
     /// # use devcon::workspace::Workspace;
-    /// # use devcon::driver::container::ContainerDriver;
+    /// # use devcon::driver::container::ContainerOrchestrator;
     /// # use devcon::driver::runtime::docker::DockerRuntime;
     /// # use std::path::PathBuf;
     /// # fn example() -> devcon::error::Result<()> {
     /// let config = Config::load(None)?;
     /// let runtime = Box::new(DockerRuntime::new(DockerRuntimeConfig::default()));
-    /// let driver = ContainerDriver::new(config, runtime);
+    /// let driver = ContainerOrchestrator::new(config, runtime);
     /// let workspace = Workspace::try_from(PathBuf::from("/project"))?;
     /// driver.build(workspace.clone(), &[], None)?;
     /// let _ = driver.start(workspace, &["EDITOR=vim".to_string()])?;
@@ -1503,8 +1050,9 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
             .any(|f| f.feature.privileged.unwrap_or(false));
 
         // Compose the startup environment from feature defaults and user-config overrides.
-        let base_container_env = self.base_container_environment(&latest_tag, probe_info.as_ref());
-        let mut processed_env_vars = Self::compose_start_environment(
+        let base_container_env =
+            base_container_environment(self.runtime.as_ref(), &latest_tag, probe_info.as_ref());
+        let mut processed_env_vars = compose_start_environment(
             &processed_features,
             devcontainer_workspace.devcontainer.container_env.as_ref(),
             env_variables,
@@ -1590,7 +1138,8 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
         }
 
         if let Some(command) = &devcontainer_workspace.devcontainer.on_create_command {
-            self.run_lifecycle_command(
+            run_lifecycle_command(
+                self.runtime.as_ref(),
                 handle.as_ref(),
                 &devcontainer_workspace,
                 command,
@@ -1619,7 +1168,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
                 info!("Importing GPG public keyring into container");
                 gpg_cmd.push_str(" && gpg --import /tmp/gpg-public-keys.asc 2>&1 || true");
             }
-            let guarded = Self::guard_with_marker(&gpg_cmd, "gpgAgentSetup");
+            let guarded = guard_with_marker(&gpg_cmd, "gpgAgentSetup");
             self.runtime.exec(
                 handle.as_ref(),
                 vec!["bash", "-c", &guarded],
@@ -1641,7 +1190,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
                 "sudo chmod 600 {p} && sudo chown $(id -u):$(id -g) {p}",
                 p = ssh_sock_in_container
             );
-            let guarded = Self::guard_with_marker(&cmd, "sshAgentSetup");
+            let guarded = guard_with_marker(&cmd, "sshAgentSetup");
             self.runtime.exec(
                 handle.as_ref(),
                 vec!["bash", "-c", &guarded],
@@ -1661,7 +1210,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
                     .as_deref()
                     .unwrap_or("")
             );
-            let guarded = Self::guard_with_marker(dotfiles_cmd.trim(), "dotfilesSetup");
+            let guarded = guard_with_marker(dotfiles_cmd.trim(), "dotfilesSetup");
             self.runtime.exec(
                 handle.as_ref(),
                 vec!["bash", "-c", &guarded],
@@ -1713,7 +1262,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
                         })
                         .collect();
                     let combined = login_cmds.join(" && ");
-                    let guarded = Self::guard_with_marker(&combined, "ghForwarding");
+                    let guarded = guard_with_marker(&combined, "ghForwarding");
                     self.runtime.exec(
                         handle.as_ref(),
                         vec!["bash", "-c", &guarded],
@@ -1728,7 +1277,8 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
         }
 
         if let Some(command) = &devcontainer_workspace.devcontainer.post_create_command {
-            self.run_lifecycle_command(
+            run_lifecycle_command(
+                self.runtime.as_ref(),
                 handle.as_ref(),
                 &devcontainer_workspace,
                 command,
@@ -1747,8 +1297,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
                         "Executing entrypoint script for feature '{}'",
                         feature_result.feature.id
                     );
-                    let wrapped_cmd =
-                        self.wrap_lifecycle_command(&devcontainer_workspace, entrypoint);
+                    let wrapped_cmd = entrypoint.to_string();
                     self.runtime.exec(
                         handle.as_ref(),
                         vec!["bash", "-c", "-i", &wrapped_cmd],
@@ -1761,7 +1310,8 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
             })?;
 
         if let Some(command) = &devcontainer_workspace.devcontainer.post_start_command {
-            self.run_lifecycle_command(
+            run_lifecycle_command(
+                self.runtime.as_ref(),
                 handle.as_ref(),
                 &devcontainer_workspace,
                 command,
@@ -1824,13 +1374,13 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
     /// ```no_run
     /// # use devcon::config::{Config, DockerRuntimeConfig};
     /// # use devcon::workspace::Workspace;
-    /// # use devcon::driver::container::ContainerDriver;
+    /// # use devcon::driver::container::ContainerOrchestrator;
     /// # use devcon::driver::runtime::docker::DockerRuntime;
     /// # use std::path::PathBuf;
     /// # fn example() -> devcon::error::Result<()> {
     /// let config = Config::load(None)?;
     /// let runtime = Box::new(DockerRuntime::new(DockerRuntimeConfig::default()));
-    /// let driver = ContainerDriver::new(config, runtime);
+    /// let driver = ContainerOrchestrator::new(config, runtime);
     /// let workspace = Workspace::try_from(PathBuf::from("/project"))?;
     /// driver.build(workspace.clone(), &[], None)?;
     /// driver.shell(workspace)?;
@@ -1900,7 +1450,8 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
         }
 
         if let Some(command) = &devcontainer_workspace.devcontainer.post_attach_command {
-            self.run_lifecycle_command(
+            run_lifecycle_command(
+                self.runtime.as_ref(),
                 handle,
                 &devcontainer_workspace,
                 command,
@@ -1921,167 +1472,14 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
         Ok(())
     }
 
-    fn base_container_environment(
-        &self,
-        image_tag: &str,
-        probe_info: Option<&ContainerProbeInfo>,
-    ) -> HashMap<String, String> {
-        let mut env = HashMap::new();
-
-        match self.runtime.inspect_image(image_tag) {
-            Ok(Some(inspect)) => {
-                for raw in &inspect.config.env {
-                    let Some((key, value)) = raw.split_once('=') else {
-                        continue;
-                    };
-                    env.insert(key.to_string(), value.to_string());
-                }
-            }
-            Ok(None) => {
-                debug!(
-                    "Image '{}' could not be inspected before PATH probing; using probe only",
-                    image_tag
-                );
-            }
-            Err(err) => {
-                warn!(
-                    "Failed to inspect image '{}' for base container environment: {}",
-                    image_tag, err
-                );
-            }
-        }
-
-        if let Some(info) = probe_info {
-            if !info.path.is_empty() {
-                debug!("Using probed PATH from image: {}", info.path);
-                env.insert("PATH".to_string(), info.path.clone());
-            }
-        } else {
-            debug!(
-                "No probe info available for '{}'; using inspected PATH if present",
-                image_tag
-            );
-        }
-
-        env
-    }
-
-    fn resolve_container_env_value(
-        raw_value: &str,
-        merged_env: &HashMap<String, String>,
-        host_env: &HashMap<String, String>,
-    ) -> String {
-        let mut resolved = String::new();
-        let mut index = 0;
-
-        while let Some(rel_start) = raw_value[index..].find("${") {
-            let start = index + rel_start;
-            resolved.push_str(&raw_value[index..start]);
-
-            let after_start = start + 2;
-            let Some(rel_end) = raw_value[after_start..].find('}') else {
-                resolved.push_str(&raw_value[start..]);
-                return resolved;
-            };
-            let end = after_start + rel_end;
-
-            let token = &raw_value[after_start..end];
-            let replacement = if let Some(name) = token.strip_prefix("containerEnv:") {
-                merged_env.get(name).cloned().unwrap_or_default()
-            } else if let Some(name) = token.strip_prefix("localEnv:") {
-                host_env.get(name).cloned().unwrap_or_default()
-            } else {
-                merged_env.get(token).cloned().unwrap_or_default()
-            };
-
-            resolved.push_str(&replacement);
-            index = end + 1;
-        }
-
-        resolved.push_str(&raw_value[index..]);
-        resolved
-    }
-
-    fn merge_container_env_map(
-        merged_env: &mut HashMap<String, String>,
-        source_env: &HashMap<String, String>,
-        host_env: &HashMap<String, String>,
-    ) {
-        for (key, value) in source_env {
-            let resolved = Self::resolve_container_env_value(value, merged_env, host_env);
-            merged_env.insert(key.clone(), resolved);
-        }
-    }
-
-    fn compose_start_environment(
-        processed_features: &[FeatureProcessResult],
-        devcontainer_container_env: Option<&HashMap<String, String>>,
-        env_variables: &[String],
-        base_container_env: &HashMap<String, String>,
-    ) -> Vec<String> {
-        let mut merged_env = base_container_env.clone();
-        let host_env: HashMap<String, String> = std::env::vars().collect();
-
-        // Feature-provided containerEnv values are merged first in feature order.
-        for feature_result in processed_features {
-            if let Some(feature_env) = &feature_result.feature.container_env {
-                Self::merge_container_env_map(&mut merged_env, feature_env, &host_env);
-            }
-        }
-
-        // Devcontainer containerEnv overrides feature defaults.
-        if let Some(container_env) = devcontainer_container_env {
-            Self::merge_container_env_map(&mut merged_env, container_env, &host_env);
-        }
-
-        // Explicit env vars passed to start override prior values.
-        for env_var in env_variables {
-            if let Some((key, value)) = env_var.split_once('=') {
-                let resolved = Self::resolve_container_env_value(value, &merged_env, &host_env);
-                merged_env.insert(key.to_string(), resolved);
-            } else {
-                let host_value = host_env.get(env_var).cloned().unwrap_or_default();
-                merged_env.insert(env_var.clone(), host_value);
-            }
-        }
-
-        merged_env
-            .into_iter()
-            .map(|(key, value)| format!("{}={}", key, value))
-            .collect()
-    }
-
-    /// Returns the Docker image tag for this container.
-    ///
-    /// The tag is formatted as `devcon-{sanitized_name}` where the sanitized
-    /// name is the project directory name with special characters replaced.
-    ///
-    /// # Returns
-    ///
-    /// A string containing the full image tag.
     fn get_image_tag(&self, devcontainer_workspace: &Workspace) -> String {
         format!("devcon-{}", devcontainer_workspace.get_sanitized_name())
     }
 
-    /// Returns the container name for this devcontainer.
-    ///
-    /// The name is formatted as `devcon.{sanitized_name}` where the sanitized
-    /// name is the project directory name with special characters replaced.
-    ///
-    /// # Returns
-    ///
-    /// A string containing the container name.
     fn get_container_name(&self, devcontainer_workspace: &Workspace) -> String {
         format!("devcon.{}", devcontainer_workspace.get_sanitized_name())
     }
 
-    /// Returns the container label for this devcontainer.
-    ///
-    /// The label is formatted as `devcon.project={sanitized_name}`.
-    ///
-    /// # Returns
-    ///
-    /// A string containing the label key-value pair.
     fn get_container_label(&self, devcontainer_workspace: &Workspace) -> String {
         format!(
             "devcon.project={}",
@@ -2089,19 +1487,9 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
         )
     }
 
-    /// Generates a unique container ID for the devcontainer.
-    ///
-    /// The ID is a deterministic hash based on the devcontainer.json file content,
-    /// ensuring different configurations get different IDs. Falls back to hashing
-    /// the workspace path if the file cannot be read.
-    ///
-    /// # Returns
-    ///
-    /// A hex-encoded SHA256 hash of the devcontainer.json content.
     fn get_devcontainer_id(&self, devcontainer_workspace: &Workspace) -> String {
         let mut hasher = Sha256::new();
 
-        // Try to read and hash the devcontainer.json file content
         let devcontainer_path = devcontainer_workspace
             .path
             .join(".devcontainer")
@@ -2112,14 +1500,10 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
                 hasher.update(content.as_bytes());
             }
             Err(_) => {
-                // Fallback to workspace path if file can't be read
                 hasher.update(devcontainer_workspace.path.to_string_lossy().as_bytes());
             }
         }
 
-        // Also hash the Dockerfile when a build config references one, so that
-        // changes to the Dockerfile trigger a rebuild even if devcontainer.json
-        // is unchanged.
         if let Some(build_config) = &devcontainer_workspace.devcontainer.build {
             if build_config.dockerfile.is_some() {
                 let devcontainer_dir = if devcontainer_path.exists() {
@@ -2136,7 +1520,6 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
                 }
             }
 
-            // Hash build args (sorted for determinism) so arg changes invalidate the cache.
             if let Some(args) = &build_config.args {
                 let mut sorted_args: Vec<(&String, &String)> = args.iter().collect();
                 sorted_args.sort_by_key(|(k, _)| *k);
@@ -2150,11 +1533,6 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
         result.iter().map(|byte| format!("{:02x}", byte)).collect()
     }
 
-    /// Returns `true` when the existing image's config hash matches the current workspace config.
-    ///
-    /// The hash is stored as the `devcon.config-hash` image label at build time. If the image is
-    /// absent or the label is missing (e.g. an image built by an older version of devcon), this
-    /// method returns `false` so that a rebuild is triggered.
     pub fn image_is_current(&self, devcontainer_workspace: &Workspace) -> Result<bool> {
         let latest_tag = format!("{}:latest", self.get_image_tag(devcontainer_workspace));
         let stored = self
@@ -2255,21 +1633,6 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
         }
     }
 
-    /// Performs variable substitution on a mount string.
-    ///
-    /// Supports the following variables:
-    /// - `${devcontainerId}` - Unique ID for this container
-    /// - `${localWorkspaceFolder}` - Path to the workspace folder
-    /// - `${containerWorkspaceFolder}` - Path to workspace inside container
-    ///
-    /// # Arguments
-    ///
-    /// * `mount_str` - The mount string with variables to substitute
-    /// * `devcontainer_workspace` - The workspace to use for substitution
-    ///
-    /// # Returns
-    ///
-    /// The mount string with all variables substituted.
     #[allow(dead_code)]
     fn substitute_mount_variables(
         &self,
@@ -2321,417 +1684,12 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
             .replace("${remoteUserHome}", &users.remote_user_home)
             .replace("${containerUserHome}", &users.container_user_home)
     }
-
-    /// Wraps a lifecycle command with proper environment and working directory setup.
-    ///
-    /// This ensures the command runs with:
-    /// - Proper shell environment loaded
-    /// - Correct working directory
-    /// - User's profile sourced
-    ///
-    /// # Arguments
-    ///
-    /// * `_devcontainer_workspace` - The devcontainer workspace
-    /// * `cmd` - The command to wrap
-    ///
-    /// # Returns
-    ///
-    /// A wrapped command string ready for execution.
-    fn wrap_lifecycle_command(&self, _devcontainer_workspace: &Workspace, cmd: &str) -> String {
-        cmd.to_string()
-    }
-
-    fn lifecycle_marker_path(marker_name: &str) -> String {
-        format!("/var/lib/devcon/lifecycle-markers/{}", marker_name)
-    }
-
-    fn lifecycle_marker_exists(
-        &self,
-        handle: &dyn crate::driver::runtime::ContainerHandle,
-        marker_name: &str,
-    ) -> bool {
-        let marker = Self::lifecycle_marker_path(marker_name);
-        self.runtime
-            .exec(
-                handle,
-                vec!["sudo", "test", "-f", &marker],
-                &[],
-                false,
-                false,
-            )
-            .is_ok()
-    }
-
-    fn create_lifecycle_marker(
-        &self,
-        handle: &dyn crate::driver::runtime::ContainerHandle,
-        marker_name: &str,
-    ) -> Result<()> {
-        let marker = Self::lifecycle_marker_path(marker_name);
-        let marker_dir = "/var/lib/devcon/lifecycle-markers";
-
-        self.runtime.exec(
-            handle,
-            vec!["sudo", "mkdir", "-p", marker_dir],
-            &[],
-            false,
-            false,
-        )?;
-        self.runtime
-            .exec(handle, vec!["sudo", "touch", &marker], &[], false, false)?;
-
-        Ok(())
-    }
-
-    fn exec_shell_lifecycle_command(
-        &self,
-        handle: &dyn crate::driver::runtime::ContainerHandle,
-        devcontainer_workspace: &Workspace,
-        cmd: &str,
-        env_vars: &[String],
-        attach_stdin: bool,
-        attach_stdout: bool,
-    ) -> Result<()> {
-        let wrapped_cmd = self.wrap_lifecycle_command(devcontainer_workspace, cmd);
-        self.runtime.exec(
-            handle,
-            vec!["bash", "-c", "-i", &wrapped_cmd],
-            env_vars,
-            attach_stdin,
-            attach_stdout,
-        )
-    }
-
-    fn exec_argv_lifecycle_command(
-        &self,
-        handle: &dyn crate::driver::runtime::ContainerHandle,
-        cmd: &[String],
-        env_vars: &[String],
-        attach_stdin: bool,
-        attach_stdout: bool,
-    ) -> Result<()> {
-        let args: Vec<&str> = cmd.iter().map(String::as_str).collect();
-        self.runtime
-            .exec(handle, args, env_vars, attach_stdin, attach_stdout)
-    }
-
-    fn exec_lifecycle_value(
-        &self,
-        handle: &dyn crate::driver::runtime::ContainerHandle,
-        devcontainer_workspace: &Workspace,
-        value: &LifecycleCommandValue,
-        env_vars: &[String],
-        attach_stdin: bool,
-        attach_stdout: bool,
-    ) -> Result<()> {
-        match value {
-            LifecycleCommandValue::String(cmd) => self.exec_shell_lifecycle_command(
-                handle,
-                devcontainer_workspace,
-                cmd,
-                env_vars,
-                attach_stdin,
-                attach_stdout,
-            ),
-            LifecycleCommandValue::Array(cmd) => {
-                self.exec_argv_lifecycle_command(handle, cmd, env_vars, attach_stdin, attach_stdout)
-            }
-        }
-    }
-
-    fn run_lifecycle_command(
-        &self,
-        handle: &dyn crate::driver::runtime::ContainerHandle,
-        devcontainer_workspace: &Workspace,
-        command: &LifecycleCommand,
-        marker_name: &str,
-        attach_stdin: bool,
-        attach_stdout: bool,
-    ) -> Result<()> {
-        if self.lifecycle_marker_exists(handle, marker_name) {
-            return Ok(());
-        }
-
-        match command {
-            LifecycleCommand::String(cmd) => self.exec_shell_lifecycle_command(
-                handle,
-                devcontainer_workspace,
-                cmd,
-                &[],
-                attach_stdin,
-                attach_stdout,
-            )?,
-            LifecycleCommand::Array(cmd) => {
-                self.exec_argv_lifecycle_command(handle, cmd, &[], attach_stdin, attach_stdout)?
-            }
-            LifecycleCommand::Object(map) => {
-                // Parallel object execution is a future enhancement.
-                // Preserve direct argv execution for array values, but run the
-                // object entries sequentially for now.
-                let mut entries: Vec<_> = map.iter().collect();
-                entries.sort_by_key(|(left, _)| *left);
-
-                for (_, value) in entries {
-                    self.exec_lifecycle_value(
-                        handle,
-                        devcontainer_workspace,
-                        value,
-                        &[],
-                        attach_stdin,
-                        attach_stdout,
-                    )?;
-                }
-            }
-        }
-
-        self.create_lifecycle_marker(handle, marker_name)
-    }
-
-    /// Wraps a shell command string so it runs at most once inside the container,
-    /// guarded by a marker file at `/var/lib/devcon/lifecycle-markers/{marker_name}`.
-    ///
-    /// The marker is created only when the command succeeds (`&&`). With `--rm`
-    /// (current default) the container filesystem is discarded on stop, so the guard
-    /// has no effect today. Once containers are persisted across stop/start cycles the
-    /// marker will survive and prevent the command from re-running on subsequent starts.
-    fn guard_with_marker(cmd: &str, marker_name: &str) -> String {
-        let marker = format!("/var/lib/devcon/lifecycle-markers/{}", marker_name);
-        format!(
-            "MARKER='{}'; if [ ! -f \"$MARKER\" ]; then {}; sudo mkdir -p \"$(dirname \"$MARKER\")\" && sudo touch \"$MARKER\"; fi",
-            marker, cmd
-        )
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::DockerRuntimeConfig;
-    use crate::devcontainer::{FeatureRegistry, FeatureRegistryType, FeatureSource};
-    use crate::driver::runtime::docker::DockerRuntime;
-    use crate::feature::Feature;
-    use std::collections::HashMap;
-    use std::path::PathBuf;
-
-    fn create_test_feature_result(id: &str) -> FeatureProcessResult {
-        let feature = Feature {
-            id: id.to_string(),
-            version: "1.0.0".to_string(),
-            name: Some(format!("Test {}", id)),
-            description: None,
-            documentation_url: None,
-            license_url: None,
-            keywords: None,
-            options: None,
-            installs_after: None,
-            depends_on: None,
-            deprecated: None,
-            legacy_ids: None,
-            cap_add: None,
-            security_opt: None,
-            privileged: None,
-            init: None,
-            entrypoint: None,
-            mounts: None,
-            container_env: None,
-            customizations: None,
-            on_create_command: None,
-            update_content_command: None,
-            post_create_command: None,
-            post_start_command: None,
-            post_attach_command: None,
-        };
-
-        let feature_ref = FeatureRef::new(FeatureSource::Registry {
-            registry: FeatureRegistry {
-                owner: "test".to_string(),
-                repository: "features".to_string(),
-                name: id.to_string(),
-                version: "1.0.0".to_string(),
-                registry_type: FeatureRegistryType::Ghcr,
-            },
-        });
-
-        FeatureProcessResult {
-            feature_ref,
-            feature,
-            path: PathBuf::from(format!("/tmp/{}", id)),
-        }
-    }
-
-    fn env_vec_to_map(env_vars: Vec<String>) -> HashMap<String, String> {
-        env_vars
-            .into_iter()
-            .filter_map(|entry| {
-                entry
-                    .split_once('=')
-                    .map(|(key, value)| (key.to_string(), value.to_string()))
-            })
-            .collect()
-    }
-
-    #[test]
-    fn test_compose_start_environment_includes_feature_container_env() {
-        let mut feature_a = create_test_feature_result("feature-a");
-        feature_a.feature.container_env = Some(HashMap::from([
-            ("GOPATH".to_string(), "/go".to_string()),
-            ("PATH".to_string(), "/usr/local/go/bin:${PATH}".to_string()),
-        ]));
-
-        let base_env = HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
-
-        let env = ContainerDriver::compose_start_environment(&[feature_a], None, &[], &base_env);
-        let env_map = env_vec_to_map(env);
-
-        assert_eq!(env_map.get("GOPATH"), Some(&"/go".to_string()));
-        assert_eq!(
-            env_map.get("PATH"),
-            Some(&"/usr/local/go/bin:/usr/bin:/bin".to_string())
-        );
-    }
-
-    #[test]
-    fn test_compose_start_environment_config_overrides_feature_values() {
-        let mut feature_a = create_test_feature_result("feature-a");
-        feature_a.feature.container_env = Some(HashMap::from([(
-            "PATH".to_string(),
-            "/feature/bin".to_string(),
-        )]));
-
-        let base_env = HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
-
-        let env = ContainerDriver::compose_start_environment(
-            &[feature_a],
-            None,
-            &["PATH=/config/bin".to_string(), "FOO=bar".to_string()],
-            &base_env,
-        );
-        let env_map = env_vec_to_map(env);
-
-        assert_eq!(env_map.get("PATH"), Some(&"/config/bin".to_string()));
-        assert_eq!(env_map.get("FOO"), Some(&"bar".to_string()));
-    }
-
-    #[test]
-    fn test_compose_start_environment_devcontainer_container_env_overrides_feature_values() {
-        let mut feature_a = create_test_feature_result("feature-a");
-        feature_a.feature.container_env = Some(HashMap::from([(
-            "PATH".to_string(),
-            "/feature/bin:${PATH}".to_string(),
-        )]));
-
-        let devcontainer_env = HashMap::from([(
-            "PATH".to_string(),
-            "${containerEnv:PATH}:/workspace/bin".to_string(),
-        )]);
-
-        let base_env = HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
-
-        let env = ContainerDriver::compose_start_environment(
-            &[feature_a],
-            Some(&devcontainer_env),
-            &[],
-            &base_env,
-        );
-        let env_map = env_vec_to_map(env);
-
-        assert_eq!(
-            env_map.get("PATH"),
-            Some(&"/feature/bin:/usr/bin:/bin:/workspace/bin".to_string())
-        );
-    }
-
-    #[test]
-    fn test_apply_feature_order_override_complete() {
-        let features = vec![
-            create_test_feature_result("feature-a"),
-            create_test_feature_result("feature-b"),
-            create_test_feature_result("feature-c"),
-        ];
-
-        let override_order = vec![
-            "feature-c".to_string(),
-            "feature-a".to_string(),
-            "feature-b".to_string(),
-        ];
-
-        let result = apply_feature_order_override(features, &override_order);
-        assert!(result.is_ok());
-
-        let ordered = result.unwrap();
-        assert_eq!(ordered.len(), 3);
-        assert_eq!(ordered[0].feature.id, "feature-c");
-        assert_eq!(ordered[1].feature.id, "feature-a");
-        assert_eq!(ordered[2].feature.id, "feature-b");
-    }
-
-    #[test]
-    fn test_apply_feature_order_override_partial() {
-        let features = vec![
-            create_test_feature_result("feature-a"),
-            create_test_feature_result("feature-b"),
-            create_test_feature_result("feature-c"),
-            create_test_feature_result("feature-d"),
-        ];
-
-        // Only specify order for some features
-        let override_order = vec!["feature-c".to_string(), "feature-a".to_string()];
-
-        let result = apply_feature_order_override(features, &override_order);
-        assert!(result.is_ok());
-
-        let ordered = result.unwrap();
-        assert_eq!(ordered.len(), 4);
-
-        // First two should be in specified order
-        assert_eq!(ordered[0].feature.id, "feature-c");
-        assert_eq!(ordered[1].feature.id, "feature-a");
-
-        // Remaining features should be at the end (b and d)
-        let remaining_ids: Vec<&str> = ordered[2..].iter().map(|f| f.feature.id.as_str()).collect();
-        assert!(remaining_ids.contains(&"feature-b"));
-        assert!(remaining_ids.contains(&"feature-d"));
-    }
-
-    #[test]
-    fn test_apply_feature_order_override_empty() {
-        let features = vec![
-            create_test_feature_result("feature-a"),
-            create_test_feature_result("feature-b"),
-        ];
-
-        let override_order: Vec<String> = vec![];
-
-        let result = apply_feature_order_override(features, &override_order);
-        assert!(result.is_ok());
-
-        let ordered = result.unwrap();
-        assert_eq!(ordered.len(), 2);
-        // Original order should be preserved
-        assert_eq!(ordered[0].feature.id, "feature-a");
-        assert_eq!(ordered[1].feature.id, "feature-b");
-    }
-
-    #[test]
-    fn test_apply_feature_order_override_nonexistent() {
-        let features = vec![
-            create_test_feature_result("feature-a"),
-            create_test_feature_result("feature-b"),
-        ];
-
-        let override_order = vec!["feature-nonexistent".to_string(), "feature-a".to_string()];
-
-        let result = apply_feature_order_override(features, &override_order);
-        assert!(result.is_ok());
-
-        let ordered = result.unwrap();
-        assert_eq!(ordered.len(), 2);
-
-        // feature-a should be first (as it was in override list)
-        assert_eq!(ordered[0].feature.id, "feature-a");
-        // feature-b should be second (not in override list)
-        assert_eq!(ordered[1].feature.id, "feature-b");
-    }
 
     #[test]
     fn test_devcontainer_id_generation() {
@@ -2777,7 +1735,7 @@ mod tests {
 
         let config = Config::default();
         let runtime = Box::new(DockerRuntime::new(DockerRuntimeConfig::default()));
-        let driver = ContainerDriver::new(config, runtime);
+        let driver = ContainerOrchestrator::new(config, runtime);
 
         let id1 = driver.get_devcontainer_id(&workspace1);
         let id2 = driver.get_devcontainer_id(&workspace2);
@@ -2823,7 +1781,7 @@ mod tests {
         let workspace = Workspace::try_from(temp_dir.path().to_path_buf()).unwrap();
         let config = Config::default();
         let runtime = Box::new(DockerRuntime::new(DockerRuntimeConfig::default()));
-        let driver = ContainerDriver::new(config, runtime);
+        let driver = ContainerOrchestrator::new(config, runtime);
 
         // Test devcontainerId substitution
         let mount_str = "type=volume,source=myvolume-${devcontainerId},target=/data";
@@ -2856,232 +1814,5 @@ mod tests {
         let mount_str = "${remoteUser}:${containerUser}:${remoteUserHome}:${containerUserHome}";
         let result = driver.substitute_mount_variables(mount_str, &workspace);
         assert_eq!(result, "vscode:vscode:/home/vscode:/home/vscode");
-    }
-
-    #[test]
-    fn test_lifecycle_marker_path_contains_marker_name() {
-        let marker = ContainerDriver::lifecycle_marker_path("onCreateCommand");
-        assert_eq!(marker, "/var/lib/devcon/lifecycle-markers/onCreateCommand");
-    }
-
-    #[test]
-    fn test_guard_with_marker_contains_marker_path() {
-        let result = ContainerDriver::guard_with_marker("echo hello", "sshAgentSetup");
-        assert!(
-            result.contains("/var/lib/devcon/lifecycle-markers/sshAgentSetup"),
-            "marker path missing: {result}"
-        );
-        assert!(result.contains("if [ ! -f"), "missing if guard: {result}");
-        assert!(result.contains("touch"), "missing touch: {result}");
-        assert!(
-            result.contains("echo hello"),
-            "inner command missing: {result}"
-        );
-    }
-
-    #[test]
-    fn test_guard_with_marker_distinct_names() {
-        let ssh = ContainerDriver::guard_with_marker("chmod /ssh-agent", "sshAgentSetup");
-        let gpg = ContainerDriver::guard_with_marker("chmod .gnupg", "gpgAgentSetup");
-        let dots = ContainerDriver::guard_with_marker("/dotfiles_helper.sh", "dotfilesSetup");
-        let gh = ContainerDriver::guard_with_marker("gh auth login", "ghForwarding");
-
-        assert!(ssh.contains("lifecycle-markers/sshAgentSetup"));
-        assert!(gpg.contains("lifecycle-markers/gpgAgentSetup"));
-        assert!(dots.contains("lifecycle-markers/dotfilesSetup"));
-        assert!(gh.contains("lifecycle-markers/ghForwarding"));
-
-        // All four must be distinct
-        let all = [&ssh, &gpg, &dots, &gh];
-        for (i, a) in all.iter().enumerate() {
-            for (j, b) in all.iter().enumerate() {
-                if i != j {
-                    assert_ne!(a, b, "markers {i} and {j} must differ");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_guard_with_marker_touch_after_success() {
-        let result = ContainerDriver::guard_with_marker("false", "someMarker");
-        let touch_pos = result.find("touch").expect("touch not found");
-        let and_pos = result[..touch_pos]
-            .rfind("&&")
-            .expect("&& before touch not found");
-        assert!(and_pos < touch_pos, "&& must precede touch");
-    }
-
-    #[test]
-    fn test_is_transient_agent_mount_start_error_matches_stale_ssh_mount() {
-        let err = Error::runtime(
-            "docker start failed: error during container init: error mounting '/private/var/run/com.apple.launchd.ABC/Listeners' to '/ssh-agent': not a directory",
-        );
-
-        assert!(is_transient_agent_mount_start_error(&err));
-    }
-
-    #[test]
-    fn test_is_transient_agent_mount_start_error_ignores_unrelated_start_error() {
-        let err = Error::runtime("docker start failed: port is already allocated");
-
-        assert!(!is_transient_agent_mount_start_error(&err));
-    }
-
-    #[test]
-    fn test_is_transient_agent_mount_start_error_matches_stable_dir_missing() {
-        let err = Error::runtime(
-            "error mounting /home/user/.local/share/devcon/agent-sockets to /run/devcon-agents: \
-             no such file or directory",
-        );
-        assert!(is_transient_agent_mount_start_error(&err));
-    }
-
-    #[test]
-    fn test_update_agent_socket_symlink_creates_new() {
-        let tmp = TempDir::new().unwrap();
-        let stable_dir = tmp.path();
-
-        // Create a fake socket file to point at
-        let socket = stable_dir.join("real.sock");
-        std::fs::write(&socket, "").unwrap();
-
-        let ok = update_agent_socket_symlink(stable_dir, "ssh-agent", &socket);
-        assert!(ok);
-        let target = std::fs::read_link(stable_dir.join("ssh-agent")).unwrap();
-        assert_eq!(target, socket);
-    }
-
-    #[test]
-    fn test_update_agent_socket_symlink_replaces_stale() {
-        let tmp = TempDir::new().unwrap();
-        let stable_dir = tmp.path();
-
-        let old_socket = stable_dir.join("old.sock");
-        let new_socket = stable_dir.join("new.sock");
-        std::fs::write(&old_socket, "").unwrap();
-        std::fs::write(&new_socket, "").unwrap();
-
-        // Create the initial symlink pointing to old socket
-        update_agent_socket_symlink(stable_dir, "ssh-agent", &old_socket);
-        // Now update to new socket
-        let ok = update_agent_socket_symlink(stable_dir, "ssh-agent", &new_socket);
-        assert!(ok);
-        let target = std::fs::read_link(stable_dir.join("ssh-agent")).unwrap();
-        assert_eq!(target, new_socket);
-    }
-
-    #[test]
-    fn test_update_agent_socket_symlink_idempotent() {
-        let tmp = TempDir::new().unwrap();
-        let stable_dir = tmp.path();
-
-        let socket = stable_dir.join("real.sock");
-        std::fs::write(&socket, "").unwrap();
-
-        // First call
-        assert!(update_agent_socket_symlink(
-            stable_dir,
-            "ssh-agent",
-            &socket
-        ));
-        // Second call with same target — should still return true without error
-        assert!(update_agent_socket_symlink(
-            stable_dir,
-            "ssh-agent",
-            &socket
-        ));
-        let target = std::fs::read_link(stable_dir.join("ssh-agent")).unwrap();
-        assert_eq!(target, socket);
-    }
-
-    #[test]
-    fn test_copy_feature_options_include_different_options() {
-        let feature_dir = TempDir::new().unwrap();
-        let temp_dir = TempDir::new().unwrap().keep();
-
-        let feature = Feature {
-            id: "base".to_string(),
-            version: "1.0.0".to_string(),
-            name: None,
-            description: None,
-            documentation_url: None,
-            license_url: None,
-            keywords: None,
-            options: Some(
-                serde_json::from_str(
-                    r#"
-{
-    "default": {
-        "type": "string",
-        "default": ""
-    },
-    "string": {
-        "type": "string",
-        "default": "test"
-    },
-    "bool": {
-        "type": "boolean",
-        "default": false
-    },
-    "int": {
-        "type": "string",
-        "default": "0"
-    }
-}"#,
-                )
-                .unwrap(),
-            ),
-            installs_after: None,
-            depends_on: None,
-            deprecated: None,
-            legacy_ids: None,
-            cap_add: None,
-            security_opt: None,
-            privileged: None,
-            init: None,
-            entrypoint: None,
-            mounts: None,
-            container_env: None,
-            customizations: None,
-            on_create_command: None,
-            update_content_command: None,
-            post_create_command: None,
-            post_start_command: None,
-            post_attach_command: None,
-        };
-
-        let options =
-            serde_json::from_str(r#"{ "string": "hello", "bool":true, "int": 42 }"#).unwrap();
-
-        let feature_ref = FeatureRef {
-            source: FeatureSource::Local {
-                path: feature_dir.path().to_path_buf(),
-            },
-            options,
-        };
-        let feature_process_result = FeatureProcessResult {
-            feature_ref,
-            feature,
-            path: feature_dir.path().to_path_buf(),
-        };
-
-        let driver = ContainerDriver::new(
-            Config::default(),
-            Box::new(DockerRuntime::new(DockerRuntimeConfig::default())),
-        );
-
-        let result = driver.copy_feature_to_build(&feature_process_result, temp_dir.as_path());
-
-        assert!(result.is_ok());
-        assert!(std::fs::exists(temp_dir.join("base").join("devcontainer-features.env")).unwrap());
-
-        let content =
-            std::fs::read_to_string(temp_dir.join("base").join("devcontainer-features.env"))
-                .unwrap();
-        assert_eq!(
-            "export BOOL=true\nexport DEFAULT=\nexport INT=42\nexport STRING=hello\n",
-            content
-        );
     }
 }

@@ -44,8 +44,8 @@ use crate::output::OutputFormat;
 use crate::{
     config::Config,
     driver::{
-        container::ContainerDriver,
         control_server,
+        orchestrator::ContainerOrchestrator,
         runtime::{container::ContainerCliRuntime, docker::DockerRuntime},
     },
     workspace::Workspace,
@@ -170,7 +170,7 @@ pub struct InfoResponse {
 /// 1. Loads the user configuration from XDG directories
 /// 2. Loads the devcontainer configuration from the specified path
 /// 3. Merges additional features from user config
-/// 4. Creates a `ContainerDriver` instance
+/// 4. Creates a `ContainerOrchestrator` instance
 /// 5. Builds the container image with all configured features
 ///
 /// # Arguments
@@ -215,7 +215,7 @@ pub fn handle_build_command(
     debug!("Using runtime {:?}", runtime_name);
     let runtime = get_runtime_specific_config(&config, &runtime_name)?;
 
-    let driver = ContainerDriver::new_silent(config, runtime, output == OutputFormat::Json);
+    let driver = ContainerOrchestrator::new_silent(config, runtime, output == OutputFormat::Json);
 
     let result = driver.build(devcontainer_workspace, &[], effective_build_path);
 
@@ -240,7 +240,7 @@ pub fn handle_build_command(
 /// 1. Loads the user configuration from XDG directories
 /// 2. Loads the devcontainer configuration from the specified path
 /// 3. Resolves the canonical path to the project directory
-/// 4. Creates a `ContainerDriver` instance
+/// 4. Creates a `ContainerOrchestrator` instance
 /// 5. Starts the container with the project mounted as a volume and env variables
 ///
 /// # Arguments
@@ -280,7 +280,7 @@ pub fn handle_start_command(
     debug!("Using runtime {:?}", runtime_name);
     let runtime = get_runtime_specific_config(&config, &runtime_name)?;
 
-    let driver = ContainerDriver::new_silent(config, runtime, output == OutputFormat::Json);
+    let driver = ContainerOrchestrator::new_silent(config, runtime, output == OutputFormat::Json);
     let container_id = driver.start(devcontainer_workspace.clone(), &[])?;
 
     let remote_user = driver.resolve_remote_user_for_workspace(&devcontainer_workspace);
@@ -329,7 +329,7 @@ pub fn handle_shell_command(
     debug!("Using runtime {:?}", runtime_name);
     let runtime = get_runtime_specific_config(&config, &runtime_name)?;
 
-    let driver = ContainerDriver::new(config, runtime);
+    let driver = ContainerOrchestrator::new(config, runtime);
     driver.shell(devcontainer_workspace)?;
     Ok(())
 }
@@ -348,7 +348,7 @@ pub fn handle_ssh_command(
     debug!("Using runtime {:?}", runtime_name);
     let runtime = get_runtime_specific_config(&config, &runtime_name)?;
 
-    let driver = ContainerDriver::new(config.clone(), runtime);
+    let driver = ContainerOrchestrator::new(config.clone(), runtime);
     let ssh_port = config.get_agent_ssh_port();
     let container_id = driver.resolve_running_container_id(
         &devcontainer_workspace,
@@ -418,7 +418,7 @@ pub fn handle_ssh_create_config_command(path: PathBuf, config_path: Option<PathB
     let runtime_name = config.resolve_runtime()?;
     let runtime = get_runtime_specific_config(&config, &runtime_name)?;
     let workspace = Workspace::try_from(path.clone())?;
-    let driver = ContainerDriver::new(config, runtime);
+    let driver = ContainerOrchestrator::new(config, runtime);
     let remote_user = driver.resolve_remote_user_for_workspace(&workspace);
 
     write_ssh_config_entry(&workspace, &remote_user, true)?;
@@ -637,7 +637,7 @@ pub fn handle_up_command(
     debug!("Using runtime {:?}", runtime_name);
     let runtime = get_runtime_specific_config(&config, &runtime_name)?;
 
-    let driver = ContainerDriver::new_silent(config, runtime, output == OutputFormat::Json);
+    let driver = ContainerOrchestrator::new_silent(config, runtime, output == OutputFormat::Json);
 
     // Process features once
     let (processed_features, _) = driver.prepare_features(&devcontainer_workspace)?;
@@ -862,7 +862,7 @@ pub fn handle_info_command(
     debug!("Using runtime {:?}", runtime_name);
     let runtime = get_runtime_specific_config(&config, &runtime_name)?;
 
-    let driver = ContainerDriver::new(config, runtime);
+    let driver = ContainerOrchestrator::new(config, runtime);
 
     match driver.prepare_features(&devcontainer_workspace) {
         Ok((processed_features, _)) => {
@@ -984,7 +984,7 @@ fn handle_info_json(config: &Config, devcontainer_workspace: &Workspace) -> Resu
     // Create runtime based on config
     let runtime_name = config.resolve_runtime()?;
     let runtime = get_runtime_specific_config(config, &runtime_name)?;
-    let driver = ContainerDriver::new_silent(config.clone(), runtime, true);
+    let driver = ContainerOrchestrator::new_silent(config.clone(), runtime, true);
 
     // Features
     let (features, features_error) = match driver.prepare_features(devcontainer_workspace) {
