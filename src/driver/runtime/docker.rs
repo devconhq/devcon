@@ -36,7 +36,7 @@ use tracing::{debug, trace};
 use crate::config::DockerRuntimeConfig;
 use crate::driver::runtime::RuntimeParameters;
 
-use super::{ContainerRuntime, stream_build_output};
+use super::{ContainerImageConfig, ContainerImageInfo, ContainerRuntime, stream_build_output};
 
 /// Extract container-side port from a ForwardPort
 fn extract_container_port(port: &crate::devcontainer::ForwardPort) -> Option<u16> {
@@ -534,7 +534,7 @@ impl ContainerRuntime for DockerRuntime {
         }
     }
 
-    fn inspect_image(&self, image_tag: &str) -> Result<Option<serde_json::Value>> {
+    fn inspect_image(&self, image_tag: &str) -> Result<Option<ContainerImageInfo>> {
         let output = Command::new("docker")
             .arg("image")
             .arg("inspect")
@@ -551,18 +551,47 @@ impl ContainerRuntime for DockerRuntime {
             value => value,
         };
 
-        Ok(Some(inspect))
+        let architecture = inspect
+            .get("Architecture")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToString::to_string);
+
+        let labels = inspect
+            .get("Config")
+            .and_then(|v| v.get("Labels"))
+            .and_then(|v| v.as_object())
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let env = inspect
+            .get("Config")
+            .and_then(|v| v.get("Env"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(ToString::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(Some(ContainerImageInfo {
+            architecture,
+            config: ContainerImageConfig { labels, env },
+        }))
     }
 
     fn image_label(&self, image_tag: &str, label_key: &str) -> Result<Option<String>> {
         let inspect = self.inspect_image(image_tag)?;
         let value = inspect
             .as_ref()
-            .and_then(|v| v.get("Config"))
-            .and_then(|v| v.get("Labels"))
-            .and_then(|v| v.get(label_key))
-            .and_then(|v| v.as_str())
-            .map(ToString::to_string);
+            .and_then(|v| v.config.labels.get(label_key))
+            .cloned();
         Ok(value)
     }
 
