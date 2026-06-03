@@ -28,7 +28,6 @@ use std::{
     collections::HashSet,
     path::Path,
     process::{Command, Stdio},
-    time::Duration,
 };
 
 use crate::error::Error;
@@ -659,10 +658,14 @@ impl ContainerRuntime for ContainerCliRuntime {
             let result = cmd.output()?;
 
             if result.status.code() == Some(0) {
-                std::thread::sleep(Duration::from_secs(10));
-                return Ok(Box::new(ContainerCliHandle {
-                    id: String::from_utf8_lossy(&result.stdout).trim().to_string(),
-                }));
+                let container_id = String::from_utf8_lossy(&result.stdout).trim().to_string();
+                if container_id.is_empty() {
+                    return Err(Error::runtime(
+                        "Container start command succeeded but returned an empty container id"
+                            .to_string(),
+                    ));
+                }
+                return Ok(Box::new(ContainerCliHandle { id: container_id }));
             }
 
             let exit_code = result
@@ -746,9 +749,10 @@ impl ContainerRuntime for ContainerCliRuntime {
         let result = cmd.output()?;
 
         if result.status.code() != Some(0) {
+            let stderr = String::from_utf8_lossy(&result.stderr).trim().to_string();
             return Err(Error::runtime(format!(
                 "Container exec command failed: {}",
-                &String::from_utf8(result.stderr).unwrap()
+                stderr
             )));
         }
 
