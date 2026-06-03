@@ -25,6 +25,7 @@
 //! Implementation of ContainerRuntime trait for the `container` CLI.
 
 use std::{
+    collections::HashSet,
     path::Path,
     process::{Command, Stdio},
     time::Duration,
@@ -35,9 +36,13 @@ use crate::error::Result;
 
 use crate::config::ContainerRuntimeConfig;
 use crate::driver::runtime::RuntimeParameters;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use super::{ContainerRuntime, stream_build_output};
+
+const AUTO_HOST_PORT_MIN: u16 = 30001;
+const AUTO_HOST_PORT_PICK_ATTEMPTS: usize = 128;
+const CONTAINER_START_MAX_ATTEMPTS: usize = 3;
 
 /// Extract container-side port from a ForwardPort
 fn extract_container_port(port: &crate::devcontainer::ForwardPort) -> Option<u16> {
@@ -77,6 +82,96 @@ fn parse_host_port_from_text(output: &str) -> Option<u16> {
             .next()
             .and_then(|port| port.parse::<u16>().ok())
     })
+}
+
+fn parse_host_port_from_mapping(mapping: &str) -> Option<u16> {
+    mapping
+        .split(':')
+        .next()
+        .and_then(|s| s.parse::<u16>().ok())
+}
+
+fn allocate_auto_host_port_with_picker<F>(
+    used_host_ports: &HashSet<u16>,
+    mut picker: F,
+) -> Result<u16>
+where
+    F: FnMut() -> Option<u16>,
+{
+    for _ in 0..AUTO_HOST_PORT_PICK_ATTEMPTS {
+        let candidate = match picker() {
+            Some(port) => port,
+            None => continue,
+        };
+
+        if candidate < AUTO_HOST_PORT_MIN || used_host_ports.contains(&candidate) {
+            continue;
+        }
+
+        return Ok(candidate);
+    }
+
+    Err(Error::runtime(format!(
+        "Failed to allocate an unused host port above {}",
+        AUTO_HOST_PORT_MIN - 1
+    )))
+}
+
+fn resolve_container_runtime_ports(
+    ports: &[crate::devcontainer::ForwardPort],
+) -> Result<Vec<crate::devcontainer::ForwardPort>> {
+    resolve_container_runtime_ports_with_picker(ports, || {
+        openport::pick_unused_port(AUTO_HOST_PORT_MIN..=u16::MAX)
+    })
+}
+
+fn resolve_container_runtime_ports_with_picker<F>(
+    ports: &[crate::devcontainer::ForwardPort],
+    mut picker: F,
+) -> Result<Vec<crate::devcontainer::ForwardPort>>
+where
+    F: FnMut() -> Option<u16>,
+{
+    use crate::devcontainer::ForwardPort;
+
+    let mut used_host_ports = HashSet::new();
+    for port in ports {
+        if let ForwardPort::HostPort(mapping) = port
+            && let Some(host_port) = parse_host_port_from_mapping(mapping)
+        {
+            used_host_ports.insert(host_port);
+        }
+    }
+
+    let mut resolved = Vec::with_capacity(ports.len());
+    for port in ports {
+        match port {
+            ForwardPort::Port(container_port) => {
+                let host_port = allocate_auto_host_port_with_picker(&used_host_ports, &mut picker)?;
+                used_host_ports.insert(host_port);
+                resolved.push(ForwardPort::HostPort(format!(
+                    "{}:{}",
+                    host_port, container_port
+                )));
+            }
+            ForwardPort::HostPort(mapping) => resolved.push(ForwardPort::HostPort(mapping.clone())),
+        }
+    }
+
+    Ok(resolved)
+}
+
+fn is_host_port_conflict_error(stderr: &str, stdout: &str) -> bool {
+    let combined = format!("{}\n{}", stderr, stdout).to_ascii_lowercase();
+    [
+        "address already in use",
+        "already allocated",
+        "port is in use",
+        "failed to expose port",
+        "port conflict",
+    ]
+    .iter()
+    .any(|needle| combined.contains(needle))
 }
 
 fn extract_mapped_port_from_value(value: &serde_json::Value, container_port: u16) -> Option<u16> {
@@ -462,90 +557,114 @@ impl ContainerRuntime for ContainerCliRuntime {
         env_vars: &[String],
         runtime_parameters: RuntimeParameters,
     ) -> Result<Box<dyn super::ContainerHandle>> {
-        let mut cmd = Command::new("container");
+        let RuntimeParameters {
+            additional_mounts,
+            ports,
+            requires_privileged,
+            platform_architecture_translation,
+        } = runtime_parameters;
 
-        cmd.arg("run").arg("-d");
+        let mut last_error = None;
 
-        if runtime_parameters.platform_architecture_translation {
-            cmd.arg("--rosetta");
-        }
+        for attempt in 1..=CONTAINER_START_MAX_ATTEMPTS {
+            let resolved_ports = resolve_container_runtime_ports(&ports)?;
+            debug!(
+                "Container runtime port mappings (attempt {}): {:?}",
+                attempt, resolved_ports
+            );
 
-        cmd.arg("-v").arg(volume_mount).arg("-l").arg(label);
+            let mut cmd = Command::new("container");
 
-        // Add CPU and memory limits from config
-        let memory = self.config.run_memory.as_deref().unwrap_or("8g");
-        cmd.arg("--memory").arg(memory);
-        let cpu = self.config.run_cpu.as_deref().unwrap_or("2");
-        cmd.arg("--cpus").arg(cpu);
+            cmd.arg("run").arg("-d");
 
-        // Add privileged flag if required
-        if runtime_parameters.requires_privileged {
-            cmd.arg("--virtualization");
-        }
+            if platform_architecture_translation {
+                cmd.arg("--rosetta");
+            }
 
-        // Add environment variables
-        for env_var in env_vars {
-            cmd.arg("-e").arg(env_var);
-        }
+            cmd.arg("-v").arg(volume_mount).arg("-l").arg(label);
 
-        // Add excluded ports environment variable for agent
-        let excluded_ports: Vec<String> = runtime_parameters
-            .ports
-            .iter()
-            .filter_map(extract_container_port)
-            .map(|p| p.to_string())
-            .collect();
-        if !excluded_ports.is_empty() {
-            let excluded_ports_str = excluded_ports.join(",");
-            cmd.arg("-e")
-                .arg(format!("DEVCON_FORWARDED_PORTS={}", excluded_ports_str));
-        }
+            // Add CPU and memory limits from config
+            let memory = self.config.run_memory.as_deref().unwrap_or("8g");
+            cmd.arg("--memory").arg(memory);
+            let cpu = self.config.run_cpu.as_deref().unwrap_or("2");
+            cmd.arg("--cpus").arg(cpu);
 
-        // Add additional mounts from features and devcontainer config
-        for mount in runtime_parameters.additional_mounts {
-            match mount {
-                crate::devcontainer::Mount::String(mount_str) => {
-                    cmd.arg("-v").arg(mount_str);
-                }
-                crate::devcontainer::Mount::Structured(structured) => {
-                    let mount_arg = match &structured.mount_type {
-                        crate::devcontainer::MountType::Bind => {
-                            if let Some(source) = &structured.source {
-                                format!("type=bind,source={},target={}", source, structured.target)
-                            } else {
-                                continue; // Skip bind mounts without source
+            // Add privileged flag if required
+            if requires_privileged {
+                cmd.arg("--virtualization");
+            }
+
+            // Add environment variables
+            for env_var in env_vars {
+                cmd.arg("-e").arg(env_var);
+            }
+
+            // Add excluded ports environment variable for agent
+            let excluded_ports: Vec<String> = resolved_ports
+                .iter()
+                .filter_map(extract_container_port)
+                .map(|p| p.to_string())
+                .collect();
+            if !excluded_ports.is_empty() {
+                let excluded_ports_str = excluded_ports.join(",");
+                cmd.arg("-e")
+                    .arg(format!("DEVCON_FORWARDED_PORTS={}", excluded_ports_str));
+            }
+
+            // Add additional mounts from features and devcontainer config
+            for mount in additional_mounts.clone() {
+                match mount {
+                    crate::devcontainer::Mount::String(mount_str) => {
+                        cmd.arg("-v").arg(mount_str);
+                    }
+                    crate::devcontainer::Mount::Structured(structured) => {
+                        let mount_arg = match &structured.mount_type {
+                            crate::devcontainer::MountType::Bind => {
+                                if let Some(source) = &structured.source {
+                                    format!(
+                                        "type=bind,source={},target={}",
+                                        source, structured.target
+                                    )
+                                } else {
+                                    continue; // Skip bind mounts without source
+                                }
                             }
-                        }
-                        crate::devcontainer::MountType::Volume => {
-                            if let Some(source) = &structured.source {
-                                format!(
-                                    "type=volume,source={},target={}",
-                                    source, structured.target
-                                )
-                            } else {
-                                format!("type=volume,target={}", structured.target)
+                            crate::devcontainer::MountType::Volume => {
+                                if let Some(source) = &structured.source {
+                                    format!(
+                                        "type=volume,source={},target={}",
+                                        source, structured.target
+                                    )
+                                } else {
+                                    format!("type=volume,target={}", structured.target)
+                                }
                             }
-                        }
-                    };
-                    cmd.arg("--mount").arg(mount_arg);
+                        };
+                        cmd.arg("--mount").arg(mount_arg);
+                    }
                 }
             }
-        }
 
-        // Add port forwards
-        for port in runtime_parameters.ports {
-            let port_number = match port {
-                crate::devcontainer::ForwardPort::Port(port_number) => port_number.to_string(),
-                crate::devcontainer::ForwardPort::HostPort(port) => port,
-            };
-            cmd.arg("-p").arg(port_number);
-        }
+            // Add port forwards
+            for port in resolved_ports {
+                let port_number = match port {
+                    crate::devcontainer::ForwardPort::Port(port_number) => port_number.to_string(),
+                    crate::devcontainer::ForwardPort::HostPort(port) => port,
+                };
+                cmd.arg("-p").arg(port_number);
+            }
 
-        cmd.arg(image_tag);
+            cmd.arg(image_tag);
 
-        let result = cmd.output()?;
+            let result = cmd.output()?;
 
-        if result.status.code() != Some(0) {
+            if result.status.code() == Some(0) {
+                std::thread::sleep(Duration::from_secs(10));
+                return Ok(Box::new(ContainerCliHandle {
+                    id: String::from_utf8_lossy(&result.stdout).trim().to_string(),
+                }));
+            }
+
             let exit_code = result
                 .status
                 .code()
@@ -563,13 +682,23 @@ impl ContainerRuntime for ContainerCliRuntime {
                 details.push_str(&format!("\nstdout: {}", stdout));
             }
 
-            return Err(Error::runtime(details));
-        }
-        std::thread::sleep(Duration::from_secs(10));
+            let err = Error::runtime(details);
+            if attempt < CONTAINER_START_MAX_ATTEMPTS
+                && is_host_port_conflict_error(&stderr, &stdout)
+            {
+                warn!(
+                    "Container start failed due to host port conflict (attempt {}/{}), retrying with new host ports",
+                    attempt, CONTAINER_START_MAX_ATTEMPTS
+                );
+                last_error = Some(err);
+                continue;
+            }
 
-        Ok(Box::new(ContainerCliHandle {
-            id: String::from_utf8_lossy(&result.stdout).trim().to_string(),
-        }))
+            return Err(err);
+        }
+
+        Err(last_error
+            .unwrap_or_else(|| Error::runtime("Container start failed after retries".to_string())))
     }
 
     fn exec(
@@ -826,6 +955,86 @@ impl ContainerRuntime for ContainerCliRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_host_port_from_mapping() {
+        assert_eq!(parse_host_port_from_mapping("49152:22"), Some(49152));
+        assert_eq!(parse_host_port_from_mapping("not-a-port:22"), None);
+    }
+
+    #[test]
+    fn test_resolve_container_runtime_ports_maps_plain_ports_above_30000() {
+        let input = vec![
+            crate::devcontainer::ForwardPort::Port(22),
+            crate::devcontainer::ForwardPort::Port(3000),
+        ];
+
+        let mut picks = vec![Some(29999), Some(40001), Some(40002)].into_iter();
+        let resolved =
+            resolve_container_runtime_ports_with_picker(&input, || picks.next().flatten())
+                .expect("resolve ports");
+        assert_eq!(resolved.len(), 2);
+
+        for mapped in resolved {
+            match mapped {
+                crate::devcontainer::ForwardPort::HostPort(mapping) => {
+                    let parts: Vec<&str> = mapping.split(':').collect();
+                    assert_eq!(parts.len(), 2);
+                    let host_port = parts[0].parse::<u16>().expect("host port number");
+                    assert!(host_port >= AUTO_HOST_PORT_MIN);
+                }
+                crate::devcontainer::ForwardPort::Port(_) => {
+                    panic!("expected host:container mapping")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_resolve_container_runtime_ports_preserves_explicit_mappings() {
+        let input = vec![crate::devcontainer::ForwardPort::HostPort(
+            "40000:22".to_string(),
+        )];
+        let resolved = resolve_container_runtime_ports_with_picker(&input, || Some(40001))
+            .expect("resolve ports");
+
+        assert_eq!(resolved.len(), 1);
+        assert!(matches!(
+            &resolved[0],
+            crate::devcontainer::ForwardPort::HostPort(mapping) if mapping == "40000:22"
+        ));
+    }
+
+    #[test]
+    fn test_resolve_container_runtime_ports_avoids_explicit_host_port_collision() {
+        let input = vec![
+            crate::devcontainer::ForwardPort::HostPort("41000:8080".to_string()),
+            crate::devcontainer::ForwardPort::Port(3000),
+        ];
+        let mut picks = vec![Some(41000), Some(42000)].into_iter();
+        let resolved =
+            resolve_container_runtime_ports_with_picker(&input, || picks.next().flatten())
+                .expect("resolve ports");
+
+        assert_eq!(resolved.len(), 2);
+        assert!(matches!(
+            &resolved[0],
+            crate::devcontainer::ForwardPort::HostPort(mapping) if mapping == "41000:8080"
+        ));
+        assert!(matches!(
+            &resolved[1],
+            crate::devcontainer::ForwardPort::HostPort(mapping) if mapping == "42000:3000"
+        ));
+    }
+
+    #[test]
+    fn test_is_host_port_conflict_error() {
+        assert!(is_host_port_conflict_error(
+            "bind: address already in use",
+            ""
+        ));
+        assert!(!is_host_port_conflict_error("failed to pull image", ""));
+    }
 
     #[test]
     fn test_parse_host_port_from_text_arrow_format() {

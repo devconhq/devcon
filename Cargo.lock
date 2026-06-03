@@ -480,6 +480,7 @@ dependencies = [
  "minijinja",
  "oci-spec",
  "open",
+ "openport",
  "pidlock",
  "prost",
  "reqwest",
@@ -1419,6 +1420,12 @@ dependencies = [
  "libc",
  "pathdiff",
 ]
+
+[[package]]
+name = "openport"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "18242255fbcde3d59739209490b7dbdff291d29ea96a4136b0595860e7045325"
 
 [[package]]
 name = "openssl-probe"
