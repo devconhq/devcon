@@ -74,7 +74,7 @@ use crate::devcontainer::{
 };
 use crate::driver::agent::{self, AgentConfig};
 use crate::driver::feature_process::FeatureProcessResult;
-use crate::driver::runtime::{ContainerProbeInfo, RuntimeParameters};
+use crate::driver::runtime::{ContainerImageInfo, ContainerProbeInfo, RuntimeParameters};
 use crate::{
     config::Config, devcontainer::LifecycleCommand, driver::feature_process::process_features,
     driver::runtime::ContainerRuntime, workspace::Workspace,
@@ -856,11 +856,10 @@ fi
                         .as_ref()
                         .and_then(|inspect| {
                             let label_str = inspect
-                                .get("Config")
-                                .or_else(|| inspect.get("config"))
-                                .and_then(|v| v.get("Labels").or_else(|| v.get("labels")))
-                                .and_then(|v| v.get("devcontainer.metadata"))
-                                .and_then(|v| v.as_str())?;
+                                .config
+                                .labels
+                                .get("devcontainer.metadata")
+                                .map(String::as_str)?;
                             let entries: serde_json::Value =
                                 serde_json::from_str(label_str).ok()?;
                             entries.as_array()?.iter().rev().find_map(|entry| {
@@ -1197,11 +1196,10 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
                     .as_ref()
                     .and_then(|inspect| {
                         let label_str = inspect
-                            .get("Config")
-                            .or_else(|| inspect.get("config"))
-                            .and_then(|v| v.get("Labels").or_else(|| v.get("labels")))
-                            .and_then(|v| v.get("devcontainer.metadata"))
-                            .and_then(|v| v.as_str())?;
+                            .config
+                            .labels
+                            .get("devcontainer.metadata")
+                            .map(String::as_str)?;
                         let entries: serde_json::Value = serde_json::from_str(label_str).ok()?;
                         entries.as_array()?.iter().rev().find_map(|entry| {
                             entry
@@ -1537,7 +1535,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
 
         match self.runtime.inspect_image(&latest_tag)? {
             Some(inspect) => {
-                trace!("Pre-run image inspect for '{}': {}", latest_tag, inspect);
+                trace!("Pre-run image inspect for '{}': {:?}", latest_tag, inspect);
             }
             None => {
                 trace!(
@@ -1932,19 +1930,11 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
 
         match self.runtime.inspect_image(image_tag) {
             Ok(Some(inspect)) => {
-                if let Some(config) = inspect.get("Config").or_else(|| inspect.get("config"))
-                    && let Some(entries) = config.get("Env").or_else(|| config.get("env"))
-                    && let Some(entries) = entries.as_array()
-                {
-                    for entry in entries {
-                        let Some(raw) = entry.as_str() else {
-                            continue;
-                        };
-                        let Some((key, value)) = raw.split_once('=') else {
-                            continue;
-                        };
-                        env.insert(key.to_string(), value.to_string());
-                    }
+                for raw in &inspect.config.env {
+                    let Some((key, value)) = raw.split_once('=') else {
+                        continue;
+                    };
+                    env.insert(key.to_string(), value.to_string());
                 }
             }
             Ok(None) => {
@@ -2204,21 +2194,10 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
         }
     }
 
-    fn extract_architecture_from_inspect(inspect: &serde_json::Value) -> Option<String> {
-        let from_key = |path: &[&str]| {
-            let mut current = inspect;
-            for key in path {
-                current = current.get(*key)?;
-            }
-            current
-                .as_str()
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(ToString::to_string)
-        };
-
-        from_key(&["Architecture"])
-            .or_else(|| from_key(&["architecture"]))
+    fn extract_architecture_from_inspect(inspect: &ContainerImageInfo) -> Option<String> {
+        inspect
+            .architecture
+            .clone()
             .map(|arch| Self::canonical_image_architecture(&arch))
     }
 

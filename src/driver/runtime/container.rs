@@ -37,7 +37,7 @@ use crate::config::ContainerRuntimeConfig;
 use crate::driver::runtime::RuntimeParameters;
 use tracing::{debug, trace, warn};
 
-use super::{ContainerRuntime, stream_build_output};
+use super::{ContainerImageConfig, ContainerImageInfo, ContainerRuntime, stream_build_output};
 
 const AUTO_HOST_PORT_MIN: u16 = 30001;
 const AUTO_HOST_PORT_PICK_ATTEMPTS: usize = 128;
@@ -754,7 +754,7 @@ impl ContainerRuntime for ContainerCliRuntime {
         }
     }
 
-    fn inspect_image(&self, image_tag: &str) -> Result<Option<serde_json::Value>> {
+    fn inspect_image(&self, image_tag: &str) -> Result<Option<ContainerImageInfo>> {
         let output = Command::new("container")
             .arg("image")
             .arg("inspect")
@@ -769,7 +769,40 @@ impl ContainerRuntime for ContainerCliRuntime {
 
         let inspect: serde_json::Value = serde_json::from_slice(&output.stdout)?;
 
-        Ok(Some(inspect))
+        let architecture = inspect
+            .get("architecture")
+            .or_else(|| inspect.get("Architecture"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToString::to_string);
+
+        let config = inspect.get("config").or_else(|| inspect.get("Config"));
+
+        let labels = config
+            .and_then(|v| v.get("labels").or_else(|| v.get("Labels")))
+            .and_then(|v| v.as_object())
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let env = config
+            .and_then(|v| v.get("env").or_else(|| v.get("Env")))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(ToString::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(Some(ContainerImageInfo {
+            architecture,
+            config: ContainerImageConfig { labels, env },
+        }))
     }
 
     fn image_label(&self, image_tag: &str, label_key: &str) -> Result<Option<String>> {
@@ -777,11 +810,8 @@ impl ContainerRuntime for ContainerCliRuntime {
         // Container's inspect JSON uses both lowercase and Docker-style key names.
         let value = inspect
             .as_ref()
-            .and_then(|v| v.get("Config").or_else(|| v.get("config")))
-            .and_then(|v| v.get("Labels").or_else(|| v.get("labels")))
-            .and_then(|v| v.get(label_key))
-            .and_then(|v| v.as_str())
-            .map(ToString::to_string);
+            .and_then(|v| v.config.labels.get(label_key))
+            .cloned();
         Ok(value)
     }
 

@@ -27,7 +27,7 @@
 //! Docker, Podman, etc.).
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     io::{BufRead, BufReader},
     path::Path,
     process::Child,
@@ -222,6 +222,28 @@ pub struct RuntimeParameters {
 pub trait ContainerHandle: Send {
     /// Returns the container ID.
     fn id(&self) -> &str;
+}
+
+/// Static metadata about a container image returned by [`ContainerRuntime::inspect_image`].
+///
+/// Each runtime implementation is responsible for extracting these fields from its
+/// own CLI output and constructing this struct manually. No serde annotations are
+/// placed on the struct so that future runtimes remain free to use any wire format.
+#[derive(Debug)]
+pub struct ContainerImageInfo {
+    /// CPU architecture reported by the image (e.g. `"amd64"`, `"arm64"`).
+    pub architecture: Option<String>,
+    /// Image configuration section (labels, environment variables, etc.).
+    pub config: ContainerImageConfig,
+}
+
+/// Configuration section of a [`ContainerImageInfo`].
+#[derive(Debug, Default)]
+pub struct ContainerImageConfig {
+    /// OCI/Docker labels attached to the image.
+    pub labels: HashMap<String, String>,
+    /// Environment variables baked into the image (`KEY=VALUE` format).
+    pub env: Vec<String>,
 }
 
 /// Runtime-probed information about a container image.
@@ -421,7 +443,7 @@ pub trait ContainerRuntime: Send {
     /// # Returns
     ///
     /// `Ok(Some(metadata))` if inspect succeeds, `Ok(None)` if the image does not exist.
-    fn inspect_image(&self, image_tag: &str) -> Result<Option<serde_json::Value>>;
+    fn inspect_image(&self, image_tag: &str) -> Result<Option<ContainerImageInfo>>;
 
     /// Read a single label from an image's metadata.
     ///
