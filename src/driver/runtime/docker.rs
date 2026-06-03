@@ -79,213 +79,41 @@ impl DockerRuntime {
         Self { config }
     }
 
-    fn probe_image_env_var_inner(image_tag: &str, key: &str) -> Option<String> {
-        let shell_probe = format!("printf '%s' \"${{{}}}\"", key);
-        let shell_probes: [Vec<&str>; 4] = [
-            vec!["--entrypoint", "sh", image_tag, "-lc", &shell_probe],
-            vec!["--entrypoint", "/bin/sh", image_tag, "-lc", &shell_probe],
-            vec!["--entrypoint", "bash", image_tag, "-lc", &shell_probe],
-            vec!["--entrypoint", "/bin/bash", image_tag, "-lc", &shell_probe],
-        ];
-
-        for probe in shell_probes {
-            let output = Command::new("docker")
-                .arg("run")
-                .arg("--rm")
-                .args(probe)
-                .output()
-                .ok()?;
-
-            if !output.status.success() {
-                continue;
+    fn probe_image_info_inner(
+        image_tag: &str,
+        user: Option<&str>,
+    ) -> Option<super::ContainerProbeInfo> {
+        const PROBE_CMD: &str = "printf '%s\\n%s\\n%s' \"$(id -un)\" \"$HOME\" \"$PATH\"";
+        let shells = ["sh", "/bin/sh", "bash", "/bin/bash"];
+        for shell in shells {
+            let mut cmd = Command::new("docker");
+            cmd.arg("run").arg("--rm");
+            if let Some(u) = user {
+                cmd.arg("--user").arg(u);
             }
-
-            let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !value.is_empty() {
-                return Some(value);
-            }
-        }
-
-        let env_entrypoints = ["env", "/usr/bin/env", "/bin/env"];
-        for entrypoint in env_entrypoints {
-            let output = Command::new("docker")
-                .arg("run")
-                .arg("--rm")
-                .arg("--entrypoint")
-                .arg(entrypoint)
+            cmd.arg("--entrypoint")
+                .arg(shell)
                 .arg(image_tag)
-                .output()
-                .ok()?;
+                .arg("-lc")
+                .arg(PROBE_CMD);
 
+            let output = cmd.output().ok()?;
             if !output.status.success() {
                 continue;
             }
-
-            let prefix = format!("{}=", key);
-            if let Some(value) = String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .find_map(|line| line.strip_prefix(&prefix).map(str::trim))
-                .filter(|value| !value.is_empty())
-            {
-                return Some(value.to_string());
-            }
-        }
-
-        None
-    }
-
-    /// Extracts `remoteUser` from the `devcontainer.metadata` OCI label embedded in the image.
-    ///
-    /// Devcontainer-aware images (e.g. `mcr.microsoft.com/devcontainers/base:ubuntu`) set
-    /// `Config.User` to `root` for technical reasons, but encode the intended development user
-    /// in a JSON array stored in the `devcontainer.metadata` label.  The last entry that
-    /// contains a non-empty `remoteUser` field wins (per the devcontainer spec merge order).
-    fn remote_user_from_metadata_label(inspect: &serde_json::Value) -> Option<String> {
-        let label_str = inspect
-            .get("Config")
-            .and_then(|v| v.get("Labels"))
-            .and_then(|v| v.get("devcontainer.metadata"))
-            .and_then(|v| v.as_str())?;
-
-        let entries: serde_json::Value = serde_json::from_str(label_str).ok()?;
-        entries.as_array()?.iter().rev().find_map(|entry| {
-            entry
-                .get("remoteUser")
-                .and_then(|u| u.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(ToString::to_string)
-        })
-    }
-
-    /// Probes the home directory of `user` by running a throwaway container.
-    ///
-    /// Returns `None` if the probe fails (e.g. the user does not exist in the image).
-    fn probe_home_for_user(image_tag: &str, user: &str) -> Option<String> {
-        let probes: [Vec<&str>; 2] = [
-            vec![
-                "--user",
-                user,
-                "--entrypoint",
-                "sh",
-                image_tag,
-                "-lc",
-                "printf '%s' \"$HOME\"",
-            ],
-            vec![
-                "--user",
-                user,
-                "--entrypoint",
-                "/bin/sh",
-                image_tag,
-                "-lc",
-                "printf '%s' \"$HOME\"",
-            ],
-        ];
-
-        for probe in probes {
-            let output = Command::new("docker")
-                .arg("run")
-                .arg("--rm")
-                .args(probe)
-                .output()
-                .ok()?;
-
-            if !output.status.success() {
-                continue;
-            }
-
-            let home = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !home.is_empty() {
-                return Some(home);
-            }
-        }
-
-        None
-    }
-
-    /// Returns the conventional home directory path for `user`.
-    fn default_home_for_user(user: &str) -> String {
-        if user == "root" {
-            "/root".to_string()
-        } else {
-            format!("/home/{}", user)
-        }
-    }
-
-    fn metadata_user(inspect: &serde_json::Value) -> Option<String> {
-        // The devcontainer.metadata OCI label takes precedence over Config.User.
-        // Devcontainer-aware images may set Config.User to "root" while embedding
-        // the real remote user (e.g. "vscode") in the label.
-        Self::remote_user_from_metadata_label(inspect).or_else(|| {
-            inspect
-                .get("Config")
-                .and_then(|v| v.get("User"))
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(ToString::to_string)
-        })
-    }
-
-    fn metadata_home(inspect: &serde_json::Value) -> Option<String> {
-        let envs = inspect
-            .get("Config")
-            .and_then(|v| v.get("Env"))
-            .and_then(|v| v.as_array())?;
-
-        envs.iter().find_map(|v| {
-            let env = v.as_str()?;
-            env.strip_prefix("HOME=")
-                .map(str::trim)
-                .filter(|h| !h.is_empty())
-                .map(ToString::to_string)
-        })
-    }
-
-    fn probe_image_user_and_home(image_tag: &str) -> Option<(String, String)> {
-        let probes: [Vec<&str>; 2] = [
-            vec![
-                "--entrypoint",
-                "sh",
-                image_tag,
-                "-lc",
-                "id -un; printf '\n'; printf '%s' \"$HOME\"",
-            ],
-            vec![
-                "--entrypoint",
-                "/bin/sh",
-                image_tag,
-                "-lc",
-                "id -un; printf '\n'; printf '%s' \"$HOME\"",
-            ],
-        ];
-
-        for probe in probes {
-            let output = Command::new("docker")
-                .arg("run")
-                .arg("--rm")
-                .args(probe)
-                .output()
-                .ok();
-
-            let Some(output) = output else {
-                continue;
-            };
-
-            if !output.status.success() {
-                continue;
-            }
-
             let stdout = String::from_utf8_lossy(&output.stdout);
             let mut lines = stdout.lines();
-            let user = lines.next().unwrap_or_default().trim().to_string();
+            let probe_user = lines.next().unwrap_or_default().trim().to_string();
             let home = lines.next().unwrap_or_default().trim().to_string();
-            if !user.is_empty() && !home.is_empty() {
-                return Some((user, home));
+            let path = lines.next().unwrap_or_default().trim().to_string();
+            if !probe_user.is_empty() {
+                return Some(super::ContainerProbeInfo {
+                    user: probe_user,
+                    home,
+                    path,
+                });
             }
         }
-
         None
     }
 
@@ -718,46 +546,10 @@ impl ContainerRuntime for DockerRuntime {
         }
 
         let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-        let mut inspect = match parsed {
+        let inspect = match parsed {
             serde_json::Value::Array(mut items) => items.pop().unwrap_or(serde_json::Value::Null),
             value => value,
         };
-
-        let has_valid_user = Self::metadata_user(&inspect).is_some();
-        let has_valid_home = Self::metadata_home(&inspect).is_some();
-
-        if let serde_json::Value::Object(ref mut map) = inspect
-            && (!has_valid_user || !has_valid_home)
-            && let Some((user, home)) = Self::probe_image_user_and_home(image_tag)
-        {
-            map.insert(
-                "_devconDetectedUser".to_string(),
-                serde_json::Value::String(user),
-            );
-            map.insert(
-                "_devconDetectedHome".to_string(),
-                serde_json::Value::String(home),
-            );
-        }
-
-        // The devcontainer.metadata label is authoritative for the remote user.
-        // Override whatever the probe detected so that images like
-        // mcr.microsoft.com/devcontainers/base:ubuntu (which run as root but embed
-        // remoteUser=vscode in the label) resolve to the correct user and home.
-        if let Some(label_user) = Self::remote_user_from_metadata_label(&inspect)
-            && let serde_json::Value::Object(ref mut map) = inspect
-        {
-            let home = Self::probe_home_for_user(image_tag, &label_user)
-                .unwrap_or_else(|| Self::default_home_for_user(&label_user));
-            map.insert(
-                "_devconDetectedUser".to_string(),
-                serde_json::Value::String(label_user),
-            );
-            map.insert(
-                "_devconDetectedHome".to_string(),
-                serde_json::Value::String(home),
-            );
-        }
 
         Ok(Some(inspect))
     }
@@ -774,8 +566,12 @@ impl ContainerRuntime for DockerRuntime {
         Ok(value)
     }
 
-    fn probe_image_env_var(&self, image_tag: &str, key: &str) -> Result<Option<String>> {
-        Ok(Self::probe_image_env_var_inner(image_tag, key))
+    fn probe_image_info(
+        &self,
+        image_tag: &str,
+        user: Option<&str>,
+    ) -> Result<Option<super::ContainerProbeInfo>> {
+        Ok(Self::probe_image_info_inner(image_tag, user))
     }
 
     fn get_host_address(&self) -> String {
@@ -800,31 +596,5 @@ mod tests {
     #[test]
     fn test_parse_host_port_empty() {
         assert_eq!(parse_host_port(""), None);
-    }
-
-    /// Images like `mcr.microsoft.com/devcontainers/base:ubuntu` have `Config.User` set to
-    /// `"root"` but embed the intended remote user (`vscode`) in the OCI label
-    /// `devcontainer.metadata`. This test demonstrates that `metadata_user` must read the label
-    /// rather than returning the raw `Config.User` value in that case.
-    #[test]
-    fn test_metadata_user_reads_devcontainer_metadata_label() {
-        let inspect = serde_json::json!({
-            "Config": {
-                "User": "root",
-                "Labels": {
-                    "devcontainer.metadata": "[{\"remoteUser\": \"vscode\"}]"
-                }
-            }
-        });
-
-        // Config.User is "root", but devcontainer.metadata specifies remoteUser as "vscode".
-        // metadata_user should prefer the devcontainer.metadata label over Config.User = "root".
-        let user = DockerRuntime::metadata_user(&inspect);
-        assert_eq!(
-            user.as_deref(),
-            Some("vscode"),
-            "metadata_user should resolve remoteUser from the devcontainer.metadata label \
-             when Config.User is 'root'"
-        );
     }
 }

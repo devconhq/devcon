@@ -74,7 +74,7 @@ use crate::devcontainer::{
 };
 use crate::driver::agent::{self, AgentConfig};
 use crate::driver::feature_process::FeatureProcessResult;
-use crate::driver::runtime::RuntimeParameters;
+use crate::driver::runtime::{ContainerProbeInfo, RuntimeParameters};
 use crate::{
     config::Config, devcontainer::LifecycleCommand, driver::feature_process::process_features,
     driver::runtime::ContainerRuntime, workspace::Workspace,
@@ -481,7 +481,13 @@ impl ContainerDriver {
     /// Resolves the remote SSH user for a workspace using devcontainer/image metadata.
     pub fn resolve_remote_user_for_workspace(&self, workspace: &Workspace) -> String {
         let latest_tag = format!("{}:latest", self.get_image_tag(workspace));
-        self.resolve_users_for_image(workspace, &latest_tag)
+        let probe_user_hint = workspace.devcontainer.remote_user.clone();
+        let probe_info = self
+            .runtime
+            .probe_image_info(&latest_tag, probe_user_hint.as_deref())
+            .ok()
+            .flatten();
+        self.resolve_users_for_image(workspace, &latest_tag, probe_info.as_ref())
             .remote_user
     }
 
@@ -836,7 +842,44 @@ fi
                 .clone()
         };
 
-        let resolved_users = self.resolve_users_for_image(&devcontainer_workspace, &base_image);
+        let resolved_users = {
+            // Determine probe user hint from devcontainer.json or metadata label.
+            let probe_user_hint = devcontainer_workspace
+                .devcontainer
+                .remote_user
+                .clone()
+                .or_else(|| {
+                    self.runtime
+                        .inspect_image(&base_image)
+                        .ok()
+                        .flatten()
+                        .as_ref()
+                        .and_then(|inspect| {
+                            let label_str = inspect
+                                .get("Config")
+                                .or_else(|| inspect.get("config"))
+                                .and_then(|v| v.get("Labels").or_else(|| v.get("labels")))
+                                .and_then(|v| v.get("devcontainer.metadata"))
+                                .and_then(|v| v.as_str())?;
+                            let entries: serde_json::Value =
+                                serde_json::from_str(label_str).ok()?;
+                            entries.as_array()?.iter().rev().find_map(|entry| {
+                                entry
+                                    .get("remoteUser")
+                                    .and_then(|u| u.as_str())
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                    .map(ToString::to_string)
+                            })
+                        })
+                });
+            let probe_info = self
+                .runtime
+                .probe_image_info(&base_image, probe_user_hint.as_deref())
+                .ok()
+                .flatten();
+            self.resolve_users_for_image(&devcontainer_workspace, &base_image, probe_info.as_ref())
+        };
 
         // Phase 2: Build features Dockerfile using base_image
         let env = Environment::new();
@@ -1140,7 +1183,45 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
             ));
         }
 
-        let resolved_users = self.resolve_users_for_image(&devcontainer_workspace, &latest_tag);
+        // Determine the user hint for probing: devcontainer.json remoteUser overrides, otherwise
+        // fall back to the user embedded in the devcontainer.metadata OCI label.
+        let probe_user_hint = devcontainer_workspace
+            .devcontainer
+            .remote_user
+            .clone()
+            .or_else(|| {
+                self.runtime
+                    .inspect_image(&latest_tag)
+                    .ok()
+                    .flatten()
+                    .as_ref()
+                    .and_then(|inspect| {
+                        let label_str = inspect
+                            .get("Config")
+                            .or_else(|| inspect.get("config"))
+                            .and_then(|v| v.get("Labels").or_else(|| v.get("labels")))
+                            .and_then(|v| v.get("devcontainer.metadata"))
+                            .and_then(|v| v.as_str())?;
+                        let entries: serde_json::Value = serde_json::from_str(label_str).ok()?;
+                        entries.as_array()?.iter().rev().find_map(|entry| {
+                            entry
+                                .get("remoteUser")
+                                .and_then(|u| u.as_str())
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(ToString::to_string)
+                        })
+                    })
+            });
+
+        let probe_info = self
+            .runtime
+            .probe_image_info(&latest_tag, probe_user_hint.as_deref())
+            .ok()
+            .flatten();
+
+        let resolved_users =
+            self.resolve_users_for_image(&devcontainer_workspace, &latest_tag, probe_info.as_ref());
 
         let volume_mount = format!(
             "{}:/workspaces/{}",
@@ -1424,7 +1505,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
             .any(|f| f.feature.privileged.unwrap_or(false));
 
         // Compose the startup environment from feature defaults and user-config overrides.
-        let base_container_env = self.base_container_environment(&latest_tag);
+        let base_container_env = self.base_container_environment(&latest_tag, probe_info.as_ref());
         let mut processed_env_vars = Self::compose_start_environment(
             &processed_features,
             devcontainer_workspace.devcontainer.container_env.as_ref(),
@@ -1842,7 +1923,11 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
         Ok(())
     }
 
-    fn base_container_environment(&self, image_tag: &str) -> HashMap<String, String> {
+    fn base_container_environment(
+        &self,
+        image_tag: &str,
+        probe_info: Option<&ContainerProbeInfo>,
+    ) -> HashMap<String, String> {
         let mut env = HashMap::new();
 
         match self.runtime.inspect_image(image_tag) {
@@ -1876,23 +1961,16 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
             }
         }
 
-        match self.runtime.probe_image_env_var(image_tag, "PATH") {
-            Ok(Some(path)) => {
-                debug!("Probed PATH from image runtime: {}", path);
-                env.insert("PATH".to_string(), path);
+        if let Some(info) = probe_info {
+            if !info.path.is_empty() {
+                debug!("Using probed PATH from image: {}", info.path);
+                env.insert("PATH".to_string(), info.path.clone());
             }
-            Ok(None) => {
-                debug!(
-                    "Could not probe PATH from image runtime for '{}'; falling back to inspected PATH if present",
-                    image_tag
-                );
-            }
-            Err(err) => {
-                warn!(
-                    "Failed to probe PATH from image '{}' via runtime: {}",
-                    image_tag, err
-                );
-            }
+        } else {
+            debug!(
+                "No probe info available for '{}'; using inspected PATH if present",
+                image_tag
+            );
         }
 
         env
@@ -2144,65 +2222,15 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
             .map(|arch| Self::canonical_image_architecture(&arch))
     }
 
-    fn extract_user_from_inspect(inspect: &serde_json::Value) -> Option<String> {
-        let from_key = |path: &[&str]| {
-            let mut current = inspect;
-            for key in path {
-                current = current.get(*key)?;
-            }
-            current
-                .as_str()
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(ToString::to_string)
-        };
-
-        from_key(&["_devconDetectedUser"])
-            .or_else(|| from_key(&["Config", "User"]))
-            .or_else(|| from_key(&["config", "user"]))
-            .or_else(|| from_key(&["configuration", "user"]))
-    }
-
-    fn extract_home_from_inspect(inspect: &serde_json::Value) -> Option<String> {
-        let from_key = |path: &[&str]| {
-            let mut current = inspect;
-            for key in path {
-                current = current.get(*key)?;
-            }
-            current
-                .as_str()
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(ToString::to_string)
-        };
-
-        let home_from_env = |path: &[&str]| {
-            let mut current = inspect;
-            for key in path {
-                current = current.get(*key)?;
-            }
-
-            current.as_array().and_then(|envs| {
-                envs.iter().find_map(|env| {
-                    env.as_str()?
-                        .strip_prefix("HOME=")
-                        .map(str::trim)
-                        .filter(|v| !v.is_empty())
-                        .map(ToString::to_string)
-                })
-            })
-        };
-
-        from_key(&["_devconDetectedHome"])
-            .or_else(|| home_from_env(&["Config", "Env"]))
-            .or_else(|| home_from_env(&["config", "env"]))
-            .or_else(|| home_from_env(&["configuration", "env"]))
-    }
-
-    fn resolve_users_for_image(&self, workspace: &Workspace, image_tag: &str) -> ResolvedUsers {
+    fn resolve_users_for_image(
+        &self,
+        workspace: &Workspace,
+        image_tag: &str,
+        probe_info: Option<&ContainerProbeInfo>,
+    ) -> ResolvedUsers {
         let inspect = self.runtime.inspect_image(image_tag).ok().flatten();
-        let detected_user = inspect.as_ref().and_then(Self::extract_user_from_inspect);
-        let detected_home = inspect.as_ref().and_then(Self::extract_home_from_inspect);
+        let detected_user = probe_info.map(|i| i.user.clone());
+        let detected_home = probe_info.map(|i| i.home.clone());
         let image_architecture = inspect
             .as_ref()
             .and_then(Self::extract_architecture_from_inspect)
@@ -2855,56 +2883,6 @@ mod tests {
     fn test_lifecycle_marker_path_contains_marker_name() {
         let marker = ContainerDriver::lifecycle_marker_path("onCreateCommand");
         assert_eq!(marker, "/var/lib/devcon/lifecycle-markers/onCreateCommand");
-    }
-
-    #[test]
-    fn test_extract_user_from_inspect_prefers_detected_user() {
-        let inspect = serde_json::json!({
-            "_devconDetectedUser": "node",
-            "Config": {
-                "User": "root"
-            }
-        });
-
-        let user = ContainerDriver::extract_user_from_inspect(&inspect);
-        assert_eq!(user.as_deref(), Some("node"));
-    }
-
-    #[test]
-    fn test_extract_user_from_inspect_uses_metadata_user() {
-        let inspect = serde_json::json!({
-            "Config": {
-                "User": "vscode"
-            }
-        });
-
-        let user = ContainerDriver::extract_user_from_inspect(&inspect);
-        assert_eq!(user.as_deref(), Some("vscode"));
-    }
-
-    #[test]
-    fn test_extract_home_from_inspect_prefers_detected_home() {
-        let inspect = serde_json::json!({
-            "_devconDetectedHome": "/workspace/home",
-            "Config": {
-                "Env": ["HOME=/home/vscode"]
-            }
-        });
-
-        let home = ContainerDriver::extract_home_from_inspect(&inspect);
-        assert_eq!(home.as_deref(), Some("/workspace/home"));
-    }
-
-    #[test]
-    fn test_extract_home_from_inspect_uses_env_home() {
-        let inspect = serde_json::json!({
-            "Config": {
-                "Env": ["PATH=/usr/bin", "HOME=/home/node"]
-            }
-        });
-
-        let home = ContainerDriver::extract_home_from_inspect(&inspect);
-        assert_eq!(home.as_deref(), Some("/home/node"));
     }
 
     #[test]

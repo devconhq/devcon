@@ -224,6 +224,21 @@ pub trait ContainerHandle: Send {
     fn id(&self) -> &str;
 }
 
+/// Runtime-probed information about a container image.
+///
+/// Obtained by running a single throwaway container with a shell probe command, capturing
+/// the effective user, home directory, and PATH as they are initialised at runtime
+/// (shell login scripts, feature-installed env vars, etc.).
+#[derive(Debug, Clone)]
+pub struct ContainerProbeInfo {
+    /// The effective username inside the container (output of `id -un`).
+    pub user: String,
+    /// The home directory of that user (`$HOME` after login-shell init).
+    pub home: String,
+    /// The `$PATH` after login-shell init.
+    pub path: String,
+}
+
 pub trait ContainerRuntime: Send {
     /// Builds a container image from a Dockerfile.
     ///
@@ -421,15 +436,21 @@ pub trait ContainerRuntime: Send {
     /// is not set.
     fn image_label(&self, image_tag: &str, label_key: &str) -> Result<Option<String>>;
 
-    /// Probe a single environment variable by running a temporary container from the image.
+    /// Probe the runtime user, home directory, and PATH by running a single temporary container.
     ///
-    /// This is useful when image inspect metadata lacks values that are initialized at runtime.
+    /// Runs `printf '%s\n%s\n%s' "$(id -un)" "$HOME" "$PATH"` inside a throwaway container
+    /// started from `image_tag`. When `user` is `Some`, the probe runs as that specific user
+    /// (needed when `Config.User` is `root` but the intended remote user differs).
     ///
     /// # Returns
     ///
-    /// `Ok(Some(value))` if the variable was successfully read, `Ok(None)` if probing failed
-    /// or the value is not set.
-    fn probe_image_env_var(&self, image_tag: &str, key: &str) -> Result<Option<String>>;
+    /// `Ok(Some(info))` on success, `Ok(None)` if no suitable shell was found or the probe
+    /// failed.
+    fn probe_image_info(
+        &self,
+        image_tag: &str,
+        user: Option<&str>,
+    ) -> Result<Option<ContainerProbeInfo>>;
 
     /// Get the host address for the runtime.
     ///
