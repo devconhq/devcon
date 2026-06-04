@@ -33,7 +33,7 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    fs::{self, File},
+    fs::{self},
     path::{Path, PathBuf},
 };
 
@@ -47,12 +47,57 @@ use crate::devcontainer::{
     parse_feature,
 };
 use crate::feature::Feature;
+use schema::lockfile::{DevcontainerLockEntry, DevcontainerLockfile, normalize_feature_identifier};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LockMode {
+    #[default]
+    Update,
+    Frozen,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FeatureLockContext {
+    pub mode: LockMode,
+    pub lockfile: Option<DevcontainerLockfile>,
+}
+
+impl FeatureLockContext {
+    pub fn update(lockfile: Option<DevcontainerLockfile>) -> Self {
+        Self {
+            mode: LockMode::Update,
+            lockfile,
+        }
+    }
+
+    pub fn frozen(lockfile: DevcontainerLockfile) -> Self {
+        Self {
+            mode: LockMode::Frozen,
+            lockfile: Some(lockfile),
+        }
+    }
+
+    fn lock_entry_for_registry(
+        &self,
+        registry: &FeatureRegistry,
+    ) -> Option<&DevcontainerLockEntry> {
+        let key = normalize_feature_identifier(&format!(
+            "ghcr.io/{}/{}/{}:{}",
+            registry.owner, registry.repository, registry.name, registry.version
+        ));
+        self.lockfile
+            .as_ref()
+            .and_then(|lock| lock.features.get(&key))
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct FeatureProcessResult {
     pub feature_ref: FeatureRef,
     pub feature: Feature,
     pub path: PathBuf,
+    pub resolved: Option<String>,
+    pub integrity: Option<String>,
 }
 
 impl FeatureProcessResult {
@@ -112,6 +157,7 @@ impl FeatureProcessResult {
 pub fn process_features(
     features: &[FeatureRef],
     silent: bool,
+    lock_context: &FeatureLockContext,
 ) -> Result<Vec<FeatureProcessResult>> {
     if !silent {
         println!("Processing features..");
@@ -138,7 +184,7 @@ pub fn process_features(
                 }
             }
         }
-        let feature_result = process_feature(feature_ref)?;
+        let feature_result = process_feature(feature_ref, lock_context)?;
         initial_results.push(feature_result);
     }
 
@@ -146,7 +192,7 @@ pub fn process_features(
     if !silent {
         println!("Resolving feature dependencies..");
     }
-    let all_features = resolve_all_dependencies(initial_results, silent)?;
+    let all_features = resolve_all_dependencies(initial_results, silent, lock_context)?;
 
     // Sort features topologically
     if !silent {
@@ -186,6 +232,7 @@ pub fn process_features(
 fn resolve_all_dependencies(
     initial_features: Vec<FeatureProcessResult>,
     silent: bool,
+    lock_context: &FeatureLockContext,
 ) -> Result<HashMap<String, FeatureProcessResult>> {
     let mut all_features: HashMap<String, FeatureProcessResult> = HashMap::new();
     let mut to_process: VecDeque<FeatureProcessResult> = VecDeque::new();
@@ -269,7 +316,7 @@ fn resolve_all_dependencies(
             if !silent {
                 println!("Downloading dependency feature: {}", dep_id);
             }
-            let dep_result = process_feature(&dep_ref)?;
+            let dep_result = process_feature(&dep_ref, lock_context)?;
             let dep_feature_id = dep_result.feature.id.clone();
 
             // Add to processing queue
@@ -465,14 +512,20 @@ fn topological_sort(
     Ok(sorted)
 }
 
-pub fn process_feature(feature_ref: &FeatureRef) -> Result<FeatureProcessResult> {
-    let relative_path = match &feature_ref.source {
-        Registry { registry } => download_feature(registry),
-        Local { path } => local_feature(path),
+pub fn process_feature(
+    feature_ref: &FeatureRef,
+    lock_context: &FeatureLockContext,
+) -> Result<FeatureProcessResult> {
+    let feature_download = match &feature_ref.source {
+        Registry { registry } => download_feature(registry, lock_context),
+        Local { path } => Ok(DownloadedFeature {
+            path: local_feature(path)?,
+            digest: None,
+        }),
     }?;
 
     // Read devcontainer-feature.json if it exists to parse the Feature metadata
-    let feature_json_path = relative_path.join("devcontainer-feature.json");
+    let feature_json_path = feature_download.path.join("devcontainer-feature.json");
 
     if !feature_json_path.exists() {
         return Err(Error::new(format!(
@@ -487,8 +540,34 @@ pub fn process_feature(feature_ref: &FeatureRef) -> Result<FeatureProcessResult>
     Ok(FeatureProcessResult {
         feature_ref: feature_ref.clone(),
         feature: parsed_feature,
-        path: relative_path,
+        path: feature_download.path,
+        resolved: feature_download
+            .digest
+            .as_ref()
+            .map(|digest| registry_resolved_reference(feature_ref, digest))
+            .transpose()?,
+        integrity: feature_download
+            .digest
+            .map(|digest| format!("sha256:{}", digest)),
     })
+}
+
+fn registry_resolved_reference(feature_ref: &FeatureRef, digest: &str) -> Result<String> {
+    match &feature_ref.source {
+        Registry { registry } => Ok(format!(
+            "ghcr.io/{}/{}/{}@sha256:{}",
+            registry.owner, registry.repository, registry.name, digest
+        )),
+        Local { .. } => Err(Error::new(
+            "resolved reference only applies to registry features",
+        )),
+    }
+}
+
+#[derive(Debug)]
+struct DownloadedFeature {
+    path: PathBuf,
+    digest: Option<String>,
 }
 
 /// Get the cache directory for devcontainer features
@@ -522,27 +601,84 @@ fn local_feature(path: &Path) -> Result<PathBuf> {
     path.canonicalize().map_err(|e| Error::new(e.to_string()))
 }
 
-/// Download a feature from registry to cache, or use cached version if available
-fn download_feature(registry: &FeatureRegistry) -> Result<PathBuf> {
-    // First, fetch the manifest to get the layer SHA
-    let (token, layer_digest) = fetch_manifest_and_layer_digest(registry)?;
-
-    // Extract SHA from digest (format: "sha256:abc123...")
-    let layer_sha = layer_digest
+fn normalize_layer_digest(layer_digest: &str) -> String {
+    layer_digest
         .strip_prefix("sha256:")
-        .unwrap_or(&layer_digest)
-        .chars()
-        .take(12) // Use first 12 chars of SHA for shorter paths
-        .collect::<String>();
+        .unwrap_or(layer_digest)
+        .to_string()
+}
 
+fn layer_sha_prefix(layer_digest: &str) -> String {
+    normalize_layer_digest(layer_digest)
+        .chars()
+        .take(12)
+        .collect::<String>()
+}
+
+fn parse_digest_from_resolved(resolved: &str) -> Option<String> {
+    let (_, digest_part) = resolved.rsplit_once('@')?;
+    if !digest_part.starts_with("sha256:") {
+        return None;
+    }
+    Some(normalize_layer_digest(digest_part))
+}
+
+fn is_feature_cached(path: &Path) -> bool {
+    path.exists() && path.join("devcontainer-feature.json").exists()
+}
+
+/// Download a feature from registry to cache, or use cached version if available
+fn download_feature(
+    registry: &FeatureRegistry,
+    lock_context: &FeatureLockContext,
+) -> Result<DownloadedFeature> {
+    if let Some(lock_entry) = lock_context.lock_entry_for_registry(registry) {
+        if let Some(locked_digest) = parse_digest_from_resolved(&lock_entry.resolved) {
+            let locked_sha = layer_sha_prefix(&locked_digest);
+            let locked_path = get_cached_feature_path(registry, &locked_sha)?;
+
+            if is_feature_cached(&locked_path) {
+                info!(
+                    "Using locked cached feature: {} (version {}, SHA: {})",
+                    registry.name, registry.version, locked_sha
+                );
+                return Ok(DownloadedFeature {
+                    path: locked_path,
+                    digest: Some(locked_digest),
+                });
+            }
+
+            if lock_context.mode == LockMode::Frozen {
+                return Err(Error::feature(format!(
+                    "Feature {} is locked to digest sha256:{} but not present in local cache. Run an online build without --frozen-lockfile first.",
+                    registry.name, locked_digest
+                )));
+            }
+
+            info!(
+                "Locked cache miss for feature {} (SHA: {}), downloading locked digest",
+                registry.name, locked_sha
+            );
+            let token = fetch_registry_token(registry)?;
+            download_and_cache_feature(registry, &locked_path, &token, &locked_digest)?;
+            return Ok(DownloadedFeature {
+                path: locked_path,
+                digest: Some(locked_digest),
+            });
+        }
+
+        debug!(
+            "Ignoring malformed lockfile resolved value for feature {}: {}",
+            registry.name, lock_entry.resolved
+        );
+    }
+
+    let token = fetch_registry_token(registry)?;
+    let layer_digest = fetch_manifest_layer_digest(registry, &token)?;
+    let layer_sha = layer_sha_prefix(&layer_digest);
     let cached_feature_path = get_cached_feature_path(registry, &layer_sha)?;
 
-    // Check if feature is already cached
-    if !cached_feature_path.exists()
-        || !cached_feature_path
-            .join("devcontainer-feature.json")
-            .exists()
-    {
+    if !is_feature_cached(&cached_feature_path) {
         info!(
             "Downloading feature: {} (version {}, SHA: {})",
             registry.name, registry.version, layer_sha
@@ -555,11 +691,14 @@ fn download_feature(registry: &FeatureRegistry) -> Result<PathBuf> {
         );
     }
 
-    Ok(cached_feature_path)
+    Ok(DownloadedFeature {
+        path: cached_feature_path,
+        digest: Some(normalize_layer_digest(&layer_digest)),
+    })
 }
 
-/// Fetch the manifest and extract the layer digest (SHA)
-fn fetch_manifest_and_layer_digest(registry: &FeatureRegistry) -> Result<(String, String)> {
+/// Fetch an auth token for downloading feature manifests/layers.
+fn fetch_registry_token(registry: &FeatureRegistry) -> Result<String> {
     let token_url = format!(
         "https://{}/token?scope=repository:{}/{}:pull",
         "ghcr.io", registry.owner, registry.repository
@@ -583,6 +722,11 @@ fn fetch_manifest_and_layer_digest(registry: &FeatureRegistry) -> Result<(String
         })?
         .to_string();
 
+    Ok(token)
+}
+
+/// Fetch the manifest and extract the layer digest (SHA).
+fn fetch_manifest_layer_digest(registry: &FeatureRegistry, token: &str) -> Result<String> {
     let manifest_url = format!(
         "https://{}/v2/{}/{}/{}/manifests/{}",
         "ghcr.io", registry.owner, registry.repository, registry.name, registry.version
@@ -590,7 +734,7 @@ fn fetch_manifest_and_layer_digest(registry: &FeatureRegistry) -> Result<(String
 
     let manifest_response = reqwest::blocking::Client::new()
         .get(&manifest_url)
-        .bearer_auth(&token)
+        .bearer_auth(token)
         .header("Accept", "application/vnd.oci.image.manifest.v1+json")
         .send()?;
 
@@ -611,7 +755,7 @@ fn fetch_manifest_and_layer_digest(registry: &FeatureRegistry) -> Result<(String
         ))
     })?;
 
-    Ok((token, layer.digest().to_string()))
+    Ok(layer.digest().to_string())
 }
 
 /// Download and extract a feature to the cache directory
@@ -640,79 +784,7 @@ fn download_and_cache_feature(
     }
     let layer_bytes = layer_response.bytes()?;
 
-    // Re-fetch manifest to get media type (we only got the digest earlier)
-    let manifest_url = format!(
-        "https://{}/v2/{}/{}/{}/manifests/{}",
-        "ghcr.io", registry.owner, registry.repository, registry.name, registry.version
-    );
-    let manifest_response = reqwest::blocking::Client::new()
-        .get(&manifest_url)
-        .bearer_auth(token)
-        .header("Accept", "application/vnd.oci.image.manifest.v1+json")
-        .send()?;
-    let manifest_json: serde_json::Value = manifest_response.json()?;
-    let manifest_str = serde_json::to_string(&manifest_json)?;
-    let reader = std::io::Cursor::new(manifest_str);
-    let manifest = oci_spec::image::ImageManifest::from_reader(reader)?;
-    let layer = manifest.layers().first().ok_or_else(|| {
-        Error::new(format!(
-            "No layers found in manifest for feature: {}",
-            registry.name
-        ))
-    })?;
-
-    let extract_path = match layer.media_type() {
-        oci_spec::image::MediaType::Other(str) => match str.as_str() {
-            "application/vnd.devcontainers.layer.v1+tar"
-            | "application/vnd.oci.image.layer.v1.tar" => {
-                debug!(
-                    "Extracting uncompressed layer for feature: {}",
-                    registry.name
-                );
-                let temp_file = temp_directory.path().join("feature.tar");
-                fs::write(&temp_file, &layer_bytes)?;
-
-                let feature_archive = File::open(&temp_file)?;
-                let mut archive = tar::Archive::new(feature_archive);
-                let extract_path = temp_directory.path().join("extract");
-                fs::create_dir_all(&extract_path)?;
-                archive.unpack(&extract_path).unwrap();
-
-                extract_path
-            }
-            "application/vnd.devcontainers.layer.v1+tar+gzip"
-            | "application/vnd.oci.image.layer.v1.tar+gzip" => {
-                debug!(
-                    "Extracting gzip compressed layer for feature: {}",
-                    registry.name
-                );
-                let temp_file = temp_directory.path().join("feature.tar.gz");
-                fs::write(&temp_file, &layer_bytes)?;
-
-                let feature_archive = File::open(&temp_file)?;
-                let decompressor = flate2::read::GzDecoder::new(feature_archive);
-                let mut archive = tar::Archive::new(decompressor);
-                let extract_path = temp_directory.path().join("extract");
-                fs::create_dir_all(&extract_path)?;
-                archive.unpack(&extract_path).unwrap();
-
-                extract_path
-            }
-            _ => {
-                return Err(Error::new(format!(
-                    "Unsupported layer media type for feature: {}, media type: {}",
-                    registry.name, str
-                )));
-            }
-        },
-
-        _ => {
-            return Err(Error::new(format!(
-                "Unsupported layer media type for feature: {}",
-                registry.name
-            )));
-        }
-    };
+    let extract_path = extract_layer(temp_directory.path(), layer_bytes.as_ref(), registry)?;
 
     debug!(
         "Feature {} extracted to temporary path: {}",
@@ -736,6 +808,85 @@ fn download_and_cache_feature(
         .map_err(|e| Error::new(format!("Failed to copy extracted feature: {}", e)))?;
 
     Ok(())
+}
+
+fn extract_layer(
+    temp_directory: &Path,
+    layer_bytes: &[u8],
+    registry: &FeatureRegistry,
+) -> Result<PathBuf> {
+    let extract_path = temp_directory.join("extract");
+    fs::create_dir_all(&extract_path)?;
+
+    if layer_bytes.len() >= 2 && layer_bytes[0] == 0x1f && layer_bytes[1] == 0x8b {
+        debug!(
+            "Extracting gzip compressed layer for feature: {}",
+            registry.name
+        );
+        let cursor = std::io::Cursor::new(layer_bytes);
+        let decompressor = flate2::read::GzDecoder::new(cursor);
+        let mut archive = tar::Archive::new(decompressor);
+        archive
+            .unpack(&extract_path)
+            .map_err(|e| Error::new(format!("Failed to unpack compressed feature layer: {}", e)))?;
+        return Ok(extract_path);
+    }
+
+    debug!(
+        "Extracting uncompressed layer for feature: {}",
+        registry.name
+    );
+    let cursor = std::io::Cursor::new(layer_bytes);
+    let mut archive = tar::Archive::new(cursor);
+    archive
+        .unpack(&extract_path)
+        .map_err(|e| Error::new(format!("Failed to unpack feature layer: {}", e)))?;
+    Ok(extract_path)
+}
+
+pub fn build_lockfile_from_features(features: &[FeatureProcessResult]) -> DevcontainerLockfile {
+    let mut lockfile = DevcontainerLockfile::default();
+
+    for feature in features {
+        let (source_key, resolved, integrity) = match (
+            &feature.feature_ref.source,
+            &feature.resolved,
+            &feature.integrity,
+        ) {
+            (Registry { registry }, Some(resolved), Some(integrity)) => (
+                normalize_feature_identifier(&format!(
+                    "ghcr.io/{}/{}/{}:{}",
+                    registry.owner, registry.repository, registry.name, registry.version
+                )),
+                resolved.clone(),
+                integrity.clone(),
+            ),
+            _ => continue,
+        };
+
+        let depends_on = feature.feature.depends_on.as_ref().map(|deps| {
+            let mut values: Vec<String> = deps
+                .keys()
+                .map(|dep| normalize_feature_identifier(dep))
+                .collect();
+            values.sort();
+            values
+        });
+
+        let depends_on = depends_on.filter(|deps| !deps.is_empty());
+
+        lockfile.features.insert(
+            source_key,
+            DevcontainerLockEntry {
+                resolved,
+                version: feature.feature.version.clone(),
+                integrity,
+                depends_on,
+            },
+        );
+    }
+
+    lockfile
 }
 
 /// Clear the entire feature cache
@@ -791,13 +942,13 @@ mod tests {
             registry_type: FeatureRegistryType::Ghcr,
         };
         let temp_dir = tempdir().unwrap();
-        let result = download_feature(&registry);
+        let result = download_feature(&registry, &FeatureLockContext::default());
         assert!(
             result.is_ok(),
             "Failed to download feature: {:?}",
             result.err()
         );
-        let relative_path = result.unwrap();
+        let relative_path = result.unwrap().path;
         let feature_path = temp_dir.path().join(&relative_path);
         assert!(feature_path.exists());
     }
@@ -813,7 +964,7 @@ mod tests {
                 registry_type: FeatureRegistryType::Ghcr,
             },
         });
-        let result = process_feature(&feature_ref);
+        let result = process_feature(&feature_ref, &FeatureLockContext::default());
         assert!(
             result.is_ok(),
             "Failed to download feature: {:?}",
@@ -838,7 +989,7 @@ mod tests {
                 registry_type: FeatureRegistryType::Ghcr,
             },
         });
-        let result = process_feature(&feature_ref);
+        let result = process_feature(&feature_ref, &FeatureLockContext::default());
         assert!(
             result.is_ok(),
             "Failed to download feature: {:?}",
@@ -984,6 +1135,44 @@ mod tests {
         assert!(pos_c < pos_d, "C should come before D");
     }
 
+    #[test]
+    fn test_parse_digest_from_resolved() {
+        let resolved = "ghcr.io/devcontainers/features/node@sha256:abcdef1234567890";
+        let parsed = parse_digest_from_resolved(resolved);
+        assert_eq!(parsed, Some("abcdef1234567890".to_string()));
+
+        assert!(parse_digest_from_resolved("ghcr.io/devcontainers/features/node:1").is_none());
+        assert!(
+            parse_digest_from_resolved("ghcr.io/devcontainers/features/node@md5:abc").is_none()
+        );
+    }
+
+    #[test]
+    fn test_build_lockfile_from_features_registry_only() {
+        let mut registry_feature = create_mock_feature("feature-a", None, None);
+        registry_feature.resolved =
+            Some("ghcr.io/test/features/feature-a@sha256:abc123".to_string());
+        registry_feature.integrity = Some("sha256:abc123".to_string());
+
+        let local_feature = FeatureProcessResult {
+            feature_ref: FeatureRef::new(FeatureSource::Local {
+                path: std::path::PathBuf::from("./local-feature"),
+            }),
+            feature: registry_feature.feature.clone(),
+            path: std::path::PathBuf::from("./local-feature"),
+            resolved: None,
+            integrity: None,
+        };
+
+        let lockfile = build_lockfile_from_features(&[registry_feature, local_feature]);
+        assert_eq!(lockfile.features.len(), 1);
+        assert!(
+            lockfile
+                .features
+                .contains_key("ghcr.io/test/features/feature-a:1.0.0")
+        );
+    }
+
     // Helper function to create mock feature results
     fn create_mock_feature(
         id: &str,
@@ -1034,6 +1223,8 @@ mod tests {
             feature_ref,
             feature,
             path: PathBuf::from(format!("/tmp/{}", id)),
+            resolved: None,
+            integrity: None,
         }
     }
 }

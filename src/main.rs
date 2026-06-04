@@ -98,6 +98,13 @@ enum Commands {
         /// Path to the build directory.
         #[arg(short, long, help = "Path to the build directory.")]
         build_path: Option<PathBuf>,
+
+        /// Use devcontainer-lock.json without updating it.
+        #[arg(
+            long,
+            help = "Resolve features from devcontainer-lock.json and do not update it."
+        )]
+        frozen_lockfile: bool,
     },
 
     /// Starts a development container for the specified path
@@ -127,6 +134,13 @@ enum Commands {
         /// Force a rebuild even if the config hash is unchanged.
         #[arg(long, help = "Force a rebuild, ignoring the cached image.")]
         force_rebuild: bool,
+
+        /// Use devcontainer-lock.json without updating it.
+        #[arg(
+            long,
+            help = "Resolve features from devcontainer-lock.json and do not update it."
+        )]
+        frozen_lockfile: bool,
     },
     /// Execs a shell in a development container for the specified path
     #[command(about = "Exec a shell in a development container with the devcontainer CLI")]
@@ -209,12 +223,17 @@ fn main() -> devcon::error::Result<()> {
     let output = cli.output.clone();
 
     match &cli.command {
-        Commands::Build { path, build_path } => {
+        Commands::Build {
+            path,
+            build_path,
+            frozen_lockfile,
+        } => {
             handle_build_command(
                 path.clone().unwrap_or(PathBuf::from(".").to_path_buf()),
                 build_path.clone(),
                 config_path,
                 output,
+                *frozen_lockfile,
             )?;
         }
         Commands::Start { path } => {
@@ -228,6 +247,7 @@ fn main() -> devcon::error::Result<()> {
             path,
             build_path,
             force_rebuild,
+            frozen_lockfile,
         } => {
             handle_up_command(
                 path.clone().unwrap_or(PathBuf::from(".").to_path_buf()),
@@ -235,6 +255,7 @@ fn main() -> devcon::error::Result<()> {
                 config_path,
                 output,
                 *force_rebuild,
+                *frozen_lockfile,
             )?;
         }
         Commands::Shell { path, env } => {

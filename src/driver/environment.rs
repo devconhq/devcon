@@ -228,6 +228,8 @@ mod tests {
                 },
             }),
             path: PathBuf::from("/tmp/test"),
+            resolved: None,
+            integrity: None,
         }
     }
 
