@@ -45,7 +45,7 @@ use crate::{
     config::Config,
     driver::{
         control_server,
-        orchestrator::ContainerOrchestrator,
+        orchestrator::{ContainerOrchestrator, FeatureLockOptions},
         runtime::{container::ContainerCliRuntime, docker::DockerRuntime},
     },
     workspace::Workspace,
@@ -193,7 +193,7 @@ pub struct InfoResponse {
 /// # use devcon::command::handle_build_command;
 ///
 /// let project_path = PathBuf::from("/path/to/project");
-/// handle_build_command(project_path, None, None, devcon::output::OutputFormat::Text)?;
+/// handle_build_command(project_path, None, None, devcon::output::OutputFormat::Text, false)?;
 /// # Ok::<(), devcon::error::Error>(())
 /// ```
 pub fn handle_build_command(
@@ -201,6 +201,7 @@ pub fn handle_build_command(
     build_path: Option<PathBuf>,
     config_path: Option<PathBuf>,
     output: OutputFormat,
+    frozen_lockfile: bool,
 ) -> Result<()> {
     let config = Config::load(config_path)?;
 
@@ -217,7 +218,12 @@ pub fn handle_build_command(
 
     let driver = ContainerOrchestrator::new_silent(config, runtime, output == OutputFormat::Json);
 
-    let result = driver.build(devcontainer_workspace, &[], effective_build_path);
+    let result = driver.build_with_lock_options(
+        devcontainer_workspace,
+        &[],
+        effective_build_path,
+        FeatureLockOptions { frozen_lockfile },
+    );
 
     if result.is_err() {
         return Err(Error::new(format!(
@@ -614,7 +620,7 @@ fn replace_or_append_host_block_by_alias(
 /// # use devcon::command::handle_up_command;
 ///
 /// let project_path = PathBuf::from("/path/to/project");
-/// handle_up_command(project_path, None, None, devcon::output::OutputFormat::Text, false)?;
+/// handle_up_command(project_path, None, None, devcon::output::OutputFormat::Text, false, false)?;
 /// # Ok::<(), devcon::error::Error>(())
 /// ```
 pub fn handle_up_command(
@@ -623,6 +629,7 @@ pub fn handle_up_command(
     config_path: Option<PathBuf>,
     output: OutputFormat,
     force_rebuild: bool,
+    frozen_lockfile: bool,
 ) -> Result<()> {
     warn_if_serve_not_running();
     let config = Config::load(config_path)?;
@@ -640,7 +647,9 @@ pub fn handle_up_command(
     let driver = ContainerOrchestrator::new_silent(config, runtime, output == OutputFormat::Json);
 
     // Process features once
-    let (processed_features, _) = driver.prepare_features(&devcontainer_workspace)?;
+    let lock_options = FeatureLockOptions { frozen_lockfile };
+    let (processed_features, _) =
+        driver.prepare_features(&devcontainer_workspace, &lock_options)?;
 
     // Only build if the config has changed, the image does not yet exist, or a force rebuild
     // was requested.
@@ -660,6 +669,7 @@ pub fn handle_up_command(
             &[],
             Some(processed_features.clone()),
             effective_build_path,
+            lock_options,
         )?;
     }
 
@@ -668,6 +678,7 @@ pub fn handle_up_command(
         devcontainer_workspace.clone(),
         &[],
         Some(processed_features),
+        lock_options,
     )?;
 
     let remote_user = driver.resolve_remote_user_for_workspace(&devcontainer_workspace);
@@ -864,7 +875,7 @@ pub fn handle_info_command(
 
     let driver = ContainerOrchestrator::new(config, runtime);
 
-    match driver.prepare_features(&devcontainer_workspace) {
+    match driver.prepare_features(&devcontainer_workspace, &FeatureLockOptions::default()) {
         Ok((processed_features, _)) => {
             if processed_features.is_empty() {
                 println!("  No features configured");
@@ -987,20 +998,21 @@ fn handle_info_json(config: &Config, devcontainer_workspace: &Workspace) -> Resu
     let driver = ContainerOrchestrator::new_silent(config.clone(), runtime, true);
 
     // Features
-    let (features, features_error) = match driver.prepare_features(devcontainer_workspace) {
-        Ok((processed_features, _)) => {
-            let entries: Vec<FeatureEntry> = processed_features
-                .iter()
-                .map(|f| FeatureEntry {
-                    name: f.name().to_string(),
-                    id: f.feature.id.clone(),
-                    version: f.feature.version.clone(),
-                })
-                .collect();
-            (Some(entries), None)
-        }
-        Err(e) => (None, Some(e.to_string())),
-    };
+    let (features, features_error) =
+        match driver.prepare_features(devcontainer_workspace, &FeatureLockOptions::default()) {
+            Ok((processed_features, _)) => {
+                let entries: Vec<FeatureEntry> = processed_features
+                    .iter()
+                    .map(|f| FeatureEntry {
+                        name: f.name().to_string(),
+                        id: f.feature.id.clone(),
+                        version: f.feature.version.clone(),
+                    })
+                    .collect();
+                (Some(entries), None)
+            }
+            Err(e) => (None, Some(e.to_string())),
+        };
 
     // Image check
     let image_tag = format!(
@@ -1088,6 +1100,7 @@ mod test {
             None,
             None,
             OutputFormat::Text,
+            false,
         );
         assert!(result.is_ok(), "Build command failed: {:?}", result.err());
     }

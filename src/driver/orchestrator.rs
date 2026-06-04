@@ -79,13 +79,16 @@ use crate::driver::agent_socket::{
 };
 use crate::driver::dockerfile::{BuildContext, DockerfileParams, apply_feature_order_override};
 use crate::driver::environment::{base_container_environment, compose_start_environment};
-use crate::driver::feature_process::FeatureProcessResult;
+use crate::driver::feature_process::{
+    FeatureLockContext, FeatureProcessResult, LockMode, build_lockfile_from_features,
+};
 use crate::driver::lifecycle::{guard_with_marker, run_lifecycle_command};
 use crate::driver::runtime::{ContainerImageInfo, ContainerProbeInfo, RuntimeParameters};
 use crate::{
     config::Config, driver::feature_process::process_features, driver::runtime::ContainerRuntime,
     workspace::Workspace,
 };
+use schema::{DevcontainerLockfile, resolve_lockfile_path};
 
 /// Driver for managing container build and runtime operations.
 ///
@@ -95,6 +98,11 @@ pub struct ContainerOrchestrator {
     config: Config,
     pub runtime: Box<dyn ContainerRuntime>,
     silent: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FeatureLockOptions {
+    pub frozen_lockfile: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -239,6 +247,7 @@ impl ContainerOrchestrator {
     pub fn prepare_features(
         &self,
         devcontainer_workspace: &Workspace,
+        lock_options: &FeatureLockOptions,
     ) -> Result<(Vec<FeatureProcessResult>, Vec<FeatureRef>)> {
         trace!(
             "Using features of devcontainer: {:?}",
@@ -271,8 +280,24 @@ impl ContainerOrchestrator {
         }
         debug!("Initial feature list: {:?}", features);
 
+        let lockfile = self.read_lockfile(devcontainer_workspace)?;
+        let lock_context = match (lock_options.frozen_lockfile, lockfile) {
+            (true, Some(lockfile)) => FeatureLockContext::frozen(lockfile),
+            (true, None) => {
+                let lock_path =
+                    resolve_lockfile_path(&devcontainer_workspace.path).ok_or_else(|| {
+                        Error::feature("Could not resolve devcontainer-lock.json path")
+                    })?;
+                return Err(Error::feature(format!(
+                    "Lockfile mode enabled but no lockfile was found at {}",
+                    lock_path.display()
+                )));
+            }
+            (false, lockfile) => FeatureLockContext::update(lockfile),
+        };
+
         // Process all features including dependency resolution and topological sorting
-        let mut processed_features = process_features(&features, self.silent)?;
+        let mut processed_features = process_features(&features, self.silent, &lock_context)?;
 
         // Apply override feature install order if specified
         if let Some(ref override_order) = devcontainer_workspace
@@ -293,6 +318,13 @@ impl ContainerOrchestrator {
                 .map(|f| &f.feature.id)
                 .collect::<Vec<_>>()
         );
+
+        if lock_context.mode == LockMode::Update {
+            self.write_lockfile(
+                devcontainer_workspace,
+                &build_lockfile_from_features(&processed_features),
+            )?;
+        }
 
         Ok((processed_features, features))
     }
@@ -346,7 +378,29 @@ impl ContainerOrchestrator {
         env_variables: &[String],
         build_path: Option<PathBuf>,
     ) -> Result<()> {
-        self.build_with_features(devcontainer_workspace, env_variables, None, build_path)
+        self.build_with_features(
+            devcontainer_workspace,
+            env_variables,
+            None,
+            build_path,
+            FeatureLockOptions::default(),
+        )
+    }
+
+    pub fn build_with_lock_options(
+        &self,
+        devcontainer_workspace: Workspace,
+        env_variables: &[String],
+        build_path: Option<PathBuf>,
+        lock_options: FeatureLockOptions,
+    ) -> Result<()> {
+        self.build_with_features(
+            devcontainer_workspace,
+            env_variables,
+            None,
+            build_path,
+            lock_options,
+        )
     }
 
     /// Returns `true` if the latest image for the given workspace already exists in the runtime.
@@ -380,6 +434,7 @@ impl ContainerOrchestrator {
         env_variables: &[String],
         processed_features: Option<Vec<FeatureProcessResult>>,
         build_path: Option<PathBuf>,
+        lock_options: FeatureLockOptions,
     ) -> Result<()> {
         let ctx = BuildContext::new(build_path)?;
         info!(
@@ -396,7 +451,8 @@ impl ContainerOrchestrator {
         let processed_features = match processed_features {
             Some(features) => features,
             None => {
-                let (features, _) = self.prepare_features(&devcontainer_workspace)?;
+                let (features, _) =
+                    self.prepare_features(&devcontainer_workspace, &lock_options)?;
                 features
             }
         };
@@ -613,7 +669,21 @@ impl ContainerOrchestrator {
         devcontainer_workspace: Workspace,
         env_variables: &[String],
     ) -> Result<String> {
-        self.start_with_features(devcontainer_workspace, env_variables, None)
+        self.start_with_features(
+            devcontainer_workspace,
+            env_variables,
+            None,
+            FeatureLockOptions::default(),
+        )
+    }
+
+    pub fn start_with_lock_options(
+        &self,
+        devcontainer_workspace: Workspace,
+        env_variables: &[String],
+        lock_options: FeatureLockOptions,
+    ) -> Result<String> {
+        self.start_with_features(devcontainer_workspace, env_variables, None, lock_options)
     }
 
     /// Starts a container from a built image with optional pre-processed features.
@@ -638,6 +708,7 @@ impl ContainerOrchestrator {
         devcontainer_workspace: Workspace,
         env_variables: &[String],
         processed_features: Option<Vec<FeatureProcessResult>>,
+        lock_options: FeatureLockOptions,
     ) -> Result<String> {
         let handles = self.runtime.list()?;
         let container_name = self.get_container_name(&devcontainer_workspace);
@@ -819,7 +890,8 @@ impl ContainerOrchestrator {
         let processed_features = match processed_features {
             Some(features) => features,
             None => {
-                let (features, _) = self.prepare_features(&devcontainer_workspace)?;
+                let (features, _) =
+                    self.prepare_features(&devcontainer_workspace, &lock_options)?;
                 features
             }
         };
@@ -1476,6 +1548,57 @@ impl ContainerOrchestrator {
         format!("devcon-{}", devcontainer_workspace.get_sanitized_name())
     }
 
+    fn read_lockfile(
+        &self,
+        devcontainer_workspace: &Workspace,
+    ) -> Result<Option<DevcontainerLockfile>> {
+        let Some(lock_path) = resolve_lockfile_path(&devcontainer_workspace.path) else {
+            return Ok(None);
+        };
+
+        if !lock_path.exists() {
+            return Ok(None);
+        }
+
+        let content = fs::read_to_string(&lock_path)?;
+        let lockfile: DevcontainerLockfile = serde_json::from_str(&content).map_err(|e| {
+            Error::feature(format!(
+                "Failed to parse lockfile {}: {}",
+                lock_path.display(),
+                e
+            ))
+        })?;
+        Ok(Some(lockfile))
+    }
+
+    fn write_lockfile(
+        &self,
+        devcontainer_workspace: &Workspace,
+        lockfile: &DevcontainerLockfile,
+    ) -> Result<()> {
+        let Some(lock_path) = resolve_lockfile_path(&devcontainer_workspace.path) else {
+            return Err(Error::feature(
+                "Could not resolve lockfile path for workspace",
+            ));
+        };
+
+        let serialized = serde_json::to_string_pretty(lockfile)?;
+        if let Ok(existing) = fs::read_to_string(&lock_path)
+            && existing == serialized
+        {
+            return Ok(());
+        }
+
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let temp_path = lock_path.with_extension("json.tmp");
+        fs::write(&temp_path, serialized)?;
+        fs::rename(temp_path, lock_path)?;
+        Ok(())
+    }
+
     fn get_container_name(&self, devcontainer_workspace: &Workspace) -> String {
         format!("devcon.{}", devcontainer_workspace.get_sanitized_name())
     }
@@ -1490,10 +1613,15 @@ impl ContainerOrchestrator {
     fn get_devcontainer_id(&self, devcontainer_workspace: &Workspace) -> String {
         let mut hasher = Sha256::new();
 
-        let devcontainer_path = devcontainer_workspace
-            .path
-            .join(".devcontainer")
-            .join("devcontainer.json");
+        let devcontainer_path = schema::resolve_devcontainer_file_path(
+            &devcontainer_workspace.path,
+        )
+        .unwrap_or_else(|| {
+            devcontainer_workspace
+                .path
+                .join(".devcontainer")
+                .join("devcontainer.json")
+        });
 
         match fs::read_to_string(&devcontainer_path) {
             Ok(content) => {
@@ -1527,6 +1655,12 @@ impl ContainerOrchestrator {
                     hasher.update(format!("{}={}", k, v).as_bytes());
                 }
             }
+        }
+
+        if let Some(lockfile_path) = resolve_lockfile_path(&devcontainer_workspace.path)
+            && let Ok(lockfile_content) = fs::read_to_string(lockfile_path)
+        {
+            hasher.update(lockfile_content.as_bytes());
         }
 
         let result = hasher.finalize();

@@ -387,6 +387,8 @@ mod tests {
                 },
             }),
             path: PathBuf::from("/tmp/test"),
+            resolved: None,
+            integrity: None,
         }
     }
 
@@ -504,6 +506,8 @@ mod tests {
             feature,
             feature_ref,
             path: feature_dir.clone(),
+            resolved: None,
+            integrity: None,
         };
 
         let ctx = BuildContext {

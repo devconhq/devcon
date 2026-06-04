@@ -25,7 +25,9 @@ pub mod error;
 pub mod feature;
 mod feature_ref;
 pub mod lifecycle;
+pub mod lockfile;
 
 pub use devcontainer::*;
 pub use error::{Error, Result};
 pub use lifecycle::{LifecycleCommand, LifecycleCommandValue};
+pub use lockfile::*;

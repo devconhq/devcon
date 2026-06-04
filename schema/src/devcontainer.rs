@@ -619,42 +619,7 @@ impl TryFrom<PathBuf> for Devcontainer {
     type Error = Error;
 
     fn try_from(path: PathBuf) -> std::result::Result<Self, Self::Error> {
-        // Check locations in order of precedence per devcontainer spec:
-        // 1. .devcontainer/devcontainer.json
-        // 2. .devcontainer.json
-        // 3. .devcontainer/<folder>/devcontainer.json (one level deep)
-
-        let primary_paths = vec![
-            path.join(".devcontainer").join("devcontainer.json"),
-            path.join("devcontainer.json"),
-        ];
-
-        // Find the first existing path from primary locations
-        let mut final_path = None;
-        for p in primary_paths {
-            if fs::exists(&p).unwrap_or(false) {
-                final_path = Some(p);
-                break;
-            }
-        }
-
-        // If not found in primary locations, check .devcontainer subfolders (one level deep)
-        if final_path.is_none() {
-            let devcontainer_dir = path.join(".devcontainer");
-            if let Ok(entries) = fs::read_dir(&devcontainer_dir) {
-                for entry in entries.flatten() {
-                    if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                        let candidate = entry.path().join("devcontainer.json");
-                        if fs::exists(&candidate).unwrap_or(false) {
-                            final_path = Some(candidate);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        let final_path = final_path.ok_or_else(|| {
+        let final_path = resolve_devcontainer_file_path(&path).ok_or_else(|| {
             Error::devcontainer(format!(
                 "Devcontainer definition not found in any standard location under {}",
                 path.to_string_lossy()
@@ -693,6 +658,41 @@ impl TryFrom<PathBuf> for Devcontainer {
 
         Ok(result)
     }
+}
+
+/// Resolve the effective `devcontainer.json` file path using spec precedence.
+pub fn resolve_devcontainer_file_path(path: &Path) -> Option<PathBuf> {
+    let primary_paths = vec![
+        path.join(".devcontainer").join("devcontainer.json"),
+        path.join("devcontainer.json"),
+    ];
+
+    for candidate in primary_paths {
+        if fs::exists(&candidate).unwrap_or(false) {
+            return Some(candidate);
+        }
+    }
+
+    let devcontainer_dir = path.join(".devcontainer");
+    if let Ok(entries) = fs::read_dir(&devcontainer_dir) {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                let candidate = entry.path().join("devcontainer.json");
+                if fs::exists(&candidate).unwrap_or(false) {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Resolve the sibling `devcontainer-lock.json` path for a workspace path.
+pub fn resolve_lockfile_path(path: &Path) -> Option<PathBuf> {
+    resolve_devcontainer_file_path(path)
+        .and_then(|devcontainer_file| devcontainer_file.parent().map(|p| p.to_path_buf()))
+        .map(|parent| parent.join("devcontainer-lock.json"))
 }
 
 impl TryFrom<String> for Devcontainer {
