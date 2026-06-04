@@ -36,13 +36,12 @@ use crate::error::Result;
 
 use crate::config::ContainerRuntimeConfig;
 use crate::driver::runtime::RuntimeParameters;
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
 use super::{ContainerImageConfig, ContainerImageInfo, ContainerRuntime, stream_build_output};
 
 const AUTO_HOST_PORT_MIN: u16 = 30001;
 const AUTO_HOST_PORT_PICK_ATTEMPTS: usize = 128;
-const CONTAINER_START_MAX_ATTEMPTS: usize = 3;
 
 /// Extract container-side port from a ForwardPort
 fn extract_container_port(port: &crate::devcontainer::ForwardPort) -> Option<u16> {
@@ -280,19 +279,6 @@ where
     Ok(resolved)
 }
 
-fn is_host_port_conflict_error(stderr: &str, stdout: &str) -> bool {
-    let combined = format!("{}\n{}", stderr, stdout).to_ascii_lowercase();
-    [
-        "address already in use",
-        "already allocated",
-        "port is in use",
-        "failed to expose port",
-        "port conflict",
-    ]
-    .iter()
-    .any(|needle| combined.contains(needle))
-}
-
 fn extract_mapped_port_from_value(value: &serde_json::Value, container_port: u16) -> Option<u16> {
     match value {
         serde_json::Value::Object(map) => {
@@ -358,37 +344,96 @@ impl ContainerCliRuntime {
         image_tag: &str,
         user: Option<&str>,
     ) -> Option<super::ContainerProbeInfo> {
-        const PROBE_CMD: &str = "printf '%s\\n%s\\n%s' \"$(id -un)\" \"$HOME\" \"$PATH\"";
+        const PROBE_CMD: &str =
+            "printf '%s\\n%s\\n%s\\n%s' \"$(id -un)\" \"$HOME\" \"$PATH\" \"$(uname -m)\"";
         let shells = ["sh", "/bin/sh", "bash", "/bin/bash"];
-        for shell in shells {
-            let mut cmd = Command::new("container");
-            cmd.arg("run").arg("--rm");
-            if let Some(u) = user {
-                cmd.arg("--user").arg(u);
-            }
-            cmd.arg("--entrypoint")
-                .arg(shell)
-                .arg(image_tag)
-                .arg("-lc")
-                .arg(PROBE_CMD);
+        debug!(
+            "Probing container image runtime environment for image '{}' with user hint {:?}",
+            image_tag, user
+        );
+        for use_rosetta in [true, false] {
+            for shell in shells {
+                trace!(
+                    "Attempting container probe with shell '{}' for image '{}' (rosetta={})",
+                    shell, image_tag, use_rosetta
+                );
+                let mut cmd = Command::new("container");
+                cmd.arg("run");
+                if use_rosetta {
+                    cmd.arg("--rosetta");
+                }
+                cmd.arg("--rm");
+                if let Some(u) = user {
+                    cmd.arg("--user").arg(u);
+                }
+                cmd.arg("--entrypoint")
+                    .arg(shell)
+                    .arg(image_tag)
+                    .arg("-lc")
+                    .arg(PROBE_CMD);
 
-            let output = cmd.output().ok()?;
-            if !output.status.success() {
-                continue;
-            }
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let mut lines = stdout.lines();
-            let probe_user = lines.next().unwrap_or_default().trim().to_string();
-            let home = lines.next().unwrap_or_default().trim().to_string();
-            let path = lines.next().unwrap_or_default().trim().to_string();
-            if !probe_user.is_empty() {
-                return Some(super::ContainerProbeInfo {
-                    user: probe_user,
-                    home,
-                    path,
-                });
+                let output = match cmd.output() {
+                    Ok(output) => output,
+                    Err(err) => {
+                        debug!(
+                            "Container probe execution failed for shell '{}' on image '{}' (rosetta={}): {}",
+                            shell, image_tag, use_rosetta, err
+                        );
+                        continue;
+                    }
+                };
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    trace!(
+                        "Container probe failed for shell '{}' on image '{}' with status {:?} (rosetta={}), stderr: {}",
+                        shell,
+                        image_tag,
+                        output.status.code(),
+                        use_rosetta,
+                        stderr.trim()
+                    );
+                    continue;
+                }
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let mut lines = stdout.lines();
+                let probe_user = lines.next().unwrap_or_default().trim().to_string();
+                let home = lines.next().unwrap_or_default().trim().to_string();
+                let path = lines.next().unwrap_or_default().trim().to_string();
+                let architecture = lines
+                    .next()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(ToString::to_string);
+                if !probe_user.is_empty() {
+                    debug!(
+                        "Container probe succeeded for image '{}' using shell '{}' (rosetta={}): user='{}', home='{}', path_present={}, architecture={:?}",
+                        image_tag,
+                        shell,
+                        use_rosetta,
+                        probe_user,
+                        home,
+                        !path.is_empty(),
+                        architecture
+                    );
+                    return Some(super::ContainerProbeInfo {
+                        user: probe_user,
+                        home,
+                        path,
+                        architecture,
+                    });
+                }
+
+                trace!(
+                    "Container probe output for shell '{}' on image '{}' did not include a runtime user (rosetta={})",
+                    shell, image_tag, use_rosetta
+                );
             }
         }
+
+        debug!(
+            "Container probe did not find a suitable shell/runtime user for image '{}'",
+            image_tag
+        );
         None
     }
 
@@ -552,149 +597,124 @@ impl ContainerRuntime for ContainerCliRuntime {
             platform_architecture_translation,
         } = runtime_parameters;
 
-        let mut last_error = None;
+        trace!(
+            "Container start attempt with requested forwards: {:?}",
+            ports
+        );
+        let resolved_ports = resolve_container_runtime_ports(&ports)?;
+        debug!("Container runtime port mappings: {:?}", resolved_ports);
 
-        for attempt in 1..=CONTAINER_START_MAX_ATTEMPTS {
-            trace!(
-                "Container start attempt {}/{} with requested forwards: {:?}",
-                attempt, CONTAINER_START_MAX_ATTEMPTS, ports
-            );
-            let resolved_ports = resolve_container_runtime_ports(&ports)?;
-            debug!(
-                "Container runtime port mappings (attempt {}): {:?}",
-                attempt, resolved_ports
-            );
+        let mut cmd = Command::new("container");
 
-            let mut cmd = Command::new("container");
+        cmd.arg("run").arg("-d");
 
-            cmd.arg("run").arg("-d");
-
-            if platform_architecture_translation {
-                cmd.arg("--rosetta");
-            }
-
-            cmd.arg("-v").arg(volume_mount).arg("-l").arg(label);
-
-            // Add CPU and memory limits from config
-            let memory = self.config.run_memory.as_deref().unwrap_or("8g");
-            cmd.arg("--memory").arg(memory);
-            let cpu = self.config.run_cpu.as_deref().unwrap_or("2");
-            cmd.arg("--cpus").arg(cpu);
-
-            // Add privileged flag if required
-            if requires_privileged {
-                cmd.arg("--virtualization");
-            }
-
-            // Add environment variables
-            for env_var in env_vars {
-                cmd.arg("-e").arg(env_var);
-            }
-
-            // Add excluded ports environment variable for agent
-            let excluded_ports: Vec<String> = resolved_ports
-                .iter()
-                .filter_map(extract_container_port)
-                .map(|p| p.to_string())
-                .collect();
-            if !excluded_ports.is_empty() {
-                let excluded_ports_str = excluded_ports.join(",");
-                cmd.arg("-e")
-                    .arg(format!("DEVCON_FORWARDED_PORTS={}", excluded_ports_str));
-            }
-
-            // Add additional mounts from features and devcontainer config
-            for mount in additional_mounts.clone() {
-                match mount {
-                    crate::devcontainer::Mount::String(mount_str) => {
-                        cmd.arg("-v").arg(mount_str);
-                    }
-                    crate::devcontainer::Mount::Structured(structured) => {
-                        let mount_arg = match &structured.mount_type {
-                            crate::devcontainer::MountType::Bind => {
-                                if let Some(source) = &structured.source {
-                                    format!(
-                                        "type=bind,source={},target={}",
-                                        source, structured.target
-                                    )
-                                } else {
-                                    continue; // Skip bind mounts without source
-                                }
-                            }
-                            crate::devcontainer::MountType::Volume => {
-                                if let Some(source) = &structured.source {
-                                    format!(
-                                        "type=volume,source={},target={}",
-                                        source, structured.target
-                                    )
-                                } else {
-                                    format!("type=volume,target={}", structured.target)
-                                }
-                            }
-                        };
-                        cmd.arg("--mount").arg(mount_arg);
-                    }
-                }
-            }
-
-            // Add port forwards
-            for port in resolved_ports {
-                let port_number = match port {
-                    crate::devcontainer::ForwardPort::Port(port_number) => port_number.to_string(),
-                    crate::devcontainer::ForwardPort::HostPort(port) => port,
-                };
-                cmd.arg("-p").arg(port_number);
-            }
-
-            cmd.arg(image_tag);
-
-            let result = cmd.output()?;
-
-            if result.status.code() == Some(0) {
-                let container_id = String::from_utf8_lossy(&result.stdout).trim().to_string();
-                if container_id.is_empty() {
-                    return Err(Error::runtime(
-                        "Container start command succeeded but returned an empty container id"
-                            .to_string(),
-                    ));
-                }
-                return Ok(Box::new(ContainerCliHandle { id: container_id }));
-            }
-
-            let exit_code = result
-                .status
-                .code()
-                .map_or("terminated by signal".to_string(), |code| {
-                    format!("exit code {}", code)
-                });
-            let stderr = String::from_utf8_lossy(&result.stderr).trim().to_string();
-            let stdout = String::from_utf8_lossy(&result.stdout).trim().to_string();
-
-            let mut details = format!("Container start command failed ({})", exit_code);
-            if !stderr.is_empty() {
-                details.push_str(&format!("\nstderr: {}", stderr));
-            }
-            if !stdout.is_empty() {
-                details.push_str(&format!("\nstdout: {}", stdout));
-            }
-
-            let err = Error::runtime(details);
-            if attempt < CONTAINER_START_MAX_ATTEMPTS
-                && is_host_port_conflict_error(&stderr, &stdout)
-            {
-                warn!(
-                    "Container start failed due to host port conflict (attempt {}/{}), retrying with new host ports",
-                    attempt, CONTAINER_START_MAX_ATTEMPTS
-                );
-                last_error = Some(err);
-                continue;
-            }
-
-            return Err(err);
+        if platform_architecture_translation {
+            cmd.arg("--rosetta");
         }
 
-        Err(last_error
-            .unwrap_or_else(|| Error::runtime("Container start failed after retries".to_string())))
+        cmd.arg("-v").arg(volume_mount).arg("-l").arg(label);
+
+        // Add CPU and memory limits from config
+        let memory = self.config.run_memory.as_deref().unwrap_or("8g");
+        cmd.arg("--memory").arg(memory);
+        let cpu = self.config.run_cpu.as_deref().unwrap_or("2");
+        cmd.arg("--cpus").arg(cpu);
+
+        // Add privileged flag if required
+        if requires_privileged {
+            cmd.arg("--virtualization");
+        }
+
+        // Add environment variables
+        for env_var in env_vars {
+            cmd.arg("-e").arg(env_var);
+        }
+
+        // Add excluded ports environment variable for agent
+        let excluded_ports: Vec<String> = resolved_ports
+            .iter()
+            .filter_map(extract_container_port)
+            .map(|p| p.to_string())
+            .collect();
+        if !excluded_ports.is_empty() {
+            let excluded_ports_str = excluded_ports.join(",");
+            cmd.arg("-e")
+                .arg(format!("DEVCON_FORWARDED_PORTS={}", excluded_ports_str));
+        }
+
+        // Add additional mounts from features and devcontainer config
+        for mount in additional_mounts.clone() {
+            match mount {
+                crate::devcontainer::Mount::String(mount_str) => {
+                    cmd.arg("-v").arg(mount_str);
+                }
+                crate::devcontainer::Mount::Structured(structured) => {
+                    let mount_arg = match &structured.mount_type {
+                        crate::devcontainer::MountType::Bind => {
+                            if let Some(source) = &structured.source {
+                                format!("type=bind,source={},target={}", source, structured.target)
+                            } else {
+                                continue; // Skip bind mounts without source
+                            }
+                        }
+                        crate::devcontainer::MountType::Volume => {
+                            if let Some(source) = &structured.source {
+                                format!(
+                                    "type=volume,source={},target={}",
+                                    source, structured.target
+                                )
+                            } else {
+                                format!("type=volume,target={}", structured.target)
+                            }
+                        }
+                    };
+                    cmd.arg("--mount").arg(mount_arg);
+                }
+            }
+        }
+
+        // Add port forwards
+        for port in resolved_ports {
+            let port_number = match port {
+                crate::devcontainer::ForwardPort::Port(port_number) => port_number.to_string(),
+                crate::devcontainer::ForwardPort::HostPort(port) => port,
+            };
+            cmd.arg("-p").arg(port_number);
+        }
+
+        cmd.arg(image_tag);
+
+        let result = cmd.output()?;
+
+        if result.status.code() == Some(0) {
+            let container_id = String::from_utf8_lossy(&result.stdout).trim().to_string();
+            if container_id.is_empty() {
+                return Err(Error::runtime(
+                    "Container start command succeeded but returned an empty container id"
+                        .to_string(),
+                ));
+            }
+            return Ok(Box::new(ContainerCliHandle { id: container_id }));
+        }
+
+        let exit_code = result
+            .status
+            .code()
+            .map_or("terminated by signal".to_string(), |code| {
+                format!("exit code {}", code)
+            });
+        let stderr = String::from_utf8_lossy(&result.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&result.stdout).trim().to_string();
+
+        let mut details = format!("Container start command failed ({})", exit_code);
+        if !stderr.is_empty() {
+            details.push_str(&format!("\nstderr: {}", stderr));
+        }
+        if !stdout.is_empty() {
+            details.push_str(&format!("\nstdout: {}", stdout));
+        }
+
+        Err(Error::runtime(details))
     }
 
     fn exec(
@@ -1033,15 +1053,6 @@ mod tests {
         assert_eq!(container_port, 3000);
         assert_ne!(host_port, 41000);
         assert!(host_port >= AUTO_HOST_PORT_MIN);
-    }
-
-    #[test]
-    fn test_is_host_port_conflict_error() {
-        assert!(is_host_port_conflict_error(
-            "bind: address already in use",
-            ""
-        ));
-        assert!(!is_host_port_conflict_error("failed to pull image", ""));
     }
 
     #[test]

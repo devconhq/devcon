@@ -111,7 +111,6 @@ struct ResolvedUsers {
     container_user: String,
     remote_user_home: String,
     container_user_home: String,
-    image_architecture: String,
 }
 
 impl ContainerOrchestrator {
@@ -535,7 +534,7 @@ impl ContainerOrchestrator {
                 .clone()
         };
 
-        let resolved_users = {
+        let (resolved_users, image_architecture) = {
             // Determine probe user hint from devcontainer.json or metadata label.
             let probe_user_hint = devcontainer_workspace
                 .devcontainer
@@ -570,7 +569,14 @@ impl ContainerOrchestrator {
                 .probe_image_info(&base_image, probe_user_hint.as_deref())
                 .ok()
                 .flatten();
-            self.resolve_users_for_image(&devcontainer_workspace, &base_image, probe_info.as_ref())
+            (
+                self.resolve_users_for_image(
+                    &devcontainer_workspace,
+                    &base_image,
+                    probe_info.as_ref(),
+                ),
+                self.resolve_image_architecture(&base_image, probe_info.as_ref()),
+            )
         };
 
         // Phase 2: Build features Dockerfile using base_image
@@ -590,7 +596,7 @@ impl ContainerOrchestrator {
             workspace_name: &workspace_name,
             runtime_host_address: &self.runtime.get_host_address(),
             config_hash: &config_hash,
-            image_architecture: &resolved_users.image_architecture,
+            image_architecture: &image_architecture,
             feature_install: &feature_install,
             env_setup: &env_setup,
             dotfiles_setup: &dotfiles_setup,
@@ -1179,18 +1185,21 @@ impl ContainerOrchestrator {
 
         debug!("Starting container with ports: {:?}", ports);
 
-        let image_arch = self
-            .runtime
-            .image_label(
-                &format!("{}:latest", self.get_image_tag(&devcontainer_workspace)),
-                "devcon.image-architecture",
-            )
-            .ok()
-            .flatten()
-            .map(|arch| Self::canonical_image_architecture(&arch))
-            .unwrap_or_else(Self::host_image_architecture);
+        let image_arch = self.resolve_image_architecture(&latest_tag, probe_info.as_ref());
         let host_is_arm = Self::host_image_architecture() == "arm64";
         let enable_rosetta = host_is_arm && image_arch == "amd64";
+        debug!(
+            "Runtime architecture translation decision: host_arch='{}', image_arch='{}', enable_translation={}",
+            Self::host_image_architecture(),
+            image_arch,
+            enable_rosetta
+        );
+        debug!(
+            "Image architecture: {}, Host architecture: {}, Rosetta enabled: {}",
+            image_arch,
+            Self::host_image_architecture(),
+            enable_rosetta
+        );
 
         let handle = self.runtime.run(
             &format!("{}:latest", self.get_image_tag(&devcontainer_workspace)),
@@ -1719,13 +1728,8 @@ impl ContainerOrchestrator {
         image_tag: &str,
         probe_info: Option<&ContainerProbeInfo>,
     ) -> ResolvedUsers {
-        let inspect = self.runtime.inspect_image(image_tag).ok().flatten();
         let detected_user = probe_info.map(|i| i.user.clone());
         let detected_home = probe_info.map(|i| i.home.clone());
-        let image_architecture = inspect
-            .as_ref()
-            .and_then(Self::extract_architecture_from_inspect)
-            .unwrap_or_else(Self::host_image_architecture);
 
         let remote_user_override = workspace.devcontainer.remote_user.clone();
         let container_user_override = workspace.devcontainer.container_user.clone();
@@ -1758,13 +1762,54 @@ impl ContainerOrchestrator {
             Self::user_home(&container_user)
         };
 
+        debug!(
+            "Resolved container users for '{}': remote_user='{}', container_user='{}'",
+            image_tag, remote_user, container_user
+        );
+
         ResolvedUsers {
             remote_user_home,
             container_user_home,
             remote_user,
             container_user,
-            image_architecture,
         }
+    }
+
+    fn resolve_image_architecture(
+        &self,
+        image_tag: &str,
+        probe_info: Option<&ContainerProbeInfo>,
+    ) -> String {
+        let inspect = self.runtime.inspect_image(image_tag).ok().flatten();
+        let detected_architecture = probe_info
+            .and_then(|i| i.architecture.as_deref())
+            .map(Self::canonical_image_architecture);
+        let inspect_architecture = inspect
+            .as_ref()
+            .and_then(Self::extract_architecture_from_inspect);
+        let labeled_architecture = inspect.as_ref().and_then(|i| {
+            i.config
+                .labels
+                .get("devcon.image-architecture")
+                .map(|arch| Self::canonical_image_architecture(arch))
+        });
+        let image_architecture = detected_architecture
+            .or(inspect_architecture)
+            .or(labeled_architecture)
+            .unwrap_or_else(Self::host_image_architecture);
+
+        debug!(
+            "Resolved image architecture for '{}': probe={:?}, inspect={:?}, label={:?}, final='{}'",
+            image_tag,
+            probe_info.and_then(|i| i.architecture.as_deref()),
+            inspect.as_ref().and_then(|i| i.architecture.as_deref()),
+            inspect
+                .as_ref()
+                .and_then(|i| i.config.labels.get("devcon.image-architecture").map(String::as_str)),
+            image_architecture
+        );
+
+        image_architecture
     }
 
     #[allow(dead_code)]
@@ -1788,7 +1833,6 @@ impl ContainerOrchestrator {
             container_user_home: Self::user_home(&container_user),
             remote_user,
             container_user,
-            image_architecture: "amd64".to_string(),
         };
 
         self.substitute_mount_variables_with_users(mount_str, devcontainer_workspace, &users)

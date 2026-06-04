@@ -259,6 +259,8 @@ pub struct ContainerProbeInfo {
     pub home: String,
     /// The `$PATH` after login-shell init.
     pub path: String,
+    /// CPU architecture reported by `uname -m` in the probed runtime shell.
+    pub architecture: Option<String>,
 }
 
 pub trait ContainerRuntime: Send {

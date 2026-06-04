@@ -83,9 +83,18 @@ impl DockerRuntime {
         image_tag: &str,
         user: Option<&str>,
     ) -> Option<super::ContainerProbeInfo> {
-        const PROBE_CMD: &str = "printf '%s\\n%s\\n%s' \"$(id -un)\" \"$HOME\" \"$PATH\"";
+        const PROBE_CMD: &str =
+            "printf '%s\\n%s\\n%s\\n%s' \"$(id -un)\" \"$HOME\" \"$PATH\" \"$(uname -m)\"";
         let shells = ["sh", "/bin/sh", "bash", "/bin/bash"];
+        debug!(
+            "Probing docker image runtime environment for image '{}' with user hint {:?}",
+            image_tag, user
+        );
         for shell in shells {
+            trace!(
+                "Attempting docker probe with shell '{}' for image '{}'",
+                shell, image_tag
+            );
             let mut cmd = Command::new("docker");
             cmd.arg("run").arg("--rm");
             if let Some(u) = user {
@@ -97,8 +106,25 @@ impl DockerRuntime {
                 .arg("-lc")
                 .arg(PROBE_CMD);
 
-            let output = cmd.output().ok()?;
+            let output = match cmd.output() {
+                Ok(output) => output,
+                Err(err) => {
+                    debug!(
+                        "Docker probe execution failed for shell '{}' on image '{}': {}",
+                        shell, image_tag, err
+                    );
+                    continue;
+                }
+            };
             if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                trace!(
+                    "Docker probe failed for shell '{}' on image '{}' with status {:?}, stderr: {}",
+                    shell,
+                    image_tag,
+                    output.status.code(),
+                    stderr.trim()
+                );
                 continue;
             }
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -106,14 +132,39 @@ impl DockerRuntime {
             let probe_user = lines.next().unwrap_or_default().trim().to_string();
             let home = lines.next().unwrap_or_default().trim().to_string();
             let path = lines.next().unwrap_or_default().trim().to_string();
+            let architecture = lines
+                .next()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(ToString::to_string);
             if !probe_user.is_empty() {
+                debug!(
+                    "Docker probe succeeded for image '{}' using shell '{}': user='{}', home='{}', path_present={}, architecture={:?}",
+                    image_tag,
+                    shell,
+                    probe_user,
+                    home,
+                    !path.is_empty(),
+                    architecture
+                );
                 return Some(super::ContainerProbeInfo {
                     user: probe_user,
                     home,
                     path,
+                    architecture,
                 });
             }
+
+            trace!(
+                "Docker probe output for shell '{}' on image '{}' did not include a runtime user",
+                shell, image_tag
+            );
         }
+
+        debug!(
+            "Docker probe did not find a suitable shell/runtime user for image '{}'",
+            image_tag
+        );
         None
     }
 

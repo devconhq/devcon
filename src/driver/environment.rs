@@ -72,6 +72,11 @@ pub(crate) fn base_container_environment(
         if !info.path.is_empty() {
             debug!("Using probed PATH from image: {}", info.path);
             env.insert("PATH".to_string(), info.path.clone());
+        } else {
+            debug!(
+                "Probe info for '{}' did not include PATH (user='{}', home='{}'); using inspected PATH if present",
+                image_tag, info.user, info.home
+            );
         }
     } else {
         debug!(
