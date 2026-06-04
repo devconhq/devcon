@@ -27,161 +27,379 @@
 //! Docker, Podman, etc.).
 
 use std::{
-    collections::{HashMap, VecDeque},
-    io::{BufRead, BufReader},
+    collections::{HashMap, HashSet},
+    io::{BufRead, BufReader, IsTerminal},
     path::Path,
     process::Child,
+    sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use crate::error::Result;
 use console::Style;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 pub mod container;
 pub mod docker;
 
-/// Stream build output from a child process with a rolling window display.
+pub const FEATURE_DONE_MARKER_PREFIX: &str = "DEVCON_FEATURE_DONE::";
+const POST_PROCESSING_IMAGE_LABEL: &str = "Post Processing Image";
+
+#[derive(Debug, Clone)]
+pub struct FeatureProgressItem {
+    pub id: String,
+    pub label: String,
+}
+
+fn extract_feature_done_marker(line: &str) -> Option<String> {
+    let marker_pos = line.find(FEATURE_DONE_MARKER_PREFIX)?;
+    let token = &line[(marker_pos + FEATURE_DONE_MARKER_PREFIX.len())..];
+    let token = token
+        .trim()
+        .trim_matches(|c| matches!(c, '"' | '\'' | '`'))
+        .trim_end_matches(|c| matches!(c, '"' | '\'' | '`' | ',' | ';' | ')' | ']' | '}'));
+    if token.is_empty() {
+        return None;
+    }
+
+    let normalized = token
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_matches(|c| matches!(c, '"' | '\'' | '`'))
+        .trim_end_matches(|c| matches!(c, '"' | '\'' | '`' | ',' | ';' | ')' | ']' | '}'));
+
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized.to_string())
+    }
+}
+
+fn active_progress_label(
+    progress_items: &[FeatureProgressItem],
+    completed: &HashSet<String>,
+    post_processing_pending: bool,
+) -> Option<String> {
+    let next_feature = progress_items
+        .iter()
+        .find(|item| !completed.contains(&item.id))
+        .map(|item| item.label.clone());
+
+    next_feature
+        .or_else(|| post_processing_pending.then_some(POST_PROCESSING_IMAGE_LABEL.to_string()))
+}
+
+/// Stream build output from a child process, rendering feature progress in-place.
 ///
-/// This function:
-/// - Captures stdout and stderr from the child process
-/// - Prints all lines as they arrive (permanent output)
-/// - Maintains a rolling buffer of the last 10 lines displayed at the bottom
-/// - If the process fails, prints the complete output again
+/// In interactive terminals a `MultiProgress` is used: each feature gets its own
+/// `ProgressBar` row that transitions from `[ ] label` to `[x] label` as the
+/// matching `DEVCON_FEATURE_DONE::` marker arrives.  A spinner at the bottom
+/// shows the current active feature and a rolling tail of the latest build line.
 ///
-/// # Arguments
-///
-/// * `child` - The child process to stream output from
-///
-/// # Returns
-///
-/// Returns `Ok(ExitStatus)` if the process completes, `Err` if there's an I/O error
-pub fn stream_build_output(mut child: Child, silent: bool) -> Result<std::process::ExitStatus> {
+/// In non-interactive / piped mode the same information is emitted with plain
+/// `println!` so that test harnesses can capture it.
+pub fn stream_build_output(
+    mut child: Child,
+    silent: bool,
+    phase_label: Option<&str>,
+    feature_progress: Option<&[FeatureProgressItem]>,
+) -> Result<std::process::ExitStatus> {
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
-    if !silent {
-        println!("Building Image..");
-    }
+    let phase_label = phase_label.unwrap_or("Building image").to_string();
 
-    // Buffer for last 10 lines (rolling window)
-    let rolling_buffer: Arc<Mutex<VecDeque<String>>> =
-        Arc::new(Mutex::new(VecDeque::with_capacity(10)));
+    let progress_items = feature_progress.unwrap_or(&[]);
+    let progress_items_arc: Arc<Vec<FeatureProgressItem>> = Arc::new(progress_items.to_vec());
+    let feature_lookup: Arc<HashMap<String, String>> = Arc::new(
+        progress_items
+            .iter()
+            .map(|item| (item.id.clone(), item.label.clone()))
+            .collect(),
+    );
+    let completed_features: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let has_feature_progress = !progress_items.is_empty();
+    let post_processing_done = Arc::new(AtomicBool::new(!has_feature_progress));
 
-    // Buffer for all output (for error reporting)
+    // Keep latest build line for spinner tail status.
+    let latest_line: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+
+    // Buffer all output so we can reprint on failure.
     let all_output: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-
-    let rolling_clone = Arc::clone(&rolling_buffer);
     let all_output_clone = Arc::clone(&all_output);
 
-    let bar = ProgressBar::new_spinner();
-    bar.set_style(ProgressStyle::default_spinner().template("{spinner} {msg}")?);
-    bar.enable_steady_tick(Duration::from_millis(100));
+    let interactive = std::io::stdout().is_terminal() && std::io::stderr().is_terminal();
 
-    // Stream stdout in a separate thread
+    // ── MultiProgress setup (interactive only) ──────────────────────────────
+    //
+    // Layout (top → bottom):
+    //   "  [ ] feature A"   ← ProgressBar per feature, no animation
+    //   "  [ ] feature B"
+    //   ...
+    //   "⠹ Building … [n/total] Active: X | tail"  ← spinner
+    //
+    // Each feature bar is updated in-place to "[x] label" when done.
+    // In non-interactive mode we fall back to plain println so tests capture it.
+
+    let mp = MultiProgress::new();
+
+    // Per-feature bars (interactive only; empty map otherwise).
+    let feature_bars: Arc<HashMap<String, ProgressBar>> = {
+        let mut map = HashMap::new();
+        if !silent && interactive && !progress_items.is_empty() {
+            let style = ProgressStyle::with_template("  {msg}")?;
+            for item in progress_items {
+                let b = mp.add(ProgressBar::new(1));
+                b.set_style(style.clone());
+                b.set_message(format!("[ ] {}", item.label));
+                map.insert(item.id.clone(), b);
+            }
+        }
+        Arc::new(map)
+    };
+
+    let post_processing_bar = if !silent && interactive && has_feature_progress {
+        let style = ProgressStyle::with_template("  {msg}")?;
+        let bar = mp.add(ProgressBar::new(1));
+        bar.set_style(style);
+        bar.set_message(format!("[ ] {}", POST_PROCESSING_IMAGE_LABEL));
+        Some(bar)
+    } else {
+        None
+    };
+
+    // Spinner bar – always present (hidden when silent).
+    let spinner = mp.add(ProgressBar::new_spinner());
+    spinner.set_style(ProgressStyle::default_spinner().template("{spinner} {msg}")?);
+    if !silent {
+        if interactive && has_feature_progress {
+            spinner.println("Feature build progress:");
+        }
+        spinner.enable_steady_tick(Duration::from_millis(100));
+        spinner.set_message(format!("{}..", &phase_label));
+    }
+
+    // Non-interactive: emit plain-text headers now for test capture.
+    if !silent && !interactive {
+        println!("{}..", phase_label);
+        if !progress_items.is_empty() {
+            println!("Feature build progress:");
+            for item in progress_items {
+                println!("  [ ] {}", item.label);
+            }
+            println!("  [ ] {}", POST_PROCESSING_IMAGE_LABEL);
+        }
+    }
+
+    // ── Stdout stream thread ─────────────────────────────────────────────────
     let stdout_thread = stdout.map(|stdout| {
-        let rolling = Arc::clone(&rolling_buffer);
         let all = Arc::clone(&all_output);
+        let latest = Arc::clone(&latest_line);
+        let feature_labels = Arc::clone(&feature_lookup);
+        let completed = Arc::clone(&completed_features);
+        let progress = Arc::clone(&progress_items_arc);
+        let bars = Arc::clone(&feature_bars);
+        let spinner_bar = spinner.clone();
+        let post_done = Arc::clone(&post_processing_done);
+        let phase = phase_label.clone();
         std::thread::spawn(move || {
             let reader = BufReader::new(stdout);
             for line_result in reader.lines() {
-                // Handle UTF-8 decoding errors gracefully
                 let line = match line_result {
                     Ok(l) => l,
-                    Err(_) => continue, // Skip lines with UTF-8 errors
+                    Err(_) => continue,
                 };
-
-                // Try to strip ANSI escapes safely, fall back to original if it fails
                 let clean_line = std::panic::catch_unwind(|| strip_ansi_escapes::strip_str(&line))
                     .unwrap_or_else(|_| line.clone());
 
-                // Add to rolling buffer
-                let mut roll = rolling.lock().unwrap();
-                if roll.len() >= 10 {
-                    roll.pop_front();
+                if let Some(feature_id) = extract_feature_done_marker(&clean_line) {
+                    if !feature_labels.contains_key(&feature_id) {
+                        continue;
+                    }
+                    let mut completed_guard = completed.lock().unwrap();
+                    if completed_guard.insert(feature_id.clone()) {
+                        let label = feature_labels
+                            .get(&feature_id)
+                            .cloned()
+                            .unwrap_or_else(|| feature_id.clone());
+                        // Update the feature row in-place (interactive) or append (non-interactive).
+                        if !silent {
+                            if let Some(fb) = bars.get(&feature_id) {
+                                fb.finish_with_message(format!("[x] {}", label));
+                            } else {
+                                println!("  [x] {}", label);
+                            }
+                        }
+                        // Advance the spinner status to the next pending feature.
+                        if let Some(active) = active_progress_label(
+                            &progress,
+                            &completed_guard,
+                            !post_done.load(Ordering::Relaxed),
+                        ) {
+                            let done = completed_guard.len();
+                            let total = progress.len() + 1;
+                            spinner_bar.set_message(format!(
+                                "{phase} [{done}/{total}] Active: {active}",
+                                phase = &phase,
+                                done = done,
+                                total = total,
+                                active = active,
+                            ));
+                        }
+                    }
+                    continue;
                 }
-                roll.push_back(clean_line);
-                drop(roll);
 
-                // Add to complete output (with original ANSI codes)
-                let mut all_buf = all.lock().unwrap();
-                all_buf.push(line);
+                *latest.lock().unwrap() = clean_line.clone();
+                all.lock().unwrap().push(line);
             }
         })
     });
 
-    // Stream stderr in a separate thread
+    // ── Stderr stream thread ─────────────────────────────────────────────────
     let stderr_thread = stderr.map(|stderr| {
-        let rolling = Arc::clone(&rolling_clone);
         let all = Arc::clone(&all_output_clone);
+        let latest = Arc::clone(&latest_line);
+        let feature_labels = Arc::clone(&feature_lookup);
+        let completed = Arc::clone(&completed_features);
+        let progress = Arc::clone(&progress_items_arc);
+        let bars = Arc::clone(&feature_bars);
+        let spinner_bar = spinner.clone();
+        let post_done = Arc::clone(&post_processing_done);
+        let phase = phase_label.clone();
         std::thread::spawn(move || {
             let reader = BufReader::new(stderr);
             for line_result in reader.lines() {
-                // Handle UTF-8 decoding errors gracefully
                 let line = match line_result {
                     Ok(l) => l,
-                    Err(_) => continue, // Skip lines with UTF-8 errors
+                    Err(_) => continue,
                 };
-
-                // Try to strip ANSI escapes safely, fall back to original if it fails
                 let clean_line = std::panic::catch_unwind(|| strip_ansi_escapes::strip_str(&line))
                     .unwrap_or_else(|_| line.clone());
 
-                // Add to rolling buffer
-                let mut roll = rolling.lock().unwrap();
-                if roll.len() >= 10 {
-                    roll.pop_front();
+                if let Some(feature_id) = extract_feature_done_marker(&clean_line) {
+                    if !feature_labels.contains_key(&feature_id) {
+                        continue;
+                    }
+                    let mut completed_guard = completed.lock().unwrap();
+                    if completed_guard.insert(feature_id.clone()) {
+                        let label = feature_labels
+                            .get(&feature_id)
+                            .cloned()
+                            .unwrap_or_else(|| feature_id.clone());
+                        if !silent {
+                            if let Some(fb) = bars.get(&feature_id) {
+                                fb.finish_with_message(format!("[x] {}", label));
+                            } else {
+                                println!("  [x] {}", label);
+                            }
+                        }
+                        if let Some(active) = active_progress_label(
+                            &progress,
+                            &completed_guard,
+                            !post_done.load(Ordering::Relaxed),
+                        ) {
+                            let done = completed_guard.len();
+                            let total = progress.len() + 1;
+                            spinner_bar.set_message(format!(
+                                "{phase} [{done}/{total}] Active: {active}",
+                                phase = &phase,
+                                done = done,
+                                total = total,
+                                active = active,
+                            ));
+                        }
+                    }
+                    continue;
                 }
-                roll.push_back(clean_line);
-                drop(roll);
 
-                // Add to complete output (with original ANSI codes)
-                let mut all_buf = all.lock().unwrap();
-                all_buf.push(line);
+                *latest.lock().unwrap() = clean_line.clone();
+                all.lock().unwrap().push(line);
             }
         })
     });
 
-    // Update progress bar with last 10 lines
-    let display_buffer = Arc::clone(&rolling_clone);
-    let display_bar = bar.clone();
+    // ── Spinner tail-update thread ───────────────────────────────────────────
+    let display_latest = Arc::clone(&latest_line);
+    let display_progress = Arc::clone(&progress_items_arc);
+    let display_completed = Arc::clone(&completed_features);
+    let display_spinner = spinner.clone();
+    let display_post_done = Arc::clone(&post_processing_done);
+    let display_phase = phase_label.clone();
+    let keep_updating = Arc::new(AtomicBool::new(true));
+    let keep_updating_thread = Arc::clone(&keep_updating);
     let update_thread = std::thread::spawn(move || {
-        let grey_style = Style::new().dim();
+        let dim = Style::new().dim();
         loop {
-            let buf = display_buffer.lock().unwrap();
-            if !buf.is_empty() {
-                let display_text = format!(
-                    "\n{}",
-                    buf.iter()
-                        .map(|s| grey_style.apply_to(s).to_string())
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                );
-                display_bar.set_message(display_text);
+            if !keep_updating_thread.load(Ordering::Relaxed) {
+                break;
             }
-            drop(buf);
+            let tail = display_latest.lock().unwrap().clone();
+            let completed_set = display_completed.lock().unwrap().clone();
+            let post_done = display_post_done.load(Ordering::Relaxed);
+            let done = completed_set.len() + usize::from(post_done && !display_progress.is_empty());
+            let total = display_progress.len() + usize::from(!display_progress.is_empty());
+
+            if total > 0 {
+                if let Some(active) =
+                    active_progress_label(&display_progress, &completed_set, !post_done)
+                {
+                    if tail.is_empty() {
+                        display_spinner.set_message(format!(
+                            "{phase} [{done}/{total}] Active: {active}",
+                            phase = &display_phase,
+                        ));
+                    } else {
+                        display_spinner.set_message(format!(
+                            "{phase} [{done}/{total}] Active: {active} | {tail}",
+                            phase = &display_phase,
+                            tail = dim.apply_to(&tail),
+                        ));
+                    }
+                } else {
+                    display_spinner.set_message(format!(
+                        "{phase} [{done}/{total}] Finalizing",
+                        phase = &display_phase,
+                    ));
+                }
+            } else if !tail.is_empty() {
+                display_spinner.set_message(format!(
+                    "{phase} | {tail}",
+                    phase = &display_phase,
+                    tail = dim.apply_to(&tail),
+                ));
+            } else {
+                display_spinner.set_message(display_phase.to_string());
+            }
+
             std::thread::sleep(Duration::from_millis(100));
         }
     });
 
-    // Wait for stdout thread to complete
-    if let Some(handle) = stdout_thread {
-        let _ = handle.join();
+    if let Some(h) = stdout_thread {
+        let _ = h.join();
     }
-
-    // Wait for stderr thread to complete
-    if let Some(handle) = stderr_thread {
-        let _ = handle.join();
+    if let Some(h) = stderr_thread {
+        let _ = h.join();
     }
 
     let result = child.wait()?;
 
-    // Stop the update thread
-    bar.finish_and_clear();
-    drop(update_thread);
+    if !silent && has_feature_progress && result.success() {
+        post_processing_done.store(true, Ordering::Relaxed);
+        if let Some(pb) = post_processing_bar.as_ref() {
+            pb.finish_with_message(format!("[x] {}", POST_PROCESSING_IMAGE_LABEL));
+        } else if !interactive {
+            println!("  [x] {}", POST_PROCESSING_IMAGE_LABEL);
+        }
+    }
 
-    // If the build failed, print the complete output for debugging
+    keep_updating.store(false, Ordering::Relaxed);
+    let _ = update_thread.join();
+    spinner.finish_and_clear();
+
     if !result.success() {
         eprintln!("\n=== Build failed! Complete output: ===");
         let full_output = all_output_clone.lock().unwrap();
@@ -190,7 +408,7 @@ pub fn stream_build_output(mut child: Child, silent: bool) -> Result<std::proces
         }
         eprintln!("=== End of output ===\n");
     } else if !silent {
-        println!("Building image complete");
+        println!("{} complete", phase_label);
     }
 
     Ok(result)
@@ -281,6 +499,8 @@ pub trait ContainerRuntime: Send {
         dockerfile_path: &Path,
         context_path: &Path,
         image_tag: Vec<&str>,
+        phase_label: Option<&str>,
+        feature_progress: Option<&[FeatureProgressItem]>,
         silent: bool,
     ) -> Result<()>;
 
@@ -311,6 +531,8 @@ pub trait ContainerRuntime: Send {
         args: &Option<std::collections::HashMap<String, String>>,
         target: &Option<String>,
         options: &Option<Vec<String>>,
+        phase_label: Option<&str>,
+        feature_progress: Option<&[FeatureProgressItem]>,
         silent: bool,
     ) -> Result<()>;
 

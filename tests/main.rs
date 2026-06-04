@@ -79,6 +79,18 @@ fn test_build_with_features() {
         combined.contains("node") || combined.contains("Node"),
         "Build output does not mention node feature"
     );
+    assert!(
+        combined.contains("Evaluated feature order:"),
+        "Build output does not include evaluated feature order section"
+    );
+    assert!(
+        combined.contains("Evaluated environment summary:"),
+        "Build output does not include evaluated environment summary section"
+    );
+    assert!(
+        combined.contains("Feature build progress:"),
+        "Build output does not include feature build progress checklist"
+    );
 }
 
 #[test]

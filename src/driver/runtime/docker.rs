@@ -36,7 +36,10 @@ use tracing::{debug, trace};
 use crate::config::DockerRuntimeConfig;
 use crate::driver::runtime::RuntimeParameters;
 
-use super::{ContainerImageConfig, ContainerImageInfo, ContainerRuntime, stream_build_output};
+use super::{
+    ContainerImageConfig, ContainerImageInfo, ContainerRuntime, FeatureProgressItem,
+    stream_build_output,
+};
 
 /// Extract container-side port from a ForwardPort
 fn extract_container_port(port: &crate::devcontainer::ForwardPort) -> Option<u16> {
@@ -250,6 +253,8 @@ impl ContainerRuntime for DockerRuntime {
         dockerfile_path: &Path,
         context_path: &Path,
         image_tag: Vec<&str>,
+        phase_label: Option<&str>,
+        feature_progress: Option<&[FeatureProgressItem]>,
         silent: bool,
     ) -> Result<()> {
         self.build_with_args(
@@ -259,6 +264,8 @@ impl ContainerRuntime for DockerRuntime {
             &None,
             &None,
             &None,
+            phase_label,
+            feature_progress,
             silent,
         )
     }
@@ -271,6 +278,8 @@ impl ContainerRuntime for DockerRuntime {
         args: &Option<std::collections::HashMap<String, String>>,
         target: &Option<String>,
         options: &Option<Vec<String>>,
+        phase_label: Option<&str>,
+        feature_progress: Option<&[FeatureProgressItem]>,
         silent: bool,
     ) -> Result<()> {
         let mut cmd = Command::new("docker");
@@ -309,13 +318,19 @@ impl ContainerRuntime for DockerRuntime {
             }
         }
 
+        // BuildKit can suppress RUN stdout/stderr in non-plain modes; force plain output
+        // when feature marker tracking is active so completion markers are observable.
+        if feature_progress.is_some() {
+            cmd.arg("--progress=plain");
+        }
+
         cmd.arg(context_path)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
         let child = cmd.spawn()?;
 
-        let result = stream_build_output(child, silent)?;
+        let result = stream_build_output(child, silent, phase_label, feature_progress)?;
 
         if !result.success() {
             return Err(Error::runtime("Docker build command failed"));

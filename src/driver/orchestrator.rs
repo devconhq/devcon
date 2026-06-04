@@ -83,7 +83,9 @@ use crate::driver::feature_process::{
     FeatureLockContext, FeatureProcessResult, LockMode, build_lockfile_from_features,
 };
 use crate::driver::lifecycle::{guard_with_marker, run_lifecycle_command};
-use crate::driver::runtime::{ContainerImageInfo, ContainerProbeInfo, RuntimeParameters};
+use crate::driver::runtime::{
+    ContainerImageInfo, ContainerProbeInfo, FeatureProgressItem, RuntimeParameters,
+};
 use crate::{
     config::Config, driver::feature_process::process_features, driver::runtime::ContainerRuntime,
     workspace::Workspace,
@@ -456,6 +458,12 @@ impl ContainerOrchestrator {
             }
         };
 
+        let feature_progress = self.build_feature_progress_items(&processed_features);
+
+        if !self.silent {
+            self.print_feature_evaluation_order(&feature_progress);
+        }
+
         let feature_install = ctx.generate_feature_install_snippet(&processed_features)?;
 
         // Add environment variables
@@ -518,6 +526,8 @@ impl ContainerOrchestrator {
                 &build_config.args,
                 &build_config.target,
                 &build_config.options,
+                Some("Building base image from Dockerfile"),
+                None,
                 self.silent,
             )?;
 
@@ -534,50 +544,63 @@ impl ContainerOrchestrator {
                 .clone()
         };
 
-        let (resolved_users, image_architecture) = {
-            // Determine probe user hint from devcontainer.json or metadata label.
-            let probe_user_hint = devcontainer_workspace
-                .devcontainer
-                .remote_user
-                .clone()
-                .or_else(|| {
-                    self.runtime
-                        .inspect_image(&base_image)
-                        .ok()
-                        .flatten()
-                        .as_ref()
-                        .and_then(|inspect| {
-                            let label_str = inspect
-                                .config
-                                .labels
-                                .get("devcontainer.metadata")
-                                .map(String::as_str)?;
-                            let entries: serde_json::Value =
-                                serde_json::from_str(label_str).ok()?;
-                            entries.as_array()?.iter().rev().find_map(|entry| {
-                                entry
-                                    .get("remoteUser")
-                                    .and_then(|u| u.as_str())
-                                    .map(str::trim)
-                                    .filter(|s| !s.is_empty())
-                                    .map(ToString::to_string)
-                            })
+        // Determine probe user hint from devcontainer.json or metadata label.
+        let probe_user_hint = devcontainer_workspace
+            .devcontainer
+            .remote_user
+            .clone()
+            .or_else(|| {
+                self.runtime
+                    .inspect_image(&base_image)
+                    .ok()
+                    .flatten()
+                    .as_ref()
+                    .and_then(|inspect| {
+                        let label_str = inspect
+                            .config
+                            .labels
+                            .get("devcontainer.metadata")
+                            .map(String::as_str)?;
+                        let entries: serde_json::Value = serde_json::from_str(label_str).ok()?;
+                        entries.as_array()?.iter().rev().find_map(|entry| {
+                            entry
+                                .get("remoteUser")
+                                .and_then(|u| u.as_str())
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(ToString::to_string)
                         })
-                });
-            let probe_info = self
-                .runtime
-                .probe_image_info(&base_image, probe_user_hint.as_deref())
-                .ok()
-                .flatten();
-            (
-                self.resolve_users_for_image(
-                    &devcontainer_workspace,
-                    &base_image,
-                    probe_info.as_ref(),
-                ),
-                self.resolve_image_architecture(&base_image, probe_info.as_ref()),
-            )
-        };
+                    })
+            });
+
+        let probe_info = self
+            .runtime
+            .probe_image_info(&base_image, probe_user_hint.as_deref())
+            .ok()
+            .flatten();
+
+        let resolved_users =
+            self.resolve_users_for_image(&devcontainer_workspace, &base_image, probe_info.as_ref());
+        let image_architecture = self.resolve_image_architecture(&base_image, probe_info.as_ref());
+
+        let base_env =
+            base_container_environment(self.runtime.as_ref(), &base_image, probe_info.as_ref());
+        let evaluated_env = compose_start_environment(
+            &processed_features,
+            devcontainer_workspace.devcontainer.container_env.as_ref(),
+            env_variables,
+            &base_env,
+        );
+
+        if !self.silent {
+            self.print_build_environment_summary(
+                &evaluated_env,
+                &base_env,
+                &resolved_users,
+                probe_info.as_ref(),
+            );
+            println!("Building Image");
+        }
 
         // Phase 2: Build features Dockerfile using base_image
         let config_hash = self.get_devcontainer_id(&devcontainer_workspace);
@@ -617,6 +640,8 @@ impl ContainerOrchestrator {
             &dockerfile,
             ctx.path(),
             vec![&latest_tag, &build_tag],
+            Some("Building Image"),
+            (!feature_progress.is_empty()).then_some(feature_progress.as_slice()),
             self.silent,
         )?;
 
@@ -1557,6 +1582,76 @@ impl ContainerOrchestrator {
         format!("devcon-{}", devcontainer_workspace.get_sanitized_name())
     }
 
+    fn feature_display_label(feature: &FeatureProcessResult) -> String {
+        let name = feature.name();
+        if name == feature.feature.id {
+            name
+        } else {
+            format!("{} ({})", name, feature.feature.id)
+        }
+    }
+
+    fn build_feature_progress_items(
+        &self,
+        processed_features: &[FeatureProcessResult],
+    ) -> Vec<FeatureProgressItem> {
+        processed_features
+            .iter()
+            .map(|feature| FeatureProgressItem {
+                id: feature.feature.id.clone(),
+                label: Self::feature_display_label(feature),
+            })
+            .collect()
+    }
+
+    fn print_feature_evaluation_order(&self, feature_progress: &[FeatureProgressItem]) {
+        println!("Evaluated feature order:");
+        if feature_progress.is_empty() {
+            println!("  (no features configured)");
+            return;
+        }
+
+        for (index, feature) in feature_progress.iter().enumerate() {
+            println!("  {}. {}", index + 1, feature.label);
+        }
+    }
+
+    fn print_build_environment_summary(
+        &self,
+        evaluated_env: &[String],
+        base_env: &HashMap<String, String>,
+        resolved_users: &ResolvedUsers,
+        probe_info: Option<&ContainerProbeInfo>,
+    ) {
+        let env_map = evaluated_env
+            .iter()
+            .filter_map(|entry| {
+                let (key, value) = entry.split_once('=')?;
+                Some((key.to_string(), value.to_string()))
+            })
+            .collect::<HashMap<_, _>>();
+
+        let path = env_map
+            .get("PATH")
+            .cloned()
+            .or_else(|| base_env.get("PATH").cloned())
+            .unwrap_or_else(|| "<unset>".to_string());
+
+        let user = probe_info
+            .map(|p| p.user.clone())
+            .unwrap_or_else(|| resolved_users.remote_user.clone());
+        let home = probe_info
+            .map(|p| p.home.clone())
+            .or_else(|| env_map.get("HOME").cloned())
+            .unwrap_or_else(|| resolved_users.remote_user_home.clone());
+
+        println!("Evaluated environment summary:");
+        println!("  USER={}", user);
+        println!("  HOME={}", home);
+        println!("  PATH={}", path);
+        println!("  Total vars={}", env_map.len());
+    }
+
     fn read_lockfile(
         &self,
         devcontainer_workspace: &Workspace,
@@ -1803,9 +1898,11 @@ impl ContainerOrchestrator {
             image_tag,
             probe_info.and_then(|i| i.architecture.as_deref()),
             inspect.as_ref().and_then(|i| i.architecture.as_deref()),
-            inspect
-                .as_ref()
-                .and_then(|i| i.config.labels.get("devcon.image-architecture").map(String::as_str)),
+            inspect.as_ref().and_then(|i| i
+                .config
+                .labels
+                .get("devcon.image-architecture")
+                .map(String::as_str)),
             image_architecture
         );
 

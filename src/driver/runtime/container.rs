@@ -38,7 +38,10 @@ use crate::config::ContainerRuntimeConfig;
 use crate::driver::runtime::RuntimeParameters;
 use tracing::{debug, trace};
 
-use super::{ContainerImageConfig, ContainerImageInfo, ContainerRuntime, stream_build_output};
+use super::{
+    ContainerImageConfig, ContainerImageInfo, ContainerRuntime, FeatureProgressItem,
+    stream_build_output,
+};
 
 const AUTO_HOST_PORT_MIN: u16 = 30001;
 const AUTO_HOST_PORT_PICK_ATTEMPTS: usize = 128;
@@ -508,6 +511,8 @@ impl ContainerRuntime for ContainerCliRuntime {
         dockerfile_path: &Path,
         context_path: &Path,
         image_tag: Vec<&str>,
+        phase_label: Option<&str>,
+        feature_progress: Option<&[FeatureProgressItem]>,
         silent: bool,
     ) -> Result<()> {
         self.build_with_args(
@@ -517,6 +522,8 @@ impl ContainerRuntime for ContainerCliRuntime {
             &None,
             &None,
             &None,
+            phase_label,
+            feature_progress,
             silent,
         )
     }
@@ -529,6 +536,8 @@ impl ContainerRuntime for ContainerCliRuntime {
         args: &Option<std::collections::HashMap<String, String>>,
         target: &Option<String>,
         options: &Option<Vec<String>>,
+        phase_label: Option<&str>,
+        feature_progress: Option<&[FeatureProgressItem]>,
         silent: bool,
     ) -> Result<()> {
         let mut cmd = Command::new("container");
@@ -573,7 +582,7 @@ impl ContainerRuntime for ContainerCliRuntime {
 
         let child = cmd.spawn()?;
 
-        let result = stream_build_output(child, silent)?;
+        let result = stream_build_output(child, silent, phase_label, feature_progress)?;
 
         if !result.success() {
             return Err(Error::runtime("Container build command failed"));

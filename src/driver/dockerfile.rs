@@ -36,6 +36,7 @@ use tracing::{Level, debug, warn};
 
 use crate::devcontainer::FeatureSource;
 use crate::driver::feature_process::FeatureProcessResult;
+use crate::driver::runtime::FEATURE_DONE_MARKER_PREFIX;
 use crate::error::{Error, Result};
 
 /// Metadata required to render the features Dockerfile template.
@@ -224,8 +225,12 @@ fi
                 feature_path_name, feature_name
             ));
             feature_install.push_str(&format!(
-                "RUN chmod +x /tmp/features/{}/install.sh && . /tmp/features/{}/devcontainer-features.env && cd /tmp/features/{} && ./install.sh\n",
-                feature_name, feature_name, feature_name
+                "RUN chmod +x /tmp/features/{}/install.sh && . /tmp/features/{}/devcontainer-features.env && cd /tmp/features/{} && ./install.sh && echo \"{}{}\"\n",
+                feature_name,
+                feature_name,
+                feature_name,
+                FEATURE_DONE_MARKER_PREFIX,
+                feature_result.feature.id
             ));
 
             i += 1;
