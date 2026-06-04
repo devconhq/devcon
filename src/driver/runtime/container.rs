@@ -683,6 +683,7 @@ impl ContainerRuntime for ContainerCliRuntime {
         }
 
         cmd.arg(image_tag);
+        debug!("Executing container start command: {:?}", cmd);
 
         let result = cmd.output()?;
 

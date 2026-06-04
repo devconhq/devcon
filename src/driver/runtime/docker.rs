@@ -410,8 +410,7 @@ impl ContainerRuntime for DockerRuntime {
         }
 
         cmd.arg(image_tag);
-
-        trace!("Executing Docker command: {:?}", cmd);
+        debug!("Executing docker start command: {:?}", cmd);
 
         let result = cmd.output()?;
 
