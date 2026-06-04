@@ -20,8 +20,8 @@ pub struct DevcontainerLockfile {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DevcontainerLockEntry {
-    pub resolved: String,
     pub version: String,
+    pub resolved: String,
     pub integrity: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub depends_on: Option<Vec<String>>,

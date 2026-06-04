@@ -33,11 +33,12 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    fs::{self},
+    fs,
     path::{Path, PathBuf},
 };
 
 use crate::error::{Error, Result};
+use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 use tracing::{debug, info};
 
@@ -81,13 +82,35 @@ impl FeatureLockContext {
         &self,
         registry: &FeatureRegistry,
     ) -> Option<&DevcontainerLockEntry> {
-        let key = normalize_feature_identifier(&format!(
+        let lock = self.lockfile.as_ref()?;
+        let canonical_key = registry_lock_key(registry);
+
+        // Prefer canonical key, but allow legacy `:latest`/non-`:latest` variants for compatibility.
+        lock.features.get(&canonical_key).or_else(|| {
+            let legacy_key = normalize_feature_identifier(&format!(
+                "ghcr.io/{}/{}/{}:{}",
+                registry.owner, registry.repository, registry.name, registry.version
+            ));
+            if legacy_key == canonical_key {
+                None
+            } else {
+                lock.features.get(&legacy_key)
+            }
+        })
+    }
+}
+
+fn registry_lock_key(registry: &FeatureRegistry) -> String {
+    if registry.version == "latest" {
+        normalize_feature_identifier(&format!(
+            "ghcr.io/{}/{}/{}",
+            registry.owner, registry.repository, registry.name
+        ))
+    } else {
+        normalize_feature_identifier(&format!(
             "ghcr.io/{}/{}/{}:{}",
             registry.owner, registry.repository, registry.name, registry.version
-        ));
-        self.lockfile
-            .as_ref()
-            .and_then(|lock| lock.features.get(&key))
+        ))
     }
 }
 
@@ -570,6 +593,21 @@ struct DownloadedFeature {
     digest: Option<String>,
 }
 
+#[derive(Debug)]
+struct ManifestDigests {
+    manifest_digest: String,
+    layer_digest: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FeatureCacheMetadata {
+    manifest_digest: String,
+    layer_digest: String,
+}
+
+const FEATURE_CACHE_METADATA_FILE: &str = ".devcon-feature-cache.json";
+
 /// Get the cache directory for devcontainer features
 fn get_feature_cache_dir() -> Result<std::path::PathBuf> {
     let cache_dir =
@@ -595,6 +633,14 @@ fn get_cached_feature_path(
     Ok(feature_cache)
 }
 
+fn get_feature_cache_root(registry: &FeatureRegistry) -> Result<std::path::PathBuf> {
+    let cache_dir = get_feature_cache_dir()?;
+    Ok(cache_dir
+        .join(&registry.owner)
+        .join(&registry.repository)
+        .join(&registry.name))
+}
+
 /// Get local feature path
 fn local_feature(path: &Path) -> Result<PathBuf> {
     info!("Using local feature from path: {}", path.display());
@@ -606,6 +652,14 @@ fn normalize_layer_digest(layer_digest: &str) -> String {
         .strip_prefix("sha256:")
         .unwrap_or(layer_digest)
         .to_string()
+}
+
+fn canonical_layer_digest(layer_digest: &str) -> String {
+    if layer_digest.starts_with("sha256:") {
+        layer_digest.to_string()
+    } else {
+        format!("sha256:{}", layer_digest)
+    }
 }
 
 fn layer_sha_prefix(layer_digest: &str) -> String {
@@ -627,43 +681,143 @@ fn is_feature_cached(path: &Path) -> bool {
     path.exists() && path.join("devcontainer-feature.json").exists()
 }
 
+fn cache_metadata_path(cache_path: &Path) -> PathBuf {
+    cache_path.join(FEATURE_CACHE_METADATA_FILE)
+}
+
+fn write_cache_metadata(
+    cache_path: &Path,
+    manifest_digest: &str,
+    layer_digest: &str,
+) -> Result<()> {
+    let metadata = FeatureCacheMetadata {
+        manifest_digest: normalize_layer_digest(manifest_digest),
+        layer_digest: normalize_layer_digest(layer_digest),
+    };
+    let content = serde_json::to_string_pretty(&metadata)?;
+    fs::write(cache_metadata_path(cache_path), content)?;
+    debug!(
+        "Wrote cache metadata for feature at {}: manifest digest sha256:{}, layer digest sha256:{}",
+        cache_path.display(),
+        metadata.manifest_digest,
+        metadata.layer_digest
+    );
+    Ok(())
+}
+
+fn read_cache_metadata(cache_path: &Path) -> Option<FeatureCacheMetadata> {
+    let content = fs::read_to_string(cache_metadata_path(cache_path)).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn find_cached_feature_by_manifest_digest(
+    registry: &FeatureRegistry,
+    manifest_digest: &str,
+) -> Result<Option<PathBuf>> {
+    let root = get_feature_cache_root(registry)?;
+    if !root.exists() {
+        return Ok(None);
+    }
+
+    let target = normalize_layer_digest(manifest_digest);
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(None),
+    };
+
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let path = entry.path();
+        if !is_feature_cached(&path) {
+            continue;
+        }
+        if let Some(metadata) = read_cache_metadata(&path)
+            && normalize_layer_digest(&metadata.manifest_digest) == target
+        {
+            return Ok(Some(path));
+        }
+    }
+
+    Ok(None)
+}
+
 /// Download a feature from registry to cache, or use cached version if available
 fn download_feature(
     registry: &FeatureRegistry,
     lock_context: &FeatureLockContext,
 ) -> Result<DownloadedFeature> {
     if let Some(lock_entry) = lock_context.lock_entry_for_registry(registry) {
-        if let Some(locked_digest) = parse_digest_from_resolved(&lock_entry.resolved) {
-            let locked_sha = layer_sha_prefix(&locked_digest);
-            let locked_path = get_cached_feature_path(registry, &locked_sha)?;
-
-            if is_feature_cached(&locked_path) {
+        if let Some(locked_manifest_digest) = parse_digest_from_resolved(&lock_entry.resolved) {
+            if let Some(locked_path) =
+                find_cached_feature_by_manifest_digest(registry, &locked_manifest_digest)?
+            {
                 info!(
-                    "Using locked cached feature: {} (version {}, SHA: {})",
-                    registry.name, registry.version, locked_sha
+                    "Using locked cached feature: {} (version {}, manifest digest: sha256:{})",
+                    registry.name, registry.version, locked_manifest_digest
+                );
+                debug!(
+                    "Locked manifest cache hit for feature {} (manifest digest: sha256:{}), using cached path: {}",
+                    registry.name,
+                    locked_manifest_digest,
+                    locked_path.display()
                 );
                 return Ok(DownloadedFeature {
                     path: locked_path,
-                    digest: Some(locked_digest),
+                    digest: Some(locked_manifest_digest),
                 });
             }
 
             if lock_context.mode == LockMode::Frozen {
                 return Err(Error::feature(format!(
                     "Feature {} is locked to digest sha256:{} but not present in local cache. Run an online build without --frozen-lockfile first.",
-                    registry.name, locked_digest
+                    registry.name, locked_manifest_digest
                 )));
             }
 
-            info!(
-                "Locked cache miss for feature {} (SHA: {}), downloading locked digest",
-                registry.name, locked_sha
+            debug!(
+                "Locked manifest cache miss for feature {} (manifest digest: sha256:{}), resolving layer digest",
+                registry.name, locked_manifest_digest
             );
             let token = fetch_registry_token(registry)?;
-            download_and_cache_feature(registry, &locked_path, &token, &locked_digest)?;
+            let manifest = fetch_manifest_digests_for_reference(
+                registry,
+                &token,
+                &canonical_layer_digest(&locked_manifest_digest),
+            )?;
+            let layer_sha = layer_sha_prefix(&manifest.layer_digest);
+            let locked_path = get_cached_feature_path(registry, &layer_sha)?;
+            if !is_feature_cached(&locked_path) {
+                info!(
+                    "Downloading locked feature: {} (version {}, layer SHA: {})",
+                    registry.name, registry.version, layer_sha
+                );
+                download_and_cache_feature(
+                    registry,
+                    &locked_path,
+                    &token,
+                    &manifest.layer_digest,
+                    &manifest.manifest_digest,
+                )?;
+            } else {
+                // Backfill metadata for caches created before manifest/layer mapping support.
+                let metadata_path = cache_metadata_path(&locked_path);
+                if !metadata_path.exists() {
+                    write_cache_metadata(
+                        &locked_path,
+                        &manifest.manifest_digest,
+                        &manifest.layer_digest,
+                    )?;
+                }
+                info!(
+                    "Using cached feature resolved from lockfile: {} (version {}, layer SHA: {})",
+                    registry.name, registry.version, layer_sha
+                );
+            }
             return Ok(DownloadedFeature {
                 path: locked_path,
-                digest: Some(locked_digest),
+                digest: Some(normalize_layer_digest(&manifest.manifest_digest)),
             });
         }
 
@@ -674,8 +828,8 @@ fn download_feature(
     }
 
     let token = fetch_registry_token(registry)?;
-    let layer_digest = fetch_manifest_layer_digest(registry, &token)?;
-    let layer_sha = layer_sha_prefix(&layer_digest);
+    let manifest = fetch_manifest_digests_for_reference(registry, &token, &registry.version)?;
+    let layer_sha = layer_sha_prefix(&manifest.layer_digest);
     let cached_feature_path = get_cached_feature_path(registry, &layer_sha)?;
 
     if !is_feature_cached(&cached_feature_path) {
@@ -683,17 +837,31 @@ fn download_feature(
             "Downloading feature: {} (version {}, SHA: {})",
             registry.name, registry.version, layer_sha
         );
-        download_and_cache_feature(registry, &cached_feature_path, &token, &layer_digest)?;
+        download_and_cache_feature(
+            registry,
+            &cached_feature_path,
+            &token,
+            &manifest.layer_digest,
+            &manifest.manifest_digest,
+        )?;
     } else {
         info!(
             "Using cached feature: {} (version {}, SHA: {})",
             registry.name, registry.version, layer_sha
         );
+        let metadata_path = cache_metadata_path(&cached_feature_path);
+        if !metadata_path.exists() {
+            write_cache_metadata(
+                &cached_feature_path,
+                &manifest.manifest_digest,
+                &manifest.layer_digest,
+            )?;
+        }
     }
 
     Ok(DownloadedFeature {
         path: cached_feature_path,
-        digest: Some(normalize_layer_digest(&layer_digest)),
+        digest: Some(normalize_layer_digest(&manifest.manifest_digest)),
     })
 }
 
@@ -703,6 +871,7 @@ fn fetch_registry_token(registry: &FeatureRegistry) -> Result<String> {
         "https://{}/token?scope=repository:{}/{}:pull",
         "ghcr.io", registry.owner, registry.repository
     );
+    debug!("Fetching registry token from {}", token_url);
 
     let response = reqwest::blocking::get(&token_url)?;
     if !response.status().is_success() {
@@ -725,11 +894,15 @@ fn fetch_registry_token(registry: &FeatureRegistry) -> Result<String> {
     Ok(token)
 }
 
-/// Fetch the manifest and extract the layer digest (SHA).
-fn fetch_manifest_layer_digest(registry: &FeatureRegistry, token: &str) -> Result<String> {
+/// Fetch the manifest and extract both manifest and layer digests.
+fn fetch_manifest_digests_for_reference(
+    registry: &FeatureRegistry,
+    token: &str,
+    reference: &str,
+) -> Result<ManifestDigests> {
     let manifest_url = format!(
         "https://{}/v2/{}/{}/{}/manifests/{}",
-        "ghcr.io", registry.owner, registry.repository, registry.name, registry.version
+        "ghcr.io", registry.owner, registry.repository, registry.name, reference
     );
 
     let manifest_response = reqwest::blocking::Client::new()
@@ -740,10 +913,20 @@ fn fetch_manifest_layer_digest(registry: &FeatureRegistry, token: &str) -> Resul
 
     if !manifest_response.status().is_success() {
         return Err(Error::new(format!(
-            "Failed to download manifest for feature: {}",
-            registry.name
+            "Failed to download manifest for feature {} (reference {}): HTTP {}",
+            registry.name,
+            reference,
+            manifest_response.status()
         )));
     }
+
+    let manifest_digest = manifest_response
+        .headers()
+        .get("docker-content-digest")
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| canonical_layer_digest(reference));
+
     let manifest_json: serde_json::Value = manifest_response.json()?;
     let manifest_str = serde_json::to_string(&manifest_json)?;
     let reader = std::io::Cursor::new(manifest_str);
@@ -755,7 +938,10 @@ fn fetch_manifest_layer_digest(registry: &FeatureRegistry, token: &str) -> Resul
         ))
     })?;
 
-    Ok(layer.digest().to_string())
+    Ok(ManifestDigests {
+        manifest_digest,
+        layer_digest: layer.digest().to_string(),
+    })
 }
 
 /// Download and extract a feature to the cache directory
@@ -764,13 +950,17 @@ fn download_and_cache_feature(
     cache_path: &std::path::Path,
     token: &str,
     layer_digest: &str,
+    manifest_digest: &str,
 ) -> Result<()> {
     let temp_directory = TempDir::new()?;
+    let canonical_digest = canonical_layer_digest(layer_digest);
 
     let layer_url = format!(
         "https://{}/v2/{}/{}/{}/blobs/{}",
-        "ghcr.io", registry.owner, registry.repository, registry.name, layer_digest
+        "ghcr.io", registry.owner, registry.repository, registry.name, canonical_digest
     );
+    debug!("Layer download url {}", layer_url);
+
     let layer_response = reqwest::blocking::Client::new()
         .get(&layer_url)
         .bearer_auth(token)
@@ -778,8 +968,9 @@ fn download_and_cache_feature(
 
     if !layer_response.status().is_success() {
         return Err(Error::new(format!(
-            "Failed to download layer for feature: {}",
-            registry.name
+            "Failed to download layer for feature: {}, HTTP {}",
+            registry.name,
+            layer_response.status()
         )));
     }
     let layer_bytes = layer_response.bytes()?;
@@ -806,6 +997,8 @@ fn download_and_cache_feature(
     );
     fs_extra::dir::copy(&extract_path, cache_path, &options)
         .map_err(|e| Error::new(format!("Failed to copy extracted feature: {}", e)))?;
+
+    write_cache_metadata(cache_path, manifest_digest, layer_digest)?;
 
     Ok(())
 }
@@ -854,10 +1047,7 @@ pub fn build_lockfile_from_features(features: &[FeatureProcessResult]) -> Devcon
             &feature.integrity,
         ) {
             (Registry { registry }, Some(resolved), Some(integrity)) => (
-                normalize_feature_identifier(&format!(
-                    "ghcr.io/{}/{}/{}:{}",
-                    registry.owner, registry.repository, registry.name, registry.version
-                )),
+                registry_lock_key(registry),
                 resolved.clone(),
                 integrity.clone(),
             ),
@@ -1170,6 +1360,30 @@ mod tests {
             lockfile
                 .features
                 .contains_key("ghcr.io/test/features/feature-a:1.0.0")
+        );
+    }
+
+    #[test]
+    fn test_build_lockfile_omits_latest_suffix_for_unversioned_keys() {
+        let mut feature = create_mock_feature("chrometesting", None, None);
+        if let FeatureSource::Registry { ref mut registry } = feature.feature_ref.source {
+            registry.owner = "kreemer".to_string();
+            registry.repository = "features".to_string();
+            registry.version = "latest".to_string();
+        }
+        feature.resolved = Some("ghcr.io/kreemer/features/chrometesting@sha256:abc123".to_string());
+        feature.integrity = Some("sha256:abc123".to_string());
+
+        let lockfile = build_lockfile_from_features(&[feature]);
+        assert!(
+            lockfile
+                .features
+                .contains_key("ghcr.io/kreemer/features/chrometesting")
+        );
+        assert!(
+            !lockfile
+                .features
+                .contains_key("ghcr.io/kreemer/features/chrometesting:latest")
         );
     }
 
