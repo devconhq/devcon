@@ -26,6 +26,7 @@
 
 use std::{
     collections::HashSet,
+    net::TcpListener,
     path::Path,
     process::{Command, Stdio},
 };
@@ -97,22 +98,116 @@ fn allocate_auto_host_port_with_picker<F>(
 where
     F: FnMut() -> Option<u16>,
 {
-    for _ in 0..AUTO_HOST_PORT_PICK_ATTEMPTS {
+    let mut picker_none = 0usize;
+    let mut rejected_below_min = Vec::new();
+    let mut rejected_used = Vec::new();
+    let mut rejected_unbindable = Vec::new();
+
+    let probe_bindable = |port: u16| -> bool { TcpListener::bind(("0.0.0.0", port)).is_ok() };
+
+    let find_next_bindable = |start_port: u16| -> Option<u16> {
+        let mut candidate = start_port.max(AUTO_HOST_PORT_MIN);
+        while candidate <= u16::MAX {
+            if !used_host_ports.contains(&candidate) && probe_bindable(candidate) {
+                return Some(candidate);
+            }
+
+            if candidate == u16::MAX {
+                break;
+            }
+            candidate += 1;
+        }
+        None
+    };
+
+    for attempt in 1..=AUTO_HOST_PORT_PICK_ATTEMPTS {
         let candidate = match picker() {
             Some(port) => port,
-            None => continue,
+            None => {
+                picker_none += 1;
+                trace!(
+                    "Host port picker attempt {}/{} returned no candidate",
+                    attempt, AUTO_HOST_PORT_PICK_ATTEMPTS
+                );
+                continue;
+            }
         };
 
-        if candidate < AUTO_HOST_PORT_MIN || used_host_ports.contains(&candidate) {
+        if candidate < AUTO_HOST_PORT_MIN {
+            if rejected_below_min.len() < 8 {
+                rejected_below_min.push(candidate);
+            }
+            trace!(
+                "Rejected candidate host port {}: below minimum {} (attempt {}/{})",
+                candidate, AUTO_HOST_PORT_MIN, attempt, AUTO_HOST_PORT_PICK_ATTEMPTS
+            );
             continue;
         }
 
+        if used_host_ports.contains(&candidate) {
+            if rejected_used.len() < 8 {
+                rejected_used.push(candidate);
+            }
+            trace!(
+                "Rejected candidate host port {}: already used by explicit/selected mapping (attempt {}/{})",
+                candidate, attempt, AUTO_HOST_PORT_PICK_ATTEMPTS
+            );
+
+            if let Some(next_port) = find_next_bindable(candidate.saturating_add(1)) {
+                debug!(
+                    "Picker returned already-used port {}; selected next bindable host port {}",
+                    candidate, next_port
+                );
+                return Ok(next_port);
+            }
+
+            continue;
+        }
+
+        if !probe_bindable(candidate) {
+            if rejected_unbindable.len() < 8 {
+                rejected_unbindable.push(candidate);
+            }
+            trace!(
+                "Rejected candidate host port {}: not bindable on host interface 0.0.0.0 (attempt {}/{})",
+                candidate, attempt, AUTO_HOST_PORT_PICK_ATTEMPTS
+            );
+
+            if let Some(next_port) = find_next_bindable(candidate.saturating_add(1)) {
+                debug!(
+                    "Candidate host port {} not bindable; selected next bindable host port {}",
+                    candidate, next_port
+                );
+                return Ok(next_port);
+            }
+
+            continue;
+        }
+
+        debug!(
+            "Selected host port {} after {} picker attempts (none={}, below_min_rejections={}, used_rejections={}, unbindable_rejections={})",
+            candidate,
+            attempt,
+            picker_none,
+            rejected_below_min.len(),
+            rejected_used.len(),
+            rejected_unbindable.len()
+        );
         return Ok(candidate);
     }
 
+    let mut used_ports: Vec<u16> = used_host_ports.iter().copied().collect();
+    used_ports.sort_unstable();
+
     Err(Error::runtime(format!(
-        "Failed to allocate an unused host port above {}",
-        AUTO_HOST_PORT_MIN - 1
+        "Failed to allocate an unused host port above {} after {} attempts (picker returned None {} times, below-min rejections sample: {:?}, already-used rejections sample: {:?}, unbindable rejections sample: {:?}, currently reserved host ports: {:?})",
+        AUTO_HOST_PORT_MIN - 1,
+        AUTO_HOST_PORT_PICK_ATTEMPTS,
+        picker_none,
+        rejected_below_min,
+        rejected_used,
+        rejected_unbindable,
+        used_ports
     )))
 }
 
@@ -133,6 +228,8 @@ where
 {
     use crate::devcontainer::ForwardPort;
 
+    debug!("Resolving container runtime ports from config: {:?}", ports);
+
     let mut used_host_ports = HashSet::new();
     for port in ports {
         if let ForwardPort::HostPort(mapping) = port
@@ -142,18 +239,41 @@ where
         }
     }
 
+    let mut explicit_host_ports: Vec<u16> = used_host_ports.iter().copied().collect();
+    explicit_host_ports.sort_unstable();
+    debug!(
+        "Explicit host ports already reserved before auto-allocation: {:?}",
+        explicit_host_ports
+    );
+
     let mut resolved = Vec::with_capacity(ports.len());
-    for port in ports {
+    for (index, port) in ports.iter().enumerate() {
         match port {
             ForwardPort::Port(container_port) => {
-                let host_port = allocate_auto_host_port_with_picker(&used_host_ports, &mut picker)?;
+                let host_port = allocate_auto_host_port_with_picker(&used_host_ports, &mut picker)
+                    .map_err(|e| {
+                        Error::runtime(format!(
+                            "Failed to resolve host port mapping for container port {} at index {}: {}",
+                            container_port, index, e
+                        ))
+                    })?;
                 used_host_ports.insert(host_port);
+                debug!(
+                    "Mapped container port {} to auto-selected host port {}",
+                    container_port, host_port
+                );
                 resolved.push(ForwardPort::HostPort(format!(
                     "{}:{}",
                     host_port, container_port
                 )));
             }
-            ForwardPort::HostPort(mapping) => resolved.push(ForwardPort::HostPort(mapping.clone())),
+            ForwardPort::HostPort(mapping) => {
+                trace!(
+                    "Keeping explicit host:container mapping '{}' at index {}",
+                    mapping, index
+                );
+                resolved.push(ForwardPort::HostPort(mapping.clone()));
+            }
         }
     }
 
@@ -435,6 +555,10 @@ impl ContainerRuntime for ContainerCliRuntime {
         let mut last_error = None;
 
         for attempt in 1..=CONTAINER_START_MAX_ATTEMPTS {
+            trace!(
+                "Container start attempt {}/{} with requested forwards: {:?}",
+                attempt, CONTAINER_START_MAX_ATTEMPTS, ports
+            );
             let resolved_ports = resolve_container_runtime_ports(&ports)?;
             debug!(
                 "Container runtime port mappings (attempt {}): {:?}",
@@ -897,10 +1021,18 @@ mod tests {
             &resolved[0],
             crate::devcontainer::ForwardPort::HostPort(mapping) if mapping == "41000:8080"
         ));
-        assert!(matches!(
-            &resolved[1],
-            crate::devcontainer::ForwardPort::HostPort(mapping) if mapping == "42000:3000"
-        ));
+
+        let mapping = match &resolved[1] {
+            crate::devcontainer::ForwardPort::HostPort(mapping) => mapping,
+            crate::devcontainer::ForwardPort::Port(_) => panic!("expected host:container mapping"),
+        };
+        let parts: Vec<&str> = mapping.split(':').collect();
+        assert_eq!(parts.len(), 2);
+        let host_port = parts[0].parse::<u16>().expect("host port number");
+        let container_port = parts[1].parse::<u16>().expect("container port number");
+        assert_eq!(container_port, 3000);
+        assert_ne!(host_port, 41000);
+        assert!(host_port >= AUTO_HOST_PORT_MIN);
     }
 
     #[test]
