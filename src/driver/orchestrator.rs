@@ -73,9 +73,10 @@ use crate::devcontainer::{
 };
 use crate::driver::agent::{self, AgentConfig};
 use crate::driver::agent_socket::{
-    agent_socket_stable_dir, detect_gh_config, detect_gpg_socket, detect_public_ssh_key,
-    detect_ssh_socket, ensure_ssh_port_forwarded, is_transient_agent_mount_start_error,
-    shell_single_quote, update_agent_socket_symlink,
+    agent_socket_profile_dir, agent_socket_profile_key, detect_gh_config, detect_gpg_socket,
+    detect_public_ssh_key, detect_ssh_socket, ensure_ssh_port_forwarded,
+    is_transient_agent_mount_start_error, shell_single_quote, update_agent_socket_symlink,
+    write_agent_socket_metadata,
 };
 use crate::driver::dockerfile::{BuildContext, DockerfileParams, apply_feature_order_override};
 use crate::driver::environment::{base_container_environment, compose_start_environment};
@@ -789,6 +790,7 @@ impl ContainerOrchestrator {
 
             if is_current {
                 info!("Restarting stopped container with latest image");
+                self.refresh_agent_socket_symlinks_for_profile();
                 match self.runtime.start_container(handle.id()) {
                     Ok(restarted) => return Ok(restarted.id().to_string()),
                     Err(err) => {
@@ -982,8 +984,14 @@ impl ContainerOrchestrator {
 
         // Add agent forwarding mounts if configured
         if let Some(ref agent_fwd) = self.config.agent_forwarding {
-            // Resolve the stable agent socket directory once; shared by SSH and GPG forwarding.
-            let stable_agent_dir = agent_socket_stable_dir();
+            // Resolve the profile-scoped stable agent socket directory once; shared by SSH and
+            // GPG forwarding for containers that use the same forwarding profile.
+            let profile_key = agent_socket_profile_key(agent_fwd);
+            let stable_agent_dir = agent_socket_profile_dir(&profile_key);
+            debug!(
+                "Using agent forwarding profile '{}' with stable dir {:?}",
+                profile_key, stable_agent_dir
+            );
 
             // SSH agent forwarding
             if agent_fwd.ssh_enabled.unwrap_or(false) {
@@ -1006,6 +1014,12 @@ impl ContainerOrchestrator {
                     info!("Forwarding SSH agent socket into container");
                     if let Some(ref stable_dir) = stable_agent_dir {
                         if update_agent_socket_symlink(stable_dir, "ssh-agent", &socket) {
+                            let _ = write_agent_socket_metadata(
+                                stable_dir,
+                                "ssh-agent",
+                                &profile_key,
+                                &socket,
+                            );
                             ssh_agent_mounted = true;
                             ssh_via_stable_dir = true;
                         } else {
@@ -1051,6 +1065,12 @@ impl ContainerOrchestrator {
                     info!("Forwarding GPG agent socket into container");
                     if let Some(ref stable_dir) = stable_agent_dir {
                         if update_agent_socket_symlink(stable_dir, "S.gpg-agent", &socket) {
+                            let _ = write_agent_socket_metadata(
+                                stable_dir,
+                                "S.gpg-agent",
+                                &profile_key,
+                                &socket,
+                            );
                             gpg_via_stable_dir = true;
                         } else {
                             warn!(
@@ -1705,6 +1725,87 @@ impl ContainerOrchestrator {
 
     fn get_container_name(&self, devcontainer_workspace: &Workspace) -> String {
         format!("devcon.{}", devcontainer_workspace.get_sanitized_name())
+    }
+
+    fn refresh_agent_socket_symlinks_for_profile(&self) {
+        let Some(agent_fwd) = self.config.agent_forwarding.as_ref() else {
+            return;
+        };
+
+        let profile_key = agent_socket_profile_key(agent_fwd);
+        let Some(stable_dir) = agent_socket_profile_dir(&profile_key) else {
+            warn!(
+                "Unable to refresh agent forwarding profile '{}' because stable dir was unavailable",
+                profile_key
+            );
+            return;
+        };
+
+        if agent_fwd.ssh_enabled.unwrap_or(false) {
+            let ssh_socket = if let Some(ref override_path) = agent_fwd.ssh_socket_path {
+                let path = PathBuf::from(override_path);
+                if path.exists() {
+                    Some(path)
+                } else {
+                    warn!(
+                        "SSH socket override path '{}' does not exist",
+                        override_path
+                    );
+                    None
+                }
+            } else {
+                detect_ssh_socket()
+            };
+
+            if let Some(socket) = ssh_socket {
+                if !update_agent_socket_symlink(&stable_dir, "ssh-agent", &socket) {
+                    warn!(
+                        "Failed refreshing SSH symlink for profile '{}' to socket {:?}",
+                        profile_key, socket
+                    );
+                } else {
+                    let _ = write_agent_socket_metadata(
+                        &stable_dir,
+                        "ssh-agent",
+                        &profile_key,
+                        &socket,
+                    );
+                }
+            }
+        }
+
+        if agent_fwd.gpg_enabled.unwrap_or(false) {
+            let gpg_socket = if let Some(ref override_path) = agent_fwd.gpg_socket_path {
+                let path = PathBuf::from(override_path);
+                if path.exists() {
+                    Some(path)
+                } else {
+                    warn!(
+                        "GPG socket override path '{}' does not exist",
+                        override_path
+                    );
+                    None
+                }
+            } else {
+                detect_gpg_socket()
+            };
+
+            if let Some(socket) = gpg_socket {
+                if !update_agent_socket_symlink(&stable_dir, "S.gpg-agent", &socket) {
+                    warn!(
+                        "Failed refreshing GPG symlink for profile '{}' to socket {:?}",
+                        profile_key, socket
+                    );
+                } else {
+                    let _ = write_agent_socket_metadata(
+                        &stable_dir,
+                        "S.gpg-agent",
+                        &profile_key,
+                        &socket,
+                    );
+                }
+            }
+        }
     }
 
     fn get_container_label(&self, devcontainer_workspace: &Workspace) -> String {

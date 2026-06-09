@@ -27,7 +27,9 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::config::AgentForwardingConfig;
 use tracing::{debug, info, warn};
 
 use crate::devcontainer::ForwardPort;
@@ -238,6 +240,51 @@ pub(crate) fn agent_socket_stable_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
+/// Returns a deterministic forwarding profile key.
+///
+/// The default profile is shared by all containers that rely on auto-detection.
+/// Explicit override paths get an isolated profile key to prevent cross-routing.
+pub(crate) fn agent_socket_profile_key(agent_fwd: &AgentForwardingConfig) -> String {
+    let ssh = agent_fwd
+        .ssh_socket_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let gpg = agent_fwd
+        .gpg_socket_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    match (ssh, gpg) {
+        (None, None) => "default".to_string(),
+        _ => {
+            // Keep the on-disk path compact and filename-safe.
+            let fingerprint = format!(
+                "ssh={}|gpg={}",
+                ssh.unwrap_or("auto"),
+                gpg.unwrap_or("auto")
+            );
+            let digest = sha256::digest(fingerprint.as_bytes());
+            format!("override-{}", &digest[..16])
+        }
+    }
+}
+
+/// Returns the stable directory for a forwarding profile.
+pub(crate) fn agent_socket_profile_dir(profile_key: &str) -> Option<PathBuf> {
+    let base = agent_socket_stable_dir()?;
+    let dir = base.join(profile_key);
+    if let Err(e) = fs::create_dir_all(&dir) {
+        warn!(
+            "Failed to create profile agent socket stable dir {:?}: {}",
+            dir, e
+        );
+        return None;
+    }
+    Some(dir)
+}
+
 /// Creates or atomically replaces the symlink `stable_dir/link_name → target`.
 ///
 /// Returns `true` on success. On failure, logs a warning and returns `false` so
@@ -268,6 +315,36 @@ pub(crate) fn update_agent_socket_symlink(
             warn!(
                 "Failed to create agent socket symlink {:?} → {:?}: {}",
                 link_path, target, e
+            );
+            false
+        }
+    }
+}
+
+/// Writes endpoint metadata for observability and future proxy lifecycle management.
+pub(crate) fn write_agent_socket_metadata(
+    stable_dir: &Path,
+    link_name: &str,
+    profile_key: &str,
+    target: &Path,
+) -> bool {
+    let metadata_path = stable_dir.join(format!("{}.meta", link_name));
+    let updated = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |dur| dur.as_secs());
+    let content = format!(
+        "profile={profile}\ntarget={target}\nupdated_unix={updated}\n",
+        profile = profile_key,
+        target = target.display(),
+        updated = updated
+    );
+
+    match fs::write(&metadata_path, content) {
+        Ok(()) => true,
+        Err(e) => {
+            warn!(
+                "Failed to write agent socket metadata {:?}: {}",
+                metadata_path, e
             );
             false
         }
@@ -341,5 +418,74 @@ mod tests {
         assert!(result);
         let link = std::fs::read_link(stable.path().join("ssh-agent")).unwrap();
         assert_eq!(link, target);
+    }
+
+    #[test]
+    fn test_agent_socket_profile_key_default_without_overrides() {
+        let cfg = AgentForwardingConfig::default();
+        assert_eq!(agent_socket_profile_key(&cfg), "default");
+    }
+
+    #[test]
+    fn test_agent_socket_profile_key_override_is_stable_and_scoped() {
+        let cfg_a = AgentForwardingConfig {
+            ssh_socket_path: Some("/tmp/ssh-a.sock".to_string()),
+            ..Default::default()
+        };
+        let cfg_b = AgentForwardingConfig {
+            ssh_socket_path: Some("/tmp/ssh-a.sock".to_string()),
+            ..Default::default()
+        };
+        let cfg_c = AgentForwardingConfig {
+            ssh_socket_path: Some("/tmp/ssh-b.sock".to_string()),
+            ..Default::default()
+        };
+
+        let a = agent_socket_profile_key(&cfg_a);
+        let b = agent_socket_profile_key(&cfg_b);
+        let c = agent_socket_profile_key(&cfg_c);
+
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert!(a.starts_with("override-"));
+    }
+
+    #[test]
+    fn test_agent_socket_profile_dir_is_nested_under_base_stable_dir() {
+        let profile = "test-profile";
+        let dir = agent_socket_profile_dir(profile).unwrap();
+        let base = agent_socket_stable_dir().unwrap();
+        assert_eq!(dir, base.join(profile));
+        assert!(dir.exists());
+    }
+
+    #[test]
+    fn test_write_agent_socket_metadata_creates_expected_file() {
+        let stable = tempfile::tempdir().unwrap();
+        let target = stable.path().join("ssh.sock");
+        std::fs::write(&target, b"").unwrap();
+
+        assert!(write_agent_socket_metadata(
+            stable.path(),
+            "ssh-agent",
+            "default",
+            &target
+        ));
+
+        let metadata = std::fs::read_to_string(stable.path().join("ssh-agent.meta")).unwrap();
+        assert!(metadata.contains("profile=default"));
+        assert!(metadata.contains(&format!("target={}", target.display())));
+        assert!(metadata.contains("updated_unix="));
+    }
+}
+
+mod sha256 {
+    use sha2::{Digest, Sha256};
+
+    pub(crate) fn digest(input: &[u8]) -> String {
+        Sha256::digest(input)
+            .iter()
+            .map(|byte| format!("{:02x}", byte))
+            .collect()
     }
 }
