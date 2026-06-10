@@ -128,6 +128,18 @@ if [ -f /etc/ssh/sshd_config ]; then
     else
         printf '\nPort {{ ssh_port }}\n' >> /etc/ssh/sshd_config
     fi
+
+    if grep -Eq '^[[:space:]#]*AcceptEnv[[:space:]]+' /etc/ssh/sshd_config; then
+        sed -i -E 's/^[[:space:]#]*AcceptEnv[[:space:]]+.*/AcceptEnv */' /etc/ssh/sshd_config
+    else
+        printf 'AcceptEnv *\n' >> /etc/ssh/sshd_config
+    fi
+
+    if grep -Eq '^[[:space:]#]*PermitUserEnvironment[[:space:]]+' /etc/ssh/sshd_config; then
+        sed -i -E 's/^[[:space:]#]*PermitUserEnvironment[[:space:]]+.*/PermitUserEnvironment yes/' /etc/ssh/sshd_config
+    else
+        printf 'PermitUserEnvironment yes\n' >> /etc/ssh/sshd_config
+    fi
 fi
 {% endif %}
 

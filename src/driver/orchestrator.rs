@@ -79,7 +79,9 @@ use crate::driver::agent_socket::{
     write_agent_socket_metadata,
 };
 use crate::driver::dockerfile::{BuildContext, DockerfileParams, apply_feature_order_override};
-use crate::driver::environment::{base_container_environment, compose_start_environment};
+use crate::driver::environment::{
+    base_container_environment, compose_ssh_environment, compose_start_environment,
+};
 use crate::driver::feature_process::{
     FeatureLockContext, FeatureProcessResult, LockMode, build_lockfile_from_features,
 };
@@ -220,6 +222,162 @@ impl ContainerOrchestrator {
             .flatten();
         self.resolve_users_for_image(workspace, &latest_tag, probe_info.as_ref())
             .remote_user
+    }
+
+    /// Refreshes the in-container SSH session environment file for a running container.
+    ///
+    /// This keeps dynamic host-passthrough config vars (`envVariables` entries without `=`)
+    /// up to date for each SSH connection attempt.
+    pub fn refresh_ssh_session_environment_for_connection(
+        &self,
+        workspace: &Workspace,
+        container_id: &str,
+    ) -> Result<()> {
+        if self.config.should_skip_agent_ssh_setup() {
+            return Ok(());
+        }
+
+        let handle = self
+            .runtime
+            .list()?
+            .into_iter()
+            .find_map(|(_, _, handle)| (handle.id() == container_id).then_some(handle))
+            .ok_or_else(|| {
+                Error::runtime(format!(
+                    "Container '{}' is not running; cannot refresh SSH session environment.",
+                    container_id
+                ))
+            })?;
+
+        let latest_tag = format!("{}:latest", self.get_image_tag(workspace));
+        let probe_user_hint = workspace.devcontainer.remote_user.clone().or_else(|| {
+            self.runtime
+                .inspect_image(&latest_tag)
+                .ok()
+                .flatten()
+                .as_ref()
+                .and_then(|inspect| {
+                    let label_str = inspect
+                        .config
+                        .labels
+                        .get("devcontainer.metadata")
+                        .map(String::as_str)?;
+                    let entries: serde_json::Value = serde_json::from_str(label_str).ok()?;
+                    entries.as_array()?.iter().rev().find_map(|entry| {
+                        entry
+                            .get("remoteUser")
+                            .and_then(|u| u.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(ToString::to_string)
+                    })
+                })
+        });
+        let probe_info = self
+            .runtime
+            .probe_image_info(&latest_tag, probe_user_hint.as_deref())
+            .ok()
+            .flatten();
+        let users = self.resolve_users_for_image(workspace, &latest_tag, probe_info.as_ref());
+
+        let ssh_session_env = self
+            .resolve_ssh_session_environment(workspace)
+            .unwrap_or_else(|err| {
+                warn!(
+                    "Failed to resolve SSH session environment for refresh: {}",
+                    err
+                );
+                Vec::new()
+            });
+
+        self.ensure_ssh_session_environment_file(handle.as_ref(), &users, &ssh_session_env)
+    }
+
+    /// Resolves environment variables that should be forwarded into SSH sessions.
+    ///
+    /// Merge order:
+    /// 1. Base image environment
+    /// 2. Feature `containerEnv`
+    /// 3. `devcontainer.json` `containerEnv`
+    /// 4. Config `envVariables`
+    /// 5. `devcontainer.json` `remoteEnv`
+    pub fn resolve_ssh_session_environment(
+        &self,
+        workspace: &Workspace,
+    ) -> Result<Vec<(String, String)>> {
+        let mut features = workspace
+            .devcontainer
+            .merge_additional_features(&self.config.additional_features)?;
+
+        if !self.config.is_agent_disabled() {
+            let agent_config = AgentConfig::new(
+                self.config.get_agent_use_binary(),
+                self.config.get_agent_binary_url().cloned(),
+                self.config.get_agent_git_repository().cloned(),
+                self.config.get_agent_git_branch().cloned(),
+                self.config.get_agent_ssh_port(),
+                self.config.should_skip_agent_ssh_setup(),
+            );
+            let agent_path = agent::Agent::new(agent_config).generate()?;
+            features.push(FeatureRef::new(FeatureSource::Local { path: agent_path }));
+        }
+
+        let lock_context = FeatureLockContext::update(self.read_lockfile(workspace)?);
+        let processed_features = match process_features(&features, true, &lock_context) {
+            Ok(results) => results,
+            Err(err) => {
+                warn!(
+                    "Failed to resolve features for SSH environment composition, falling back to non-feature env: {}",
+                    err
+                );
+                Vec::new()
+            }
+        };
+
+        let latest_tag = format!("{}:latest", self.get_image_tag(workspace));
+        let probe_user_hint = workspace.devcontainer.remote_user.clone().or_else(|| {
+            self.runtime
+                .inspect_image(&latest_tag)
+                .ok()
+                .flatten()
+                .as_ref()
+                .and_then(|inspect| {
+                    let label_str = inspect
+                        .config
+                        .labels
+                        .get("devcontainer.metadata")
+                        .map(String::as_str)?;
+                    let entries: serde_json::Value = serde_json::from_str(label_str).ok()?;
+                    entries.as_array()?.iter().rev().find_map(|entry| {
+                        entry
+                            .get("remoteUser")
+                            .and_then(|u| u.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(ToString::to_string)
+                    })
+                })
+        });
+
+        let probe_info = self
+            .runtime
+            .probe_image_info(&latest_tag, probe_user_hint.as_deref())
+            .ok()
+            .flatten();
+        let base_env =
+            base_container_environment(self.runtime.as_ref(), &latest_tag, probe_info.as_ref());
+
+        let ssh_env = compose_ssh_environment(
+            &processed_features,
+            workspace.devcontainer.container_env.as_ref(),
+            workspace.devcontainer.remote_env.as_ref(),
+            &self.config.env_variables,
+            &base_env,
+        );
+
+        let mut sorted = ssh_env.into_iter().collect::<Vec<_>>();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(sorted)
     }
 
     /// Prepares features for building or starting a container.
@@ -1261,6 +1419,21 @@ impl ContainerOrchestrator {
 
         if !self.config.should_skip_agent_ssh_setup() {
             self.ensure_ssh_authorized_key(handle.as_ref(), &resolved_users)?;
+
+            let ssh_session_env = self
+                .resolve_ssh_session_environment(&devcontainer_workspace)
+                .unwrap_or_else(|err| {
+                    warn!(
+                        "Failed to resolve SSH session environment for in-container SSH setup: {}",
+                        err
+                    );
+                    Vec::new()
+                });
+            self.ensure_ssh_session_environment_file(
+                handle.as_ref(),
+                &resolved_users,
+                &ssh_session_env,
+            )?;
         }
 
         if let Some(command) = &devcontainer_workspace.devcontainer.on_create_command {
@@ -1476,6 +1649,78 @@ impl ContainerOrchestrator {
 
         self.runtime
             .exec(handle, vec!["sh", "-lc", &command], &[], false, false)
+    }
+
+    fn ensure_ssh_session_environment_file(
+        &self,
+        handle: &dyn crate::driver::runtime::ContainerHandle,
+        users: &ResolvedUsers,
+        ssh_env: &[(String, String)],
+    ) -> Result<()> {
+        let home = shell_single_quote(&users.remote_user_home);
+        let env_path = shell_single_quote(&format!("{}/.ssh/environment", users.remote_user_home));
+        let env_content = Self::build_ssh_environment_file_content(ssh_env);
+
+        let command = if env_content.is_empty() {
+            format!(
+                "set -e; \
+                mkdir -p '{home}/.ssh'; \
+                chmod 700 '{home}/.ssh'; \
+                rm -f '{env_path}'"
+            )
+        } else {
+            let quoted_content = shell_single_quote(&env_content);
+            format!(
+                "set -e; \
+                mkdir -p '{home}/.ssh'; \
+                chmod 700 '{home}/.ssh'; \
+                printf '%s' '{quoted_content}' > '{env_path}'; \
+                chmod 600 '{env_path}'"
+            )
+        };
+
+        self.runtime
+            .exec(handle, vec!["sh", "-lc", &command], &[], false, false)
+    }
+
+    fn build_ssh_environment_file_content(ssh_env: &[(String, String)]) -> String {
+        let mut lines = Vec::new();
+
+        for (name, value) in ssh_env {
+            if !Self::is_valid_ssh_env_name(name) {
+                continue;
+            }
+
+            let sanitized = Self::sanitize_ssh_env_value(value);
+            lines.push(format!("{}={}", name, sanitized));
+        }
+
+        lines.sort();
+        if lines.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", lines.join("\n"))
+        }
+    }
+
+    fn is_valid_ssh_env_name(name: &str) -> bool {
+        let mut chars = name.chars();
+        let Some(first) = chars.next() else {
+            return false;
+        };
+
+        if !first.is_ascii_alphabetic() && first != '_' {
+            return false;
+        }
+
+        chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+
+    fn sanitize_ssh_env_value(value: &str) -> String {
+        value
+            .chars()
+            .filter(|c| !matches!(c, '\n' | '\r' | '\0'))
+            .collect()
     }
 
     /// Shells into a started container.
@@ -2190,5 +2435,25 @@ mod tests {
         let mount_str = "${remoteUser}:${containerUser}:${remoteUserHome}:${containerUserHome}";
         let result = driver.substitute_mount_variables(mount_str, &workspace);
         assert_eq!(result, "vscode:vscode:/home/vscode:/home/vscode");
+    }
+
+    #[test]
+    fn test_build_ssh_environment_file_content_filters_invalid_names() {
+        let input = vec![
+            ("VALID_NAME".to_string(), "ok".to_string()),
+            ("1INVALID".to_string(), "bad".to_string()),
+            ("ALSO-INVALID".to_string(), "bad".to_string()),
+        ];
+
+        let content = ContainerOrchestrator::build_ssh_environment_file_content(&input);
+        assert_eq!(content, "VALID_NAME=ok\n");
+    }
+
+    #[test]
+    fn test_build_ssh_environment_file_content_sanitizes_newlines() {
+        let input = vec![("PATH".to_string(), "line1\nline2\r\0".to_string())];
+
+        let content = ContainerOrchestrator::build_ssh_environment_file_content(&input);
+        assert_eq!(content, "PATH=line1line2\n");
     }
 }
