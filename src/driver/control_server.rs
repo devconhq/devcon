@@ -550,10 +550,12 @@ fn send_relay_stop(
     error_msg: impl Into<String>,
 ) {
     let message = AgentMessage {
-        message: Some(ProtoMessage::StopSocketRelay(devcon_proto::StopSocketRelay {
-            relay_id,
-            error: error_msg.into(),
-        })),
+        message: Some(ProtoMessage::StopSocketRelay(
+            devcon_proto::StopSocketRelay {
+                relay_id,
+                error: error_msg.into(),
+            },
+        )),
     };
     if let Ok(mut stream) = stream_arc.lock() {
         let _ = send_message(&mut stream, &message);
@@ -623,11 +625,13 @@ fn handle_start_socket_relay(
                 }
                 Ok(n) => {
                     let msg = AgentMessage {
-                        message: Some(ProtoMessage::SocketRelayData(devcon_proto::SocketRelayData {
-                            relay_id,
-                            payload: buf[..n].to_vec(),
-                            eof: false,
-                        })),
+                        message: Some(ProtoMessage::SocketRelayData(
+                            devcon_proto::SocketRelayData {
+                                relay_id,
+                                payload: buf[..n].to_vec(),
+                                eof: false,
+                            },
+                        )),
                     };
                     let mut stream = match stream_arc.lock() {
                         Ok(stream) => stream,
@@ -785,9 +789,7 @@ fn handle_agent_connection(mut stream: TcpStream, manager: PortForwardManager) -
                 Some(ProtoMessage::StartSocketRelay(req)) => {
                     info!(
                         "Starting socket relay id={} socket={} target={}",
-                        req.relay_id,
-                        req.socket_name,
-                        req.upstream_target
+                        req.relay_id, req.socket_name, req.upstream_target
                     );
                     handle_start_socket_relay(
                         req.relay_id,
@@ -939,5 +941,4 @@ mod tests {
         drop(stream_a_client);
         drop(stream_b_client);
     }
-
 }

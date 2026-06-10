@@ -16,10 +16,10 @@ use std::net::TcpStream;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
-use std::sync::atomic::AtomicU32;
-use std::sync::Mutex;
 use std::time::Duration;
 
 const DEFAULT_SSH_PORT: u16 = 22;
