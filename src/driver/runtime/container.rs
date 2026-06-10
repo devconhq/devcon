@@ -109,7 +109,7 @@ where
 
     let find_next_bindable = |start_port: u16| -> Option<u16> {
         let mut candidate = start_port.max(AUTO_HOST_PORT_MIN);
-        while candidate <= u16::MAX {
+        loop {
             if !used_host_ports.contains(&candidate) && probe_bindable(candidate) {
                 return Some(candidate);
             }

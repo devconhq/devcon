@@ -58,7 +58,7 @@ fn extract_feature_done_marker(line: &str) -> Option<String> {
     let token = token
         .trim()
         .trim_matches(|c| matches!(c, '"' | '\'' | '`'))
-        .trim_end_matches(|c| matches!(c, '"' | '\'' | '`' | ',' | ';' | ')' | ']' | '}'));
+        .trim_end_matches(['"', '\'', '`', ',', ';', ')', ']', '}']);
     if token.is_empty() {
         return None;
     }
@@ -68,7 +68,7 @@ fn extract_feature_done_marker(line: &str) -> Option<String> {
         .next()
         .unwrap_or_default()
         .trim_matches(|c| matches!(c, '"' | '\'' | '`'))
-        .trim_end_matches(|c| matches!(c, '"' | '\'' | '`' | ',' | ';' | ')' | ']' | '}'));
+        .trim_end_matches(['"', '\'', '`', ',', ';', ')', ']', '}']);
 
     if normalized.is_empty() {
         None
