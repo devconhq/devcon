@@ -371,6 +371,15 @@ pub fn handle_ssh_command(
             ))
         })?;
 
+    if let Err(err) = driver
+        .refresh_ssh_session_environment_for_connection(&devcontainer_workspace, &container_id)
+    {
+        warn!(
+            "Failed to refresh in-container SSH session environment before connect: {}",
+            err
+        );
+    }
+
     if proxy_mode {
         let status = Command::new("nc")
             .arg("127.0.0.1")

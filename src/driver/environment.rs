@@ -183,6 +183,50 @@ pub(crate) fn compose_start_environment(
         .collect()
 }
 
+/// Composes environment variables for SSH sessions.
+///
+/// Starts with the same merge order as container startup (`compose_start_environment`), then
+/// applies `remoteEnv` overrides. `remoteEnv` entries with `None` remove a key from the final
+/// forwarded set.
+pub(crate) fn compose_ssh_environment(
+    processed_features: &[FeatureProcessResult],
+    devcontainer_container_env: Option<&HashMap<String, String>>,
+    devcontainer_remote_env: Option<&HashMap<String, Option<String>>>,
+    env_variables: &[String],
+    base_container_env: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let host_env: HashMap<String, String> = std::env::vars().collect();
+
+    let mut merged_env = compose_start_environment(
+        processed_features,
+        devcontainer_container_env,
+        env_variables,
+        base_container_env,
+    )
+    .into_iter()
+    .filter_map(|entry| {
+        let (key, value) = entry.split_once('=')?;
+        Some((key.to_string(), value.to_string()))
+    })
+    .collect::<HashMap<_, _>>();
+
+    if let Some(remote_env) = devcontainer_remote_env {
+        for (key, value) in remote_env {
+            match value {
+                Some(raw_value) => {
+                    let resolved = resolve_container_env_value(raw_value, &merged_env, &host_env);
+                    merged_env.insert(key.clone(), resolved);
+                }
+                None => {
+                    merged_env.remove(key);
+                }
+            }
+        }
+    }
+
+    merged_env
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,6 +366,62 @@ mod tests {
         assert_eq!(
             map.get("FEATURE_B_ONLY").map(String::as_str),
             Some("only_b")
+        );
+    }
+
+    #[test]
+    fn test_compose_ssh_environment_applies_remote_env_last() {
+        let mut feature_a = create_test_feature_result("featureA");
+        let mut feature_env = HashMap::new();
+        feature_env.insert("MY_VAR".to_string(), "from_feature".to_string());
+        feature_a.feature.container_env = Some(feature_env);
+
+        let mut container_env = HashMap::new();
+        container_env.insert("MY_VAR".to_string(), "from_container".to_string());
+        container_env.insert("KEEP_ME".to_string(), "yes".to_string());
+
+        let mut remote_env = HashMap::new();
+        remote_env.insert("MY_VAR".to_string(), Some("from_remote".to_string()));
+        remote_env.insert("REMOVE_ME".to_string(), None);
+
+        let base_env = HashMap::new();
+        let input_env = vec!["REMOVE_ME=bye".to_string()];
+
+        let result = compose_ssh_environment(
+            &[feature_a],
+            Some(&container_env),
+            Some(&remote_env),
+            &input_env,
+            &base_env,
+        );
+
+        assert_eq!(result.get("MY_VAR"), Some(&"from_remote".to_string()));
+        assert_eq!(result.get("KEEP_ME"), Some(&"yes".to_string()));
+        assert!(!result.contains_key("REMOVE_ME"));
+    }
+
+    #[test]
+    fn test_compose_ssh_environment_resolves_remote_env_references() {
+        let mut container_env = HashMap::new();
+        container_env.insert("PATH".to_string(), "/usr/local/bin".to_string());
+
+        let mut remote_env = HashMap::new();
+        remote_env.insert(
+            "PATH".to_string(),
+            Some("${containerEnv:PATH}:/custom/bin".to_string()),
+        );
+
+        let result = compose_ssh_environment(
+            &[],
+            Some(&container_env),
+            Some(&remote_env),
+            &[],
+            &HashMap::new(),
+        );
+
+        assert_eq!(
+            result.get("PATH"),
+            Some(&"/usr/local/bin:/custom/bin".to_string())
         );
     }
 }
