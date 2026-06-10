@@ -25,6 +25,10 @@ agents:
 agentForwarding:
   sshEnabled: true
   gpgEnabled: true
+  # Export GPG secret subkeys into the container for git commit signing.
+  # For YubiKey/smartcard keys this exports shadowed stubs only (no private key material leaves the card).
+  # For file-based keys the actual subkey material is copied. Silently skipped if no subkeys exist.
+  # gpgExportSecretSubkeys: true
   ghEnabled: true
 
 runtimeConfig:

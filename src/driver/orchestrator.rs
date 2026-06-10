@@ -268,7 +268,8 @@ impl ContainerOrchestrator {
             });
 
         self.ensure_ssh_session_environment_file(handle.as_ref(), &users, &ssh_session_env)?;
-        self.ensure_ssh_session_rc_loader_file(handle.as_ref(), &users)
+        self.ensure_ssh_session_profile_loader_files(handle.as_ref(), &users)?;
+        self.refresh_gpg_public_keys_for_connection(handle.as_ref())
     }
 
     /// Resolves environment variables that should be forwarded into SSH sessions.
@@ -1157,6 +1158,39 @@ impl ContainerOrchestrator {
                             keyring_file.display()
                         )));
 
+                        // Export secret subkeys if configured (for commit signing).
+                        // For YubiKey/smartcard-backed keys this produces shadowed stubs only.
+                        // gpg exits 0 with empty stdout when no subkeys exist — skip silently.
+                        if agent_fwd.gpg_export_secret_subkeys.unwrap_or(false) {
+                            let subkeys_file = temp_dir.path().join("gpg-secret-subkeys.asc");
+                            match std::process::Command::new("gpg")
+                                .args(["--export-secret-subkeys", "--armor"])
+                                .output()
+                            {
+                                Err(e) => warn!("Failed to run gpg --export-secret-subkeys: {}", e),
+                                Ok(out) if !out.status.success() => {
+                                    warn!(
+                                        "gpg --export-secret-subkeys failed: {}",
+                                        String::from_utf8_lossy(&out.stderr)
+                                    );
+                                }
+                                Ok(out) if out.stdout.is_empty() => {
+                                    warn!("No GPG secret subkeys found on host; skipping secret subkey mount");
+                                }
+                                Ok(out) => {
+                                    if let Err(e) = fs::write(&subkeys_file, out.stdout) {
+                                        warn!("Failed to write GPG secret subkeys file: {}", e);
+                                    } else {
+                                        debug!("GPG secret subkeys exported to: {:?}", subkeys_file);
+                                        all_mounts.push(crate::devcontainer::Mount::String(format!(
+                                            "{}:/tmp/gpg-secret-subkeys.asc",
+                                            subkeys_file.display()
+                                        )));
+                                    }
+                                }
+                            }
+                        }
+
                         // Keep track of the temp directory to prevent cleanup
                         gpg_public_keyring_path = Some(temp_dir.keep());
                     }
@@ -1313,7 +1347,7 @@ impl ContainerOrchestrator {
                 &resolved_users,
                 &ssh_session_env,
             )?;
-            self.ensure_ssh_session_rc_loader_file(handle.as_ref(), &resolved_users)?;
+            self.ensure_ssh_session_profile_loader_files(handle.as_ref(), &resolved_users)?;
 
             let shell = self.config.default_shell.as_deref().unwrap_or("zsh");
             self.ensure_remote_user_login_shell(handle.as_ref(), &resolved_users, shell)?;
@@ -1350,6 +1384,16 @@ impl ContainerOrchestrator {
                 info!("Importing GPG public keyring into container");
                 gpg_cmd.push_str(" && gpg --import /tmp/gpg-public-keys.asc 2>&1 || true");
             }
+            // Prevent container gpg-agent from spawning and overwriting the forwarded socket symlink.
+            gpg_cmd.push_str(&format!(
+                " && (grep -qF no-autostart {home}/.gnupg/gpg.conf 2>/dev/null || printf 'no-autostart\\n' >> {home}/.gnupg/gpg.conf)",
+                home = &resolved_users.remote_user_home
+            ));
+            // Enable loopback pinentry for headless GPG operations in SSH sessions.
+            gpg_cmd.push_str(&format!(
+                " && (grep -qF allow-loopback-pinentry {home}/.gnupg/gpg-agent.conf 2>/dev/null || printf 'allow-loopback-pinentry\\n' >> {home}/.gnupg/gpg-agent.conf)",
+                home = &resolved_users.remote_user_home
+            ));
             let guarded = guard_with_marker(&gpg_cmd, "gpgAgentSetup");
             self.runtime.exec(
                 handle.as_ref(),
@@ -1571,28 +1615,60 @@ impl ContainerOrchestrator {
             .exec(handle, vec!["sh", "-lc", &command], &[], false, false)
     }
 
-    fn ensure_ssh_session_rc_loader_file(
+    fn ensure_ssh_session_profile_loader_files(
         &self,
         handle: &dyn crate::driver::runtime::ContainerHandle,
         users: &ResolvedUsers,
     ) -> Result<()> {
         let home = shell_single_quote(&users.remote_user_home);
-        let rc_path = shell_single_quote(&format!("{}/.ssh/rc", users.remote_user_home));
-        let loader_script = shell_single_quote(
-            "#!/bin/sh\nset -a\n[ -f \"$HOME/.ssh/environment\" ] && . \"$HOME/.ssh/environment\"\nset +a\nexport GPG_TTY=$(tty)\n",
+        let profile_path = shell_single_quote(&format!("{}/.profile", users.remote_user_home));
+        let zprofile_path = shell_single_quote(&format!("{}/.zprofile", users.remote_user_home));
+        let snippet_start = "# >>> devcon ssh session env >>>";
+        let snippet_end = "# <<< devcon ssh session env <<<";
+        let snippet = shell_single_quote(
+            "# >>> devcon ssh session env >>>\nif [ -n \"$SSH_CONNECTION\" ]; then\n    set -a\n    [ -f \"$HOME/.ssh/environment\" ] && . \"$HOME/.ssh/environment\"\n    set +a\n    if tty >/dev/null 2>&1; then\n        export GPG_TTY=$(tty)\n    fi\nfi\n# <<< devcon ssh session env <<<\n",
         );
 
         let command = format!(
             "set -e; \
             mkdir -p '{home}/.ssh'; \
-            printf '%s' '{loader_script}' > '{rc_path}'; \
-            chmod 700 '{rc_path}'; \
-            chown {user}:{user} '{rc_path}' 2>/dev/null || chown {user} '{rc_path}';",
+            for target in '{profile_path}' '{zprofile_path}'; do \
+                if [ -f \"$target\" ] && grep -Fq '{snippet_start}' \"$target\"; then \
+                    tmp=\"$target.devcon.tmp\"; \
+                    awk '\n                        BEGIN {{ skip = 0 }}\n                        $0 == \"{snippet_start}\" {{ skip = 1; next }}\n                        $0 == \"{snippet_end}\" {{ skip = 0; next }}\n                        skip == 0 {{ print }}\n                    ' \"$target\" > \"$tmp\" && mv \"$tmp\" \"$target\"; \
+                fi; \
+                if [ -f \"$target\" ] && [ -s \"$target\" ] && [ \"$(tail -c 1 \"$target\" 2>/dev/null || true)\" != \"\" ]; then \
+                    printf '\\n' >> \"$target\"; \
+                fi; \
+                printf '%s' '{snippet}' >> \"$target\"; \
+                chown {user}:{user} \"$target\" 2>/dev/null || chown {user} \"$target\"; \
+            done",
             user = shell_single_quote(&users.remote_user)
         );
 
         self.runtime
             .exec(handle, vec!["sh", "-lc", &command], &[], false, false)
+    }
+
+    fn refresh_gpg_public_keys_for_connection(
+        &self,
+        handle: &dyn crate::driver::runtime::ContainerHandle,
+    ) -> Result<()> {
+        let Some(agent_fwd) = self.config.agent_forwarding.as_ref() else {
+            return Ok(());
+        };
+
+        if !agent_fwd.gpg_enabled.unwrap_or(false) {
+            return Ok(());
+        }
+
+        let command = "\
+            if [ -r /tmp/gpg-public-keys.asc ]; then gpg --import /tmp/gpg-public-keys.asc >/dev/null 2>&1 || true; fi; \
+            if [ -r /tmp/gpg-secret-subkeys.asc ]; then gpg --import /tmp/gpg-secret-subkeys.asc >/dev/null 2>&1 || true; fi; \
+            gpg --list-keys --with-colons 2>/dev/null | awk -F: '/^fpr/{print $10\"\\:6\\:\"}' | gpg --import-ownertrust >/dev/null 2>&1 || true; \
+            gpgconf --reload gpg-agent >/dev/null 2>&1 || true";
+        self.runtime
+            .exec(handle, vec!["sh", "-lc", command], &[], false, false)
     }
 
     fn build_ssh_environment_file_content(ssh_env: &[(String, String)]) -> String {
