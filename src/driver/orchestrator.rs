@@ -1216,9 +1216,6 @@ impl ContainerOrchestrator {
         if let Some(ref ssh_sock_path) = ssh_socket_in_container {
             processed_env_vars.push(format!("SSH_AUTH_SOCK={}", ssh_sock_path));
         }
-        if gpg_agent_available {
-            processed_env_vars.push("GPG_TTY=$(tty)".to_string());
-        }
         if socket_relay_enabled && (ssh_agent_available || gpg_agent_available) {
             processed_env_vars.push("DEVCON_AGENT_SOCKET_RELAY=true".to_string());
             if let Some(target) = ssh_upstream_target.as_deref() {
@@ -1582,17 +1579,15 @@ impl ContainerOrchestrator {
         let home = shell_single_quote(&users.remote_user_home);
         let rc_path = shell_single_quote(&format!("{}/.ssh/rc", users.remote_user_home));
         let loader_script = shell_single_quote(
-            "#!/bin/sh\nset -a\n[ -f \"$HOME/.ssh/environment\" ] && . \"$HOME/.ssh/environment\"\nset +a\n",
+            "#!/bin/sh\nset -a\n[ -f \"$HOME/.ssh/environment\" ] && . \"$HOME/.ssh/environment\"\nset +a\nexport GPG_TTY=$(tty)\n",
         );
 
         let command = format!(
             "set -e; \
             mkdir -p '{home}/.ssh'; \
-            if [ ! -f '{rc_path}' ]; then \
-                printf '%s' '{loader_script}' > '{rc_path}'; \
-                chmod 700 '{rc_path}'; \
-                chown {user}:{user} '{rc_path}' 2>/dev/null || chown {user} '{rc_path}'; \
-            fi",
+            printf '%s' '{loader_script}' > '{rc_path}'; \
+            chmod 700 '{rc_path}'; \
+            chown {user}:{user} '{rc_path}' 2>/dev/null || chown {user} '{rc_path}';",
             user = shell_single_quote(&users.remote_user)
         );
 
@@ -1694,6 +1689,18 @@ impl ContainerOrchestrator {
     ) -> Result<Vec<(String, String)>> {
         let mut entries = self.resolve_ssh_session_environment(workspace)?;
 
+        if self.resolve_forwarded_ssh_socket_target().is_some() {
+            entries.push((
+                "SSH_AUTH_SOCK".to_string(),
+                "/tmp/devcon-ssh-agent".to_string(),
+            ));
+            // Keep backwards compatibility for tooling expecting SSH_AUTH_SOCKET.
+            entries.push((
+                "SSH_AUTH_SOCKET".to_string(),
+                "/tmp/devcon-ssh-agent".to_string(),
+            ));
+        }
+
         if let Some(relay_entries) = self.build_socket_relay_environment_entries() {
             entries.extend(relay_entries);
         }
@@ -1704,34 +1711,14 @@ impl ContainerOrchestrator {
     }
 
     fn build_socket_relay_environment_entries(&self) -> Option<Vec<(String, String)>> {
-        let agent_fwd = self.config.agent_forwarding.as_ref()?;
+        self.config.agent_forwarding.as_ref()?;
         if !Self::should_enable_socket_relay() {
             return None;
         }
 
-        let ssh_target = if agent_fwd.ssh_enabled.unwrap_or(false) {
-            if let Some(ref override_path) = agent_fwd.ssh_socket_path {
-                let path = PathBuf::from(override_path);
-                path.exists().then_some(path)
-            } else {
-                detect_ssh_socket()
-            }
-            .map(|path| path.to_string_lossy().to_string())
-        } else {
-            None
-        };
+        let ssh_target = self.resolve_forwarded_ssh_socket_target();
 
-        let gpg_target = if agent_fwd.gpg_enabled.unwrap_or(false) {
-            if let Some(ref override_path) = agent_fwd.gpg_socket_path {
-                let path = PathBuf::from(override_path);
-                path.exists().then_some(path)
-            } else {
-                detect_gpg_socket()
-            }
-            .map(|path| path.to_string_lossy().to_string())
-        } else {
-            None
-        };
+        let gpg_target = self.resolve_forwarded_gpg_socket_target();
 
         if ssh_target.is_none() && gpg_target.is_none() {
             return None;
@@ -1746,6 +1733,34 @@ impl ContainerOrchestrator {
         }
 
         Some(entries)
+    }
+
+    fn resolve_forwarded_ssh_socket_target(&self) -> Option<String> {
+        let agent_fwd = self.config.agent_forwarding.as_ref()?;
+        if !agent_fwd.ssh_enabled.unwrap_or(false) {
+            return None;
+        }
+
+        if let Some(ref override_path) = agent_fwd.ssh_socket_path {
+            let path = PathBuf::from(override_path);
+            return path.exists().then_some(path.to_string_lossy().to_string());
+        }
+
+        detect_ssh_socket().map(|path| path.to_string_lossy().to_string())
+    }
+
+    fn resolve_forwarded_gpg_socket_target(&self) -> Option<String> {
+        let agent_fwd = self.config.agent_forwarding.as_ref()?;
+        if !agent_fwd.gpg_enabled.unwrap_or(false) {
+            return None;
+        }
+
+        if let Some(ref override_path) = agent_fwd.gpg_socket_path {
+            let path = PathBuf::from(override_path);
+            return path.exists().then_some(path.to_string_lossy().to_string());
+        }
+
+        detect_gpg_socket().map(|path| path.to_string_lossy().to_string())
     }
 
     /// Shells into a started container.
