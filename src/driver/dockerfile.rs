@@ -79,13 +79,13 @@ impl BuildContext {
             None => TempDir::new()?,
         };
 
-        let dir = if tracing::event_enabled!(Level::DEBUG) {
-            temp.keep()
+        let (dir, temp) = if tracing::event_enabled!(Level::DEBUG) {
+            (temp.keep(), None)
         } else {
-            temp.path().to_path_buf()
+            (temp.path().to_path_buf(), Some(temp))
         };
 
-        Ok(Self { dir, _temp: None })
+        Ok(Self { dir, _temp: temp })
     }
 
     /// Copies a feature directory into the build context and writes the
@@ -542,5 +542,31 @@ mod tests {
         assert!(content.contains("export DEFAULT="));
         assert!(content.contains("export STRING=test"));
         assert!(content.contains("export BOOL=false"));
+    }
+
+    #[test]
+    fn test_build_context_keeps_temp_dir_alive() {
+        let ctx = BuildContext::new(None).unwrap();
+        assert!(ctx.path().exists());
+
+        let dockerfile_path = ctx
+            .write_dockerfile(&DockerfileParams {
+                base_image: "mcr.microsoft.com/devcontainers/base:ubuntu",
+                remote_user: "vscode",
+                container_user: "vscode",
+                remote_user_home: "/home/vscode",
+                container_user_home: "/home/vscode",
+                workspace_name: "workspace",
+                runtime_host_address: "host.docker.internal",
+                config_hash: "abc123",
+                image_architecture: "arm64",
+                feature_install: "",
+                env_setup: "",
+                dotfiles_setup: "",
+            })
+            .unwrap();
+
+        assert!(dockerfile_path.exists());
+        assert!(ctx.path().join("Dockerfile").exists());
     }
 }
