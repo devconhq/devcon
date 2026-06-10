@@ -64,6 +64,7 @@ use std::path::PathBuf;
 use crate::error::{Error, Result};
 use dialoguer::Select;
 use dialoguer::theme::ColorfulTheme;
+use pidlock::Pidlock;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tracing::{debug, info, trace, warn};
@@ -73,10 +74,8 @@ use crate::devcontainer::{
 };
 use crate::driver::agent::{self, AgentConfig};
 use crate::driver::agent_socket::{
-    agent_socket_profile_dir, agent_socket_profile_key, detect_gh_config, detect_gpg_socket,
-    detect_public_ssh_key, detect_ssh_socket, ensure_ssh_port_forwarded,
-    is_transient_agent_mount_start_error, shell_single_quote, update_agent_socket_symlink,
-    write_agent_socket_metadata,
+    detect_gh_config, detect_gpg_socket, detect_public_ssh_key, detect_ssh_socket,
+    ensure_ssh_port_forwarded, shell_single_quote,
 };
 use crate::driver::dockerfile::{BuildContext, DockerfileParams, apply_feature_order_override};
 use crate::driver::environment::{
@@ -903,29 +902,8 @@ impl ContainerOrchestrator {
 
             if is_current {
                 info!("Restarting stopped container with latest image");
-                self.refresh_agent_socket_symlinks_for_profile();
-                match self.runtime.start_container(handle.id()) {
-                    Ok(restarted) => return Ok(restarted.id().to_string()),
-                    Err(err) => {
-                        let agent_forwarding_enabled = self
-                            .config
-                            .agent_forwarding
-                            .as_ref()
-                            .map(|cfg| {
-                                cfg.ssh_enabled.unwrap_or(false) || cfg.gpg_enabled.unwrap_or(false)
-                            })
-                            .unwrap_or(false);
-
-                        if agent_forwarding_enabled && is_transient_agent_mount_start_error(&err) {
-                            warn!(
-                                "Restart failed due to stale forwarded agent socket mount, creating a fresh container: {}",
-                                err
-                            );
-                        } else {
-                            return Err(err);
-                        }
-                    }
-                }
+                let restarted = self.runtime.start_container(handle.id())?;
+                return Ok(restarted.id().to_string());
             }
 
             debug!(
@@ -1090,24 +1068,18 @@ impl ContainerOrchestrator {
             }
         }
 
-        // Track whether agent forwarding mounts were added (for environment variables later)
-        let mut ssh_agent_mounted = false;
-        let mut ssh_via_stable_dir = false;
-        let mut gpg_agent_mounted = false;
-        let mut gpg_via_stable_dir = false;
+        // Track agent forwarding availability for relay/environment setup.
+        let mut ssh_agent_available = false;
+        let mut gpg_agent_available = false;
+        let mut ssh_socket_in_container: Option<String> = None;
+        let mut gpg_socket_in_container: Option<String> = None;
+        let mut ssh_upstream_target: Option<String> = None;
+        let mut gpg_upstream_target: Option<String> = None;
         let mut gpg_public_keyring_path: Option<PathBuf> = None;
+        let socket_relay_enabled = Self::should_enable_socket_relay();
 
-        // Add agent forwarding mounts if configured
+        // Configure agent forwarding relay targets if configured.
         if let Some(ref agent_fwd) = self.config.agent_forwarding {
-            // Resolve the profile-scoped stable agent socket directory once; shared by SSH and
-            // GPG forwarding for containers that use the same forwarding profile.
-            let profile_key = agent_socket_profile_key(agent_fwd);
-            let stable_agent_dir = agent_socket_profile_dir(&profile_key);
-            debug!(
-                "Using agent forwarding profile '{}' with stable dir {:?}",
-                profile_key, stable_agent_dir
-            );
-
             // SSH agent forwarding
             if agent_fwd.ssh_enabled.unwrap_or(false) {
                 let ssh_socket = if let Some(ref override_path) = agent_fwd.ssh_socket_path {
@@ -1127,33 +1099,9 @@ impl ContainerOrchestrator {
 
                 if let Some(socket) = ssh_socket {
                     info!("Forwarding SSH agent socket into container");
-                    if let Some(ref stable_dir) = stable_agent_dir {
-                        if update_agent_socket_symlink(stable_dir, "ssh-agent", &socket) {
-                            let _ = write_agent_socket_metadata(
-                                stable_dir,
-                                "ssh-agent",
-                                &profile_key,
-                                &socket,
-                            );
-                            ssh_agent_mounted = true;
-                            ssh_via_stable_dir = true;
-                        } else {
-                            warn!(
-                                "Stable dir symlink failed; falling back to direct SSH socket mount"
-                            );
-                            all_mounts.push(crate::devcontainer::Mount::String(format!(
-                                "{}:/ssh-agent",
-                                socket.display()
-                            )));
-                            ssh_agent_mounted = true;
-                        }
-                    } else {
-                        all_mounts.push(crate::devcontainer::Mount::String(format!(
-                            "{}:/ssh-agent",
-                            socket.display()
-                        )));
-                        ssh_agent_mounted = true;
-                    }
+                    ssh_socket_in_container = Some("/tmp/devcon-ssh-agent".to_string());
+                    ssh_upstream_target = Some(socket.to_string_lossy().to_string());
+                    ssh_agent_available = true;
                 } else {
                     info!("SSH agent forwarding enabled but no socket found");
                 }
@@ -1178,32 +1126,8 @@ impl ContainerOrchestrator {
 
                 if let Some(socket) = gpg_socket {
                     info!("Forwarding GPG agent socket into container");
-                    if let Some(ref stable_dir) = stable_agent_dir {
-                        if update_agent_socket_symlink(stable_dir, "S.gpg-agent", &socket) {
-                            let _ = write_agent_socket_metadata(
-                                stable_dir,
-                                "S.gpg-agent",
-                                &profile_key,
-                                &socket,
-                            );
-                            gpg_via_stable_dir = true;
-                        } else {
-                            warn!(
-                                "Stable dir symlink failed; falling back to direct GPG socket mount"
-                            );
-                            all_mounts.push(crate::devcontainer::Mount::String(format!(
-                                "{}:{}/.gnupg/S.gpg-agent",
-                                socket.display(),
-                                &resolved_users.remote_user_home
-                            )));
-                        }
-                    } else {
-                        all_mounts.push(crate::devcontainer::Mount::String(format!(
-                            "{}:{}/.gnupg/S.gpg-agent",
-                            socket.display(),
-                            &resolved_users.remote_user_home
-                        )));
-                    }
+                    gpg_socket_in_container = Some("/tmp/devcon-S.gpg-agent".to_string());
+                    gpg_upstream_target = Some(socket.to_string_lossy().to_string());
 
                     // Export public keyring
                     let temp_dir = TempDir::new()?;
@@ -1236,7 +1160,7 @@ impl ContainerOrchestrator {
                         gpg_public_keyring_path = Some(temp_dir.keep());
                     }
 
-                    gpg_agent_mounted = true;
+                    gpg_agent_available = true;
                 } else {
                     info!("GPG agent forwarding enabled but no socket found");
                 }
@@ -1270,16 +1194,6 @@ impl ContainerOrchestrator {
                     info!("GitHub CLI forwarding enabled but no configuration found");
                 }
             }
-            // Mount the stable agent socket directory once for SSH and/or GPG forwarding.
-            if (ssh_via_stable_dir || gpg_via_stable_dir)
-                && let Some(ref stable_dir) = stable_agent_dir
-            {
-                all_mounts.push(crate::devcontainer::Mount::String(format!(
-                    "{}:/run/devcon-agents",
-                    stable_dir.display()
-                )));
-                debug!("Mounted stable agent socket directory at /run/devcon-agents");
-            }
         }
 
         // Check if container needs to run in privileged mode
@@ -1298,15 +1212,25 @@ impl ContainerOrchestrator {
         );
 
         // Add environment variables for agent forwarding
-        if ssh_agent_mounted {
-            if ssh_via_stable_dir {
-                processed_env_vars.push("SSH_AUTH_SOCK=/run/devcon-agents/ssh-agent".to_string());
-            } else {
-                processed_env_vars.push("SSH_AUTH_SOCK=/ssh-agent".to_string());
-            }
+        if let Some(ref ssh_sock_path) = ssh_socket_in_container {
+            processed_env_vars.push(format!("SSH_AUTH_SOCK={}", ssh_sock_path));
         }
-        if gpg_agent_mounted {
+        if gpg_agent_available {
             processed_env_vars.push("GPG_TTY=$(tty)".to_string());
+        }
+        if socket_relay_enabled && (ssh_agent_available || gpg_agent_available) {
+            processed_env_vars.push("DEVCON_AGENT_SOCKET_RELAY=true".to_string());
+            if let Some(target) = ssh_upstream_target.as_deref() {
+                processed_env_vars.push(format!("DEVCON_AGENT_SOCKET_RELAY_SSH_TARGET={}", target));
+            }
+            if let Some(target) = gpg_upstream_target.as_deref() {
+                processed_env_vars.push(format!("DEVCON_AGENT_SOCKET_RELAY_GPG_TARGET={}", target));
+            }
+            debug!("Agent socket relay mode enabled");
+        } else if ssh_agent_available || gpg_agent_available {
+            warn!(
+                "Agent forwarding requested but devcon serve is not active; socket forwarding is disabled"
+            );
         }
 
         // Handle port forward requests
@@ -1406,17 +1330,17 @@ impl ContainerOrchestrator {
         }
 
         // Fix file permissions on gpg agent socket
-        if gpg_agent_mounted {
+        if gpg_agent_available {
             debug!("Setting permissions on GPG agent socket inside container");
             let mut gpg_cmd = format!(
                 "sudo chmod -R 0700 {home}/.gnupg && sudo chown -R $(id -u):$(id -g) {home}/.gnupg",
                 home = &resolved_users.remote_user_home
             );
-            if gpg_via_stable_dir {
-                // Create the in-container symlink from ~/.gnupg/S.gpg-agent to the stable dir.
-                // This runs once (guarded); the host symlink is refreshed on every start.
+            if let Some(ref gpg_sock_path) = gpg_socket_in_container {
+                // Always wire the user-visible GPG agent socket path to the mounted forwarding socket.
                 gpg_cmd.push_str(&format!(
-                    " && ln -sf /run/devcon-agents/S.gpg-agent {home}/.gnupg/S.gpg-agent",
+                    " && ln -sf {sock} {home}/.gnupg/S.gpg-agent",
+                    sock = gpg_sock_path,
                     home = &resolved_users.remote_user_home
                 ));
             }
@@ -1435,15 +1359,13 @@ impl ContainerOrchestrator {
         }
 
         // Fix file permissions on ssh agent socket
-        if ssh_agent_mounted {
+        if ssh_agent_available {
             debug!("Setting permissions on SSH agent socket inside container");
-            let ssh_sock_in_container = if ssh_via_stable_dir {
-                "/run/devcon-agents/ssh-agent"
-            } else {
-                "/ssh-agent"
-            };
+            let ssh_sock_in_container = ssh_socket_in_container
+                .as_deref()
+                .unwrap_or("/tmp/devcon-ssh-agent");
             let cmd = format!(
-                "sudo chmod 600 {p} && sudo chown $(id -u):$(id -g) {p}",
+                "if [ -S {p} ]; then sudo chmod 600 {p} && sudo chown $(id -u):$(id -g) {p}; fi",
                 p = ssh_sock_in_container
             );
             let guarded = guard_with_marker(&cmd, "sshAgentSetup");
@@ -1978,87 +1900,6 @@ impl ContainerOrchestrator {
         format!("devcon.{}", devcontainer_workspace.get_sanitized_name())
     }
 
-    fn refresh_agent_socket_symlinks_for_profile(&self) {
-        let Some(agent_fwd) = self.config.agent_forwarding.as_ref() else {
-            return;
-        };
-
-        let profile_key = agent_socket_profile_key(agent_fwd);
-        let Some(stable_dir) = agent_socket_profile_dir(&profile_key) else {
-            warn!(
-                "Unable to refresh agent forwarding profile '{}' because stable dir was unavailable",
-                profile_key
-            );
-            return;
-        };
-
-        if agent_fwd.ssh_enabled.unwrap_or(false) {
-            let ssh_socket = if let Some(ref override_path) = agent_fwd.ssh_socket_path {
-                let path = PathBuf::from(override_path);
-                if path.exists() {
-                    Some(path)
-                } else {
-                    warn!(
-                        "SSH socket override path '{}' does not exist",
-                        override_path
-                    );
-                    None
-                }
-            } else {
-                detect_ssh_socket()
-            };
-
-            if let Some(socket) = ssh_socket {
-                if !update_agent_socket_symlink(&stable_dir, "ssh-agent", &socket) {
-                    warn!(
-                        "Failed refreshing SSH symlink for profile '{}' to socket {:?}",
-                        profile_key, socket
-                    );
-                } else {
-                    let _ = write_agent_socket_metadata(
-                        &stable_dir,
-                        "ssh-agent",
-                        &profile_key,
-                        &socket,
-                    );
-                }
-            }
-        }
-
-        if agent_fwd.gpg_enabled.unwrap_or(false) {
-            let gpg_socket = if let Some(ref override_path) = agent_fwd.gpg_socket_path {
-                let path = PathBuf::from(override_path);
-                if path.exists() {
-                    Some(path)
-                } else {
-                    warn!(
-                        "GPG socket override path '{}' does not exist",
-                        override_path
-                    );
-                    None
-                }
-            } else {
-                detect_gpg_socket()
-            };
-
-            if let Some(socket) = gpg_socket {
-                if !update_agent_socket_symlink(&stable_dir, "S.gpg-agent", &socket) {
-                    warn!(
-                        "Failed refreshing GPG symlink for profile '{}' to socket {:?}",
-                        profile_key, socket
-                    );
-                } else {
-                    let _ = write_agent_socket_metadata(
-                        &stable_dir,
-                        "S.gpg-agent",
-                        &profile_key,
-                        &socket,
-                    );
-                }
-            }
-        }
-    }
-
     fn get_container_label(&self, devcontainer_workspace: &Workspace) -> String {
         format!(
             "devcon.project={}",
@@ -2151,6 +1992,30 @@ impl ContainerOrchestrator {
             "aarch64" => "arm64".to_string(),
             other => other.to_string(),
         }
+    }
+
+    fn control_server_pid_path() -> PathBuf {
+        dirs::runtime_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("devcon.pid")
+    }
+
+    fn is_control_server_running() -> bool {
+        let pid_path = Self::control_server_pid_path();
+        let lock = match Pidlock::new_validated(&pid_path) {
+            Ok(lock) => lock,
+            Err(_) => return false,
+        };
+
+        lock.exists() && lock.is_active().unwrap_or(false)
+    }
+
+    fn should_enable_socket_relay_with(control_server_running: bool) -> bool {
+        control_server_running
+    }
+
+    fn should_enable_socket_relay() -> bool {
+        Self::should_enable_socket_relay_with(Self::is_control_server_running())
     }
 
     fn canonical_image_architecture(arch: &str) -> String {
@@ -2461,5 +2326,13 @@ mod tests {
 
         let content = ContainerOrchestrator::build_ssh_environment_file_content(&input);
         assert_eq!(content, "PATH=line1line2\n");
+    }
+
+    #[test]
+    fn test_should_enable_socket_relay_reflects_control_server_state() {
+        assert!(ContainerOrchestrator::should_enable_socket_relay_with(true));
+        assert!(!ContainerOrchestrator::should_enable_socket_relay_with(
+            false
+        ));
     }
 }
