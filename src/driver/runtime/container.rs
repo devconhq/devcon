@@ -322,6 +322,122 @@ fn extract_mapped_port_from_value(value: &serde_json::Value, container_port: u16
     }
 }
 
+fn parse_devcon_images_from_container_list(parsed: &serde_json::Value) -> Vec<String> {
+    let items: Vec<&serde_json::Value> = match parsed {
+        serde_json::Value::Array(arr) => arr.iter().collect(),
+        serde_json::Value::Object(_) => vec![parsed],
+        _ => Vec::new(),
+    };
+
+    items
+        .iter()
+        .filter_map(|image| {
+            trace!("Inspecting image: {}", image);
+
+            let reference = image
+                .get("reference")
+                .or_else(|| image.get("Reference"))
+                .or_else(|| image.get("name"))
+                .or_else(|| image.get("Name"))
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+
+            let last_segment = reference.rsplit('/').next().unwrap_or(reference);
+            if last_segment.starts_with("devcon-") {
+                Some(reference.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn container_inspect_entry(parsed: &serde_json::Value) -> Option<&serde_json::Value> {
+    match parsed {
+        serde_json::Value::Array(items) => items.first(),
+        serde_json::Value::Object(_) => Some(parsed),
+        _ => None,
+    }
+}
+
+fn extract_container_image_id(parsed: &serde_json::Value) -> Option<String> {
+    let entry = container_inspect_entry(parsed)?;
+
+    let id = entry
+        .get("id")
+        .or_else(|| entry.get("Id"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+
+    if id.is_some() {
+        return id;
+    }
+
+    entry
+        .get("configuration")
+        .or_else(|| entry.get("Configuration"))
+        .and_then(|value| value.get("descriptor").or_else(|| value.get("Descriptor")))
+        .and_then(|value| value.get("digest").or_else(|| value.get("Digest")))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn parse_devcon_container_entry(
+    container: &serde_json::Value,
+) -> Option<(String, String, String, String)> {
+    let state = container
+        .get("status")
+        .and_then(|value| {
+            value
+                .as_str()
+                .or_else(|| value.get("state").and_then(|state| state.as_str()))
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
+
+    let project_name = container
+        .get("configuration")
+        .and_then(|value| value.get("labels"))
+        .and_then(|value| value.get("devcon.project"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+
+    let id = container
+        .get("configuration")
+        .and_then(|value| value.get("id"))
+        .or_else(|| container.get("id"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+
+    let image_tag = container
+        .get("configuration")
+        .and_then(|value| value.get("image"))
+        .and_then(|value| {
+            value.as_str().or_else(|| {
+                value
+                    .get("reference")
+                    .and_then(|reference| reference.as_str())
+            })
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+
+    Some((
+        state.to_string(),
+        format!("devcon.{}", project_name),
+        id.to_string(),
+        image_tag.to_string(),
+    ))
+}
+
 /// `container` CLI runtime implementation.
 pub struct ContainerCliRuntime {
     config: ContainerRuntimeConfig,
@@ -463,36 +579,15 @@ impl ContainerCliRuntime {
             .filter_map(|container| {
                 trace!("Inspecting container: {}", container);
 
-                let state = container["status"].as_str().unwrap_or_default();
+                let (state, container_name, id, image_tag) =
+                    parse_devcon_container_entry(container)?;
                 if !all && state != "running" {
                     return None;
                 }
 
-                let project_name = container["configuration"]["labels"]["devcon.project"]
-                    .as_str()
-                    .unwrap_or_default();
-
-                trace!("Container project name: {}", project_name);
-                if project_name.is_empty() {
-                    return None;
-                }
-
-                let id = container["configuration"]["id"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
-
                 debug!("Found container with ID: {}", id);
 
-                let image_tag = container["configuration"]["image"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
-
-                let container_name = format!("devcon.{}", project_name);
-                let handle = ContainerCliHandle { id };
+                let handle = ContainerCliHandle { id: id.to_string() };
                 Some((
                     container_name,
                     image_tag,
@@ -862,34 +957,14 @@ impl ContainerRuntime for ContainerCliRuntime {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
 
-        let images: Vec<serde_json::Value> = serde_json::from_str(&stdout)?;
-
-        let result: Vec<String> = images
-            .iter()
-            .filter_map(|image| {
-                trace!("Inspecting image: {}", image);
-                let name = &image["reference"];
-                if name.is_null() {
-                    return None;
-                }
-
-                if name.as_str().unwrap_or_default().starts_with("devcon") {
-                    Some(name.as_str().unwrap_or_default().trim().to_string())
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        Ok(result)
+        let parsed: serde_json::Value = serde_json::from_str(&stdout)?;
+        Ok(parse_devcon_images_from_container_list(&parsed))
     }
 
     fn image_id(&self, image_tag: &str) -> Result<Option<String>> {
         let output = Command::new("container")
             .arg("image")
             .arg("inspect")
-            .arg("--format")
-            .arg("json")
             .arg(image_tag)
             .output()?;
 
@@ -900,20 +975,13 @@ impl ContainerRuntime for ContainerCliRuntime {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let image: serde_json::Value =
             serde_json::from_str(&stdout).unwrap_or(serde_json::Value::Null);
-        let id = image["digest"].as_str().unwrap_or("").trim().to_string();
-        if id.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(id))
-        }
+        Ok(extract_container_image_id(&image))
     }
 
     fn inspect_image(&self, image_tag: &str) -> Result<Option<ContainerImageInfo>> {
         let output = Command::new("container")
             .arg("image")
             .arg("inspect")
-            .arg("--format")
-            .arg("json")
             .arg(image_tag)
             .output()?;
 
@@ -922,16 +990,31 @@ impl ContainerRuntime for ContainerCliRuntime {
         }
 
         let inspect: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        let entry = match container_inspect_entry(&inspect) {
+            Some(entry) => entry,
+            None => return Ok(None),
+        };
 
-        let architecture = inspect
-            .get("architecture")
-            .or_else(|| inspect.get("Architecture"))
+        let variant_config = entry
+            .get("variants")
+            .or_else(|| entry.get("Variants"))
+            .and_then(|value| value.as_array())
+            .and_then(|variants| variants.first())
+            .and_then(|variant| variant.get("config").or_else(|| variant.get("Config")));
+
+        let architecture = variant_config
+            .and_then(|value| {
+                value
+                    .get("architecture")
+                    .or_else(|| value.get("Architecture"))
+            })
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|v| !v.is_empty())
             .map(ToString::to_string);
 
-        let config = inspect.get("config").or_else(|| inspect.get("Config"));
+        let config =
+            variant_config.and_then(|value| value.get("config").or_else(|| value.get("Config")));
 
         let labels = config
             .and_then(|v| v.get("labels").or_else(|| v.get("Labels")))
@@ -1082,5 +1165,107 @@ mod tests {
         });
 
         assert_eq!(extract_mapped_port_from_value(&value, 22), Some(49152));
+    }
+
+    #[test]
+    fn test_parse_devcon_images_from_container_list_matches_registry_prefix() {
+        let parsed = serde_json::json!([
+            {"reference": "ghcr.io/org/devcon-workspace:latest"},
+            {"reference": "mcr.microsoft.com/devcontainers/base:ubuntu"}
+        ]);
+
+        let images = parse_devcon_images_from_container_list(&parsed);
+        assert_eq!(
+            images,
+            vec!["ghcr.io/org/devcon-workspace:latest".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_parse_devcon_images_from_container_list_supports_fallback_keys() {
+        let parsed = serde_json::json!({"Name": "devcon-sample:latest"});
+
+        let images = parse_devcon_images_from_container_list(&parsed);
+        assert_eq!(images, vec!["devcon-sample:latest".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_container_image_id_prefers_top_level_id() {
+        let parsed = serde_json::json!([
+            {
+                "id": "47b2ebf94dcd70a2761c8fe11c0d4ae67b2c062e6e1325a2123740eb163b2859",
+                "configuration": {
+                    "descriptor": {
+                        "digest": "sha256:47b2ebf94dcd70a2761c8fe11c0d4ae67b2c062e6e1325a2123740eb163b2859"
+                    }
+                }
+            }
+        ]);
+
+        let id = extract_container_image_id(&parsed);
+        assert_eq!(
+            id,
+            Some("47b2ebf94dcd70a2761c8fe11c0d4ae67b2c062e6e1325a2123740eb163b2859".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_container_image_id_falls_back_to_descriptor_digest() {
+        let parsed = serde_json::json!({
+            "configuration": {
+                "descriptor": {
+                    "digest": "sha256:abc123"
+                }
+            }
+        });
+
+        let id = extract_container_image_id(&parsed);
+        assert_eq!(id, Some("sha256:abc123".to_string()));
+    }
+
+    #[test]
+    fn test_parse_devcon_container_entry_supports_status_state_and_image_reference() {
+        let parsed = serde_json::json!({
+            "configuration": {
+                "id": "8212f6e0-4f97-44a5-ba79-5c0468af80f2",
+                "labels": {
+                    "devcon.project": "terraform-provider-restapi"
+                },
+                "image": {
+                    "reference": "devcon-terraform-provider-restapi:latest"
+                }
+            },
+            "status": {
+                "state": "running"
+            }
+        });
+
+        let entry = parse_devcon_container_entry(&parsed);
+        assert_eq!(
+            entry,
+            Some((
+                "running".to_string(),
+                "devcon.terraform-provider-restapi".to_string(),
+                "8212f6e0-4f97-44a5-ba79-5c0468af80f2".to_string(),
+                "devcon-terraform-provider-restapi:latest".to_string(),
+            ))
+        );
+    }
+
+    #[test]
+    fn test_parse_devcon_container_entry_returns_none_without_project_label() {
+        let parsed = serde_json::json!({
+            "configuration": {
+                "id": "buildkit",
+                "image": {
+                    "reference": "ghcr.io/apple/container-builder-shim/builder:0.12.0"
+                }
+            },
+            "status": {
+                "state": "running"
+            }
+        });
+
+        assert_eq!(parse_devcon_container_entry(&parsed), None);
     }
 }
