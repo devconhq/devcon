@@ -1302,7 +1302,7 @@ impl ContainerOrchestrator {
             self.ensure_ssh_authorized_key(handle.as_ref(), &resolved_users)?;
 
             let ssh_session_env = self
-                .resolve_ssh_session_environment(&devcontainer_workspace)
+                .build_ssh_session_environment_entries(&devcontainer_workspace)
                 .unwrap_or_else(|err| {
                     warn!(
                         "Failed to resolve SSH session environment for in-container SSH setup: {}",
@@ -1315,6 +1315,11 @@ impl ContainerOrchestrator {
                 &resolved_users,
                 &ssh_session_env,
             )?;
+
+            let shell = self.config.default_shell.as_deref().unwrap_or("zsh");
+            self.ensure_remote_user_login_shell(handle.as_ref(), &resolved_users, shell)?;
+
+            self.ensure_remote_user_login_shell(handle.as_ref(), &resolved_users, shell)?;
         }
 
         if let Some(command) = &devcontainer_workspace.devcontainer.on_create_command {
@@ -1548,7 +1553,9 @@ impl ContainerOrchestrator {
                 "set -e; \
                 mkdir -p '{home}/.ssh'; \
                 chmod 700 '{home}/.ssh'; \
-                rm -f '{env_path}'"
+                chown -R {} '{home}/.ssh' 2>/dev/null || true; \
+                rm -f '{env_path}'",
+                shell_single_quote(&users.remote_user)
             )
         } else {
             let quoted_content = shell_single_quote(&env_content);
@@ -1557,7 +1564,9 @@ impl ContainerOrchestrator {
                 mkdir -p '{home}/.ssh'; \
                 chmod 700 '{home}/.ssh'; \
                 printf '%s' '{quoted_content}' > '{env_path}'; \
-                chmod 600 '{env_path}'"
+                chmod 600 '{env_path}'; \
+                chown -R {} '{home}/.ssh' 2>/dev/null || true",
+                shell_single_quote(&users.remote_user)
             )
         };
 
@@ -1603,6 +1612,114 @@ impl ContainerOrchestrator {
             .chars()
             .filter(|c| !matches!(c, '\n' | '\r' | '\0'))
             .collect()
+    }
+
+    fn ensure_remote_user_login_shell(
+        &self,
+        handle: &dyn crate::driver::runtime::ContainerHandle,
+        users: &ResolvedUsers,
+        shell: &str,
+    ) -> Result<()> {
+        if users.remote_user == "root" {
+            return Ok(());
+        }
+
+        let quoted_user = shell_single_quote(&users.remote_user);
+        let quoted_shell = shell_single_quote(shell);
+        let command = format!(
+            "shell_path=$(command -v {shell} || true); \
+            if [ -z \"$shell_path\" ]; then \
+                echo 'Warning: requested shell {shell} is not installed; keeping existing login shell' >&2; \
+                exit 0; \
+            fi; \
+            if command -v usermod >/dev/null 2>&1; then \
+                if [ \"$(id -u)\" = \"0\" ]; then \
+                    usermod -s \"$shell_path\" {user} || true; \
+                elif command -v sudo >/dev/null 2>&1; then \
+                    sudo -n usermod -s \"$shell_path\" {user} || true; \
+                else \
+                    echo 'Warning: cannot change login shell (need root or passwordless sudo)' >&2; \
+                fi; \
+            elif command -v chsh >/dev/null 2>&1; then \
+                chsh -s \"$shell_path\" {user} || true; \
+            else \
+                echo 'Warning: neither usermod nor chsh is available; keeping existing login shell' >&2; \
+            fi",
+            shell = quoted_shell,
+            user = quoted_user,
+        );
+
+        if let Err(err) = self
+            .runtime
+            .exec(handle, vec!["sh", "-lc", &command], &[], false, false)
+        {
+            warn!(
+                "Failed to normalize login shell for user '{}': {}",
+                users.remote_user, err
+            );
+        }
+
+        Ok(())
+    }
+
+    fn build_ssh_session_environment_entries(
+        &self,
+        workspace: &Workspace,
+    ) -> Result<Vec<(String, String)>> {
+        let mut entries = self.resolve_ssh_session_environment(workspace)?;
+
+        if let Some(relay_entries) = self.build_socket_relay_environment_entries() {
+            entries.extend(relay_entries);
+        }
+
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries.dedup_by(|a, b| a.0 == b.0);
+        Ok(entries)
+    }
+
+    fn build_socket_relay_environment_entries(&self) -> Option<Vec<(String, String)>> {
+        let agent_fwd = self.config.agent_forwarding.as_ref()?;
+        if !Self::should_enable_socket_relay() {
+            return None;
+        }
+
+        let ssh_target = if agent_fwd.ssh_enabled.unwrap_or(false) {
+            if let Some(ref override_path) = agent_fwd.ssh_socket_path {
+                let path = PathBuf::from(override_path);
+                path.exists().then_some(path)
+            } else {
+                detect_ssh_socket()
+            }
+            .map(|path| path.to_string_lossy().to_string())
+        } else {
+            None
+        };
+
+        let gpg_target = if agent_fwd.gpg_enabled.unwrap_or(false) {
+            if let Some(ref override_path) = agent_fwd.gpg_socket_path {
+                let path = PathBuf::from(override_path);
+                path.exists().then_some(path)
+            } else {
+                detect_gpg_socket()
+            }
+            .map(|path| path.to_string_lossy().to_string())
+        } else {
+            None
+        };
+
+        if ssh_target.is_none() && gpg_target.is_none() {
+            return None;
+        }
+
+        let mut entries = vec![("DEVCON_AGENT_SOCKET_RELAY".to_string(), "true".to_string())];
+        if let Some(target) = ssh_target {
+            entries.push(("DEVCON_AGENT_SOCKET_RELAY_SSH_TARGET".to_string(), target));
+        }
+        if let Some(target) = gpg_target {
+            entries.push(("DEVCON_AGENT_SOCKET_RELAY_GPG_TARGET".to_string(), target));
+        }
+
+        Some(entries)
     }
 
     /// Shells into a started container.
@@ -1722,7 +1839,8 @@ impl ContainerOrchestrator {
             let quoted_user = shell_single_quote(&remote_user);
             let quoted_shell = shell_single_quote(shell);
             let command = format!(
-                "if command -v sudo >/dev/null 2>&1; then exec sudo -iu {user} {shell}; \
+                "if [ \"$(id -un)\" = {user} ]; then exec {shell}; \
+                 elif command -v sudo >/dev/null 2>&1; then exec sudo -u {user} -H sh -lc 'exec {shell}'; \
                  elif command -v su >/dev/null 2>&1; then exec su - {user} -c {shell}; \
                  else echo 'Warning: cannot switch to remote user {name}; opening shell as current user' >&2; exec {shell}; fi",
                 user = quoted_user,
