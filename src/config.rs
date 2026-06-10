@@ -227,6 +227,16 @@ pub struct AgentForwardingConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gpg_socket_path: Option<String>,
 
+    /// Export GPG secret subkeys into the container for commit signing.
+    ///
+    /// When enabled, `gpg --export-secret-subkeys --armor` is run on the host and the
+    /// result is mounted at `/tmp/gpg-secret-subkeys.asc` inside the container.
+    /// For YubiKey/smartcard-backed keys this exports shadowed stubs only — no private
+    /// key material leaves the card. For file-based keys the actual subkey material is
+    /// exported. If no secret subkeys exist on the host the export is silently skipped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpg_export_secret_subkeys: Option<bool>,
+
     /// Override GitHub CLI configuration directory path.
     ///
     /// If not set, will auto-detect from ~/.config/gh.
