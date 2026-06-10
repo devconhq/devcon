@@ -214,7 +214,7 @@ impl ContainerOrchestrator {
     /// Resolves the remote SSH user for a workspace using devcontainer/image metadata.
     pub fn resolve_remote_user_for_workspace(&self, workspace: &Workspace) -> String {
         let latest_tag = format!("{}:latest", self.get_image_tag(workspace));
-        let probe_user_hint = workspace.devcontainer.remote_user.clone();
+        let probe_user_hint = self.resolve_probe_user_hint(workspace, &latest_tag);
         let probe_info = self
             .runtime
             .probe_image_info(&latest_tag, probe_user_hint.as_deref())
@@ -250,29 +250,7 @@ impl ContainerOrchestrator {
             })?;
 
         let latest_tag = format!("{}:latest", self.get_image_tag(workspace));
-        let probe_user_hint = workspace.devcontainer.remote_user.clone().or_else(|| {
-            self.runtime
-                .inspect_image(&latest_tag)
-                .ok()
-                .flatten()
-                .as_ref()
-                .and_then(|inspect| {
-                    let label_str = inspect
-                        .config
-                        .labels
-                        .get("devcontainer.metadata")
-                        .map(String::as_str)?;
-                    let entries: serde_json::Value = serde_json::from_str(label_str).ok()?;
-                    entries.as_array()?.iter().rev().find_map(|entry| {
-                        entry
-                            .get("remoteUser")
-                            .and_then(|u| u.as_str())
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .map(ToString::to_string)
-                    })
-                })
-        });
+        let probe_user_hint = self.resolve_probe_user_hint(workspace, &latest_tag);
         let probe_info = self
             .runtime
             .probe_image_info(&latest_tag, probe_user_hint.as_deref())
@@ -335,29 +313,7 @@ impl ContainerOrchestrator {
         };
 
         let latest_tag = format!("{}:latest", self.get_image_tag(workspace));
-        let probe_user_hint = workspace.devcontainer.remote_user.clone().or_else(|| {
-            self.runtime
-                .inspect_image(&latest_tag)
-                .ok()
-                .flatten()
-                .as_ref()
-                .and_then(|inspect| {
-                    let label_str = inspect
-                        .config
-                        .labels
-                        .get("devcontainer.metadata")
-                        .map(String::as_str)?;
-                    let entries: serde_json::Value = serde_json::from_str(label_str).ok()?;
-                    entries.as_array()?.iter().rev().find_map(|entry| {
-                        entry
-                            .get("remoteUser")
-                            .and_then(|u| u.as_str())
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .map(ToString::to_string)
-                    })
-                })
-        });
+        let probe_user_hint = self.resolve_probe_user_hint(workspace, &latest_tag);
 
         let probe_info = self
             .runtime
@@ -566,8 +522,7 @@ impl ContainerOrchestrator {
     /// Returns `true` if the latest image for the given workspace already exists in the runtime.
     pub fn image_exists(&self, devcontainer_workspace: &Workspace) -> Result<bool> {
         let latest_tag = format!("{}:latest", self.get_image_tag(devcontainer_workspace));
-        let images = self.runtime.images()?;
-        Ok(images.iter().any(|image| image == &latest_tag))
+        Ok(self.runtime.image_id(&latest_tag)?.is_some())
     }
 
     /// Builds a container image with optional pre-processed features.
@@ -979,11 +934,13 @@ impl ContainerOrchestrator {
             );
         }
 
-        debug!("Checking for existing images");
-        let images = self.runtime.images()?;
-        trace!("Images found: {:?}", images);
-        let already_built = images.iter().any(|image| image == &latest_tag);
+        debug!("Checking for existing image tag");
+        let already_built = self.runtime.image_id(&latest_tag)?.is_some();
         debug!("Image found: {}", already_built);
+        trace!(
+            "Image existence check for latest tag '{}' returned {}",
+            latest_tag, already_built
+        );
 
         if !already_built {
             return Err(Error::new(
@@ -1637,13 +1594,16 @@ impl ContainerOrchestrator {
 
         let home = shell_single_quote(&users.remote_user_home);
         let key = shell_single_quote(&public_key);
+        let remote_user = shell_single_quote(&users.remote_user);
 
         let command = format!(
             "set -e; \
             mkdir -p '{home}/.ssh'; \
+            chown '{remote_user}':'{remote_user}' '{home}/.ssh' 2>/dev/null || chown '{remote_user}' '{home}/.ssh'; \
             chmod 700 '{home}/.ssh'; \
             touch '{home}/.ssh/authorized_keys'; \
             grep -qxF '{key}' '{home}/.ssh/authorized_keys' || printf '%s\\n' '{key}' >> '{home}/.ssh/authorized_keys'; \
+            chown '{remote_user}':'{remote_user}' '{home}/.ssh/authorized_keys' 2>/dev/null || chown '{remote_user}' '{home}/.ssh/authorized_keys'; \
             chmod 600 '{home}/.ssh/authorized_keys'"
         );
 
@@ -1832,19 +1792,65 @@ impl ContainerOrchestrator {
             )?;
         }
 
-        self.runtime.exec(
-            handle,
-            vec![&self.config.default_shell.as_deref().unwrap_or("zsh")],
-            &processed_env_vars,
-            true,
-            true,
-        )?;
+        let remote_user = self.resolve_remote_user_for_workspace(&devcontainer_workspace);
+        let shell = self.config.default_shell.as_deref().unwrap_or("zsh");
+        let shell_command: Vec<String> = if remote_user == "root" {
+            vec![shell.to_string()]
+        } else {
+            let quoted_user = shell_single_quote(&remote_user);
+            let quoted_shell = shell_single_quote(shell);
+            let command = format!(
+                "if command -v sudo >/dev/null 2>&1; then exec sudo -iu {user} {shell}; \
+                 elif command -v su >/dev/null 2>&1; then exec su - {user} -c {shell}; \
+                 else echo 'Warning: cannot switch to remote user {name}; opening shell as current user' >&2; exec {shell}; fi",
+                user = quoted_user,
+                shell = quoted_shell,
+                name = remote_user,
+            );
+            vec!["sh".to_string(), "-lc".to_string(), command]
+        };
+        let shell_command_refs: Vec<&str> = shell_command.iter().map(String::as_str).collect();
+
+        self.runtime
+            .exec(handle, shell_command_refs, &processed_env_vars, true, true)?;
 
         Ok(())
     }
 
     fn get_image_tag(&self, devcontainer_workspace: &Workspace) -> String {
         format!("devcon-{}", devcontainer_workspace.get_sanitized_name())
+    }
+
+    fn resolve_probe_user_hint(&self, workspace: &Workspace, image_tag: &str) -> Option<String> {
+        workspace
+            .devcontainer
+            .remote_user
+            .clone()
+            .or_else(|| self.remote_user_from_image_metadata(image_tag))
+    }
+
+    fn remote_user_from_image_metadata(&self, image_tag: &str) -> Option<String> {
+        self.runtime
+            .inspect_image(image_tag)
+            .ok()
+            .flatten()
+            .as_ref()
+            .and_then(|inspect| {
+                let label_str = inspect
+                    .config
+                    .labels
+                    .get("devcontainer.metadata")
+                    .map(String::as_str)?;
+                let entries: serde_json::Value = serde_json::from_str(label_str).ok()?;
+                entries.as_array()?.iter().rev().find_map(|entry| {
+                    entry
+                        .get("remoteUser")
+                        .and_then(|u| u.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(ToString::to_string)
+                })
+            })
     }
 
     fn feature_display_label(feature: &FeatureProcessResult) -> String {

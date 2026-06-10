@@ -72,6 +72,42 @@ fn parse_host_port(output: &str) -> Option<u16> {
     })
 }
 
+fn parse_devcon_images_from_docker_list(stdout: &str) -> Result<Vec<String>> {
+    let mut result: Vec<String> = Vec::new();
+
+    // Docker emits one JSON object per line, not an array.
+    for line in stdout.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let image: serde_json::Value = serde_json::from_str(line)?;
+        let repository = image
+            .get("Repository")
+            .or_else(|| image.get("repository"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .unwrap_or_default();
+        let tag = image
+            .get("Tag")
+            .or_else(|| image.get("tag"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .unwrap_or_default();
+
+        if repository.is_empty() || tag.is_empty() || repository == "<none>" || tag == "<none>" {
+            continue;
+        }
+
+        let last_segment = repository.rsplit('/').next().unwrap_or(repository);
+        if last_segment.starts_with("devcon-") {
+            result.push(format!("{}:{}", repository, tag));
+        }
+    }
+
+    Ok(result)
+}
+
 /// Docker CLI runtime implementation.
 pub struct DockerRuntime {
     config: DockerRuntimeConfig,
@@ -559,23 +595,7 @@ impl ContainerRuntime for DockerRuntime {
             .output()?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut result: Vec<String> = Vec::new();
-        // Docker outputs one JSON object per line, not an array
-        for line in stdout.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-
-            let image: serde_json::Value = serde_json::from_str(line)?;
-            let repository = image["Repository"].as_str().unwrap_or_default();
-            let tag = image["Tag"].as_str().unwrap_or_default();
-            // Assuming devcon-built images have "devcon" in their repository name
-            if repository.starts_with("devcon") {
-                result.push(format!("{}:{}", repository, tag));
-            }
-        }
-
-        Ok(result)
+        parse_devcon_images_from_docker_list(&stdout)
     }
 
     fn image_id(&self, image_tag: &str) -> Result<Option<String>> {
@@ -690,5 +710,29 @@ mod tests {
     #[test]
     fn test_parse_host_port_empty() {
         assert_eq!(parse_host_port(""), None);
+    }
+
+    #[test]
+    fn test_parse_devcon_images_from_docker_list_supports_lowercase_keys() {
+        let list = r#"{"repository":"ghcr.io/org/devcon-workspace","tag":"latest"}
+{"repository":"ubuntu","tag":"latest"}
+"#;
+
+        let images = parse_devcon_images_from_docker_list(list).expect("parse docker list");
+        assert_eq!(
+            images,
+            vec!["ghcr.io/org/devcon-workspace:latest".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_parse_devcon_images_from_docker_list_skips_none_entries() {
+        let list = r#"{"Repository":"<none>","Tag":"latest"}
+{"Repository":"devcon-sample","Tag":"<none>"}
+{"Repository":"devcon-sample","Tag":"latest"}
+"#;
+
+        let images = parse_devcon_images_from_docker_list(list).expect("parse docker list");
+        assert_eq!(images, vec!["devcon-sample:latest".to_string()]);
     }
 }
