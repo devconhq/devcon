@@ -258,7 +258,7 @@ impl ContainerOrchestrator {
         let users = self.resolve_users_for_image(workspace, &latest_tag, probe_info.as_ref());
 
         let ssh_session_env = self
-            .resolve_ssh_session_environment(workspace)
+            .build_ssh_session_environment_entries(workspace)
             .unwrap_or_else(|err| {
                 warn!(
                     "Failed to resolve SSH session environment for refresh: {}",
@@ -267,7 +267,8 @@ impl ContainerOrchestrator {
                 Vec::new()
             });
 
-        self.ensure_ssh_session_environment_file(handle.as_ref(), &users, &ssh_session_env)
+        self.ensure_ssh_session_environment_file(handle.as_ref(), &users, &ssh_session_env)?;
+        self.ensure_ssh_session_rc_loader_file(handle.as_ref(), &users)
     }
 
     /// Resolves environment variables that should be forwarded into SSH sessions.
@@ -1315,10 +1316,9 @@ impl ContainerOrchestrator {
                 &resolved_users,
                 &ssh_session_env,
             )?;
+            self.ensure_ssh_session_rc_loader_file(handle.as_ref(), &resolved_users)?;
 
             let shell = self.config.default_shell.as_deref().unwrap_or("zsh");
-            self.ensure_remote_user_login_shell(handle.as_ref(), &resolved_users, shell)?;
-
             self.ensure_remote_user_login_shell(handle.as_ref(), &resolved_users, shell)?;
         }
 
@@ -1569,6 +1569,32 @@ impl ContainerOrchestrator {
                 shell_single_quote(&users.remote_user)
             )
         };
+
+        self.runtime
+            .exec(handle, vec!["sh", "-lc", &command], &[], false, false)
+    }
+
+    fn ensure_ssh_session_rc_loader_file(
+        &self,
+        handle: &dyn crate::driver::runtime::ContainerHandle,
+        users: &ResolvedUsers,
+    ) -> Result<()> {
+        let home = shell_single_quote(&users.remote_user_home);
+        let rc_path = shell_single_quote(&format!("{}/.ssh/rc", users.remote_user_home));
+        let loader_script = shell_single_quote(
+            "#!/bin/sh\nset -a\n[ -f \"$HOME/.ssh/environment\" ] && . \"$HOME/.ssh/environment\"\nset +a\n",
+        );
+
+        let command = format!(
+            "set -e; \
+            mkdir -p '{home}/.ssh'; \
+            if [ ! -f '{rc_path}' ]; then \
+                printf '%s' '{loader_script}' > '{rc_path}'; \
+                chmod 700 '{rc_path}'; \
+                chown {user}:{user} '{rc_path}' 2>/dev/null || chown {user} '{rc_path}'; \
+            fi",
+            user = shell_single_quote(&users.remote_user)
+        );
 
         self.runtime
             .exec(handle, vec!["sh", "-lc", &command], &[], false, false)
