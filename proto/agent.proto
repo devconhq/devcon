@@ -30,6 +30,26 @@ message TunnelRequest {
   uint32 data_port = 3;
 }
 
+// Message from container agent to host to open a unix socket relay session.
+message StartSocketRelay {
+  uint32 relay_id = 1;
+  string socket_name = 2;
+  string upstream_target = 3;
+}
+
+// Message carrying relay payload bytes for an active unix socket relay session.
+message SocketRelayData {
+  uint32 relay_id = 1;
+  bytes payload = 2;
+  bool eof = 3;
+}
+
+// Message indicating a relay session should be closed.
+message StopSocketRelay {
+  uint32 relay_id = 1;
+  string error = 2;
+}
+
 // Wrapper message for all agent communication
 message AgentMessage {
   oneof message {
@@ -38,5 +58,8 @@ message AgentMessage {
     OpenUrl open_url = 3;
     TunnelRequest tunnel_request = 4;
     AgentHello agent_hello = 5;
+    StartSocketRelay start_socket_relay = 6;
+    SocketRelayData socket_relay_data = 7;
+    StopSocketRelay stop_socket_relay = 8;
   }
 }

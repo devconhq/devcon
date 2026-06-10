@@ -5,19 +5,30 @@
 use clap::{Parser, Subcommand};
 use daemonize::Daemonize;
 use devcon_proto::{
-    AgentHello, AgentMessage, OpenUrl, StartPortForward, StopPortForward, agent_message,
+    AgentHello, AgentMessage, OpenUrl, SocketRelayData, StartPortForward, StartSocketRelay,
+    StopPortForward, StopSocketRelay, agent_message,
 };
 use prost::Message;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
+use std::sync::atomic::AtomicU32;
+use std::sync::Mutex;
 use std::time::Duration;
 
 const DEFAULT_SSH_PORT: u16 = 22;
+const RELAY_SSH_SOCKET_PATH: &str = "/tmp/devcon-ssh-agent";
+const RELAY_GPG_SOCKET_PATH: &str = "/tmp/devcon-S.gpg-agent";
+const RELAY_SSH_TARGET_ENV: &str = "DEVCON_AGENT_SOCKET_RELAY_SSH_TARGET";
+const RELAY_GPG_TARGET_ENV: &str = "DEVCON_AGENT_SOCKET_RELAY_GPG_TARGET";
+
+type RelayStreamMap = Arc<Mutex<std::collections::HashMap<u32, Arc<Mutex<UnixStream>>>>>;
 
 fn get_configured_ssh_port() -> u16 {
     std::env::var("DEVCON_SSH_PORT")
@@ -297,6 +308,14 @@ fn run_daemon(
     let mut stream = connect_to_control_server(host, port)?;
     eprintln!("Connected to control server");
 
+    let relay_enabled = std::env::var("DEVCON_AGENT_SOCKET_RELAY")
+        .ok()
+        .map(|value| {
+            let lowered = value.trim().to_ascii_lowercase();
+            lowered == "1" || lowered == "true" || lowered == "yes"
+        })
+        .unwrap_or(false);
+
     // Send AgentHello message to identify this container
     let workspace_name =
         std::env::var("DEVCON_WORKSPACE_NAME").unwrap_or_else(|_| "unknown".to_string());
@@ -322,9 +341,40 @@ fn run_daemon(
     stream.set_read_timeout(Some(Duration::from_millis(100)))?;
 
     let scan_failed_warning_shown = Arc::new(AtomicBool::new(false));
+    let relay_streams: RelayStreamMap = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let relay_id_counter = Arc::new(AtomicU32::new(1));
 
     // Create channel for port scanner to send messages to main thread
     let (tx, rx) = mpsc::channel::<AgentMessage>();
+
+    if relay_enabled {
+        eprintln!("Socket relay listeners enabled");
+        if let Ok(ssh_target) = std::env::var(RELAY_SSH_TARGET_ENV)
+            && !ssh_target.trim().is_empty()
+        {
+            start_socket_relay_listener(
+                "ssh-agent",
+                RELAY_SSH_SOCKET_PATH,
+                ssh_target,
+                tx.clone(),
+                relay_streams.clone(),
+                relay_id_counter.clone(),
+            )?;
+        }
+
+        if let Ok(gpg_target) = std::env::var(RELAY_GPG_TARGET_ENV)
+            && !gpg_target.trim().is_empty()
+        {
+            start_socket_relay_listener(
+                "S.gpg-agent",
+                RELAY_GPG_SOCKET_PATH,
+                gpg_target,
+                tx.clone(),
+                relay_streams.clone(),
+                relay_id_counter,
+            )?;
+        }
+    }
 
     // Spawn port scanner thread
     {
@@ -470,6 +520,12 @@ fn run_daemon(
                             }
                         });
                     }
+                    Some(agent_message::Message::SocketRelayData(data)) => {
+                        handle_incoming_socket_relay_data(data, relay_streams.clone());
+                    }
+                    Some(agent_message::Message::StopSocketRelay(stop)) => {
+                        handle_incoming_stop_socket_relay(stop, relay_streams.clone());
+                    }
                     _ => {
                         eprintln!("Received message: {:?}", message);
                     }
@@ -491,6 +547,169 @@ fn run_daemon(
     }
 
     Ok(())
+}
+
+fn start_socket_relay_listener(
+    socket_name: &'static str,
+    socket_path: &'static str,
+    upstream_target: String,
+    tx: mpsc::Sender<AgentMessage>,
+    relay_streams: RelayStreamMap,
+    relay_id_counter: Arc<AtomicU32>,
+) -> io::Result<()> {
+    if let Some(parent) = Path::new(socket_path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _ = std::fs::remove_file(socket_path);
+
+    let listener = UnixListener::bind(socket_path)?;
+    eprintln!(
+        "Listening for socket relay '{}' on {}",
+        socket_name, socket_path
+    );
+
+    std::thread::spawn(move || {
+        for incoming in listener.incoming() {
+            let stream = match incoming {
+                Ok(stream) => stream,
+                Err(e) => {
+                    eprintln!(
+                        "Failed accepting unix relay connection on {}: {}",
+                        socket_path, e
+                    );
+                    continue;
+                }
+            };
+
+            let relay_id = relay_id_counter.fetch_add(1, Ordering::SeqCst);
+            let relay_stream = Arc::new(Mutex::new(stream));
+            {
+                let mut guard = relay_streams.lock().unwrap();
+                guard.insert(relay_id, relay_stream.clone());
+            }
+
+            let start_msg = AgentMessage {
+                message: Some(agent_message::Message::StartSocketRelay(StartSocketRelay {
+                    relay_id,
+                    socket_name: socket_name.to_string(),
+                    upstream_target: upstream_target.clone(),
+                })),
+            };
+
+            if tx.send(start_msg).is_err() {
+                eprintln!("Failed sending StartSocketRelay for relay {}", relay_id);
+                let mut guard = relay_streams.lock().unwrap();
+                guard.remove(&relay_id);
+                continue;
+            }
+
+            let tx_clone = tx.clone();
+            let relay_map_clone = relay_streams.clone();
+            std::thread::spawn(move || {
+                let read_stream = {
+                    let locked = match relay_stream.lock() {
+                        Ok(stream) => stream,
+                        Err(_) => return,
+                    };
+                    match locked.try_clone() {
+                        Ok(stream) => stream,
+                        Err(_) => return,
+                    }
+                };
+
+                let mut reader = read_stream;
+                let mut buf = vec![0u8; 8192];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) => {
+                            let _ = tx_clone.send(AgentMessage {
+                                message: Some(agent_message::Message::StopSocketRelay(
+                                    StopSocketRelay {
+                                        relay_id,
+                                        error: "local unix socket closed".to_string(),
+                                    },
+                                )),
+                            });
+                            let mut guard = relay_map_clone.lock().unwrap();
+                            guard.remove(&relay_id);
+                            break;
+                        }
+                        Ok(n) => {
+                            if tx_clone
+                                .send(AgentMessage {
+                                    message: Some(agent_message::Message::SocketRelayData(
+                                        SocketRelayData {
+                                            relay_id,
+                                            payload: buf[..n].to_vec(),
+                                            eof: false,
+                                        },
+                                    )),
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx_clone.send(AgentMessage {
+                                message: Some(agent_message::Message::StopSocketRelay(
+                                    StopSocketRelay {
+                                        relay_id,
+                                        error: format!("local unix socket read error: {}", e),
+                                    },
+                                )),
+                            });
+                            let mut guard = relay_map_clone.lock().unwrap();
+                            guard.remove(&relay_id);
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    Ok(())
+}
+
+fn handle_incoming_socket_relay_data(data: SocketRelayData, relay_streams: RelayStreamMap) {
+    let relay = {
+        let guard = relay_streams.lock().unwrap();
+        guard.get(&data.relay_id).cloned()
+    };
+
+    let Some(relay) = relay else {
+        return;
+    };
+
+    if let Ok(mut stream) = relay.lock() {
+        if !data.payload.is_empty() {
+            let _ = stream.write_all(&data.payload);
+            let _ = stream.flush();
+        }
+        if data.eof {
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        }
+    }
+}
+
+fn handle_incoming_stop_socket_relay(stop: StopSocketRelay, relay_streams: RelayStreamMap) {
+    if !stop.error.is_empty() {
+        eprintln!(
+            "Host requested stop for relay {}: {}",
+            stop.relay_id, stop.error
+        );
+    }
+
+    let relay = {
+        let mut guard = relay_streams.lock().unwrap();
+        guard.remove(&stop.relay_id)
+    };
+    if let Some(relay) = relay
+        && let Ok(stream) = relay.lock()
+    {
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+    }
 }
 
 fn main() {
@@ -606,7 +825,8 @@ fn main() {
 mod tests {
     use super::*;
     use devcon_proto::{
-        AgentMessage, OpenUrl, StartPortForward, StopPortForward, TunnelRequest, agent_message,
+        AgentMessage, OpenUrl, SocketRelayData, StartPortForward, StartSocketRelay,
+        StopPortForward, StopSocketRelay, TunnelRequest, agent_message,
     };
     use std::net::{TcpListener, TcpStream};
 
@@ -697,6 +917,71 @@ mod tests {
                 assert_eq!(tr.tunnel_id, 12345);
                 assert_eq!(tr.port, 8080);
                 assert_eq!(tr.data_port, 9000);
+            }
+            _ => panic!("Wrong message type"),
+        }
+    }
+
+    #[test]
+    fn test_message_encoding_decoding_start_socket_relay() {
+        let original_msg = AgentMessage {
+            message: Some(agent_message::Message::StartSocketRelay(StartSocketRelay {
+                relay_id: 42,
+                socket_name: "ssh-agent".to_string(),
+                upstream_target: "/tmp/ssh.sock".to_string(),
+            })),
+        };
+
+        let mut buf = Vec::new();
+        original_msg.encode(&mut buf).unwrap();
+
+        let decoded_msg = AgentMessage::decode(&buf[..]).unwrap();
+        match decoded_msg.message {
+            Some(agent_message::Message::StartSocketRelay(ref msg)) => {
+                assert_eq!(msg.relay_id, 42);
+                assert_eq!(msg.socket_name, "ssh-agent");
+                assert_eq!(msg.upstream_target, "/tmp/ssh.sock");
+            }
+            _ => panic!("Wrong message type"),
+        }
+    }
+
+    #[test]
+    fn test_message_encoding_decoding_socket_relay_data_and_stop() {
+        let data_msg = AgentMessage {
+            message: Some(agent_message::Message::SocketRelayData(SocketRelayData {
+                relay_id: 9,
+                payload: vec![1, 2, 3, 4],
+                eof: false,
+            })),
+        };
+
+        let stop_msg = AgentMessage {
+            message: Some(agent_message::Message::StopSocketRelay(StopSocketRelay {
+                relay_id: 9,
+                error: "done".to_string(),
+            })),
+        };
+
+        let mut buf = Vec::new();
+        data_msg.encode(&mut buf).unwrap();
+        let decoded_data = AgentMessage::decode(&buf[..]).unwrap();
+        match decoded_data.message {
+            Some(agent_message::Message::SocketRelayData(ref msg)) => {
+                assert_eq!(msg.relay_id, 9);
+                assert_eq!(msg.payload, vec![1, 2, 3, 4]);
+                assert!(!msg.eof);
+            }
+            _ => panic!("Wrong message type"),
+        }
+
+        buf.clear();
+        stop_msg.encode(&mut buf).unwrap();
+        let decoded_stop = AgentMessage::decode(&buf[..]).unwrap();
+        match decoded_stop.message {
+            Some(agent_message::Message::StopSocketRelay(ref msg)) => {
+                assert_eq!(msg.relay_id, 9);
+                assert_eq!(msg.error, "done");
             }
             _ => panic!("Wrong message type"),
         }

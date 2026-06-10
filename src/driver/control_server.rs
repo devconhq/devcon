@@ -34,6 +34,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -122,6 +123,8 @@ type ForwardEntry = (
     u16,
     Option<ContainerInfo>,
 );
+
+type RelayMap = Arc<Mutex<HashMap<u32, Arc<Mutex<UnixStream>>>>>;
 
 /// Manages active port forwarding sessions
 #[derive(Clone)]
@@ -541,6 +544,154 @@ fn emit_port_forward_event(
     }
 }
 
+fn send_relay_stop(
+    stream_arc: &Arc<Mutex<TcpStream>>,
+    relay_id: u32,
+    error_msg: impl Into<String>,
+) {
+    let message = AgentMessage {
+        message: Some(ProtoMessage::StopSocketRelay(devcon_proto::StopSocketRelay {
+            relay_id,
+            error: error_msg.into(),
+        })),
+    };
+    if let Ok(mut stream) = stream_arc.lock() {
+        let _ = send_message(&mut stream, &message);
+    }
+}
+
+fn handle_start_socket_relay(
+    relay_id: u32,
+    socket_name: &str,
+    upstream_target: &str,
+    stream_arc: Arc<Mutex<TcpStream>>,
+    relays: RelayMap,
+) {
+    let target = upstream_target.trim().to_string();
+    if target.is_empty() {
+        let msg = format!(
+            "StartSocketRelay for '{}' missing upstream target",
+            socket_name
+        );
+        warn!("{}", msg);
+        send_relay_stop(&stream_arc, relay_id, msg);
+        return;
+    }
+
+    let unix_stream = match UnixStream::connect(&target) {
+        Ok(stream) => stream,
+        Err(e) => {
+            let msg = format!("Failed to connect relay target {}: {}", target, e);
+            warn!("{}", msg);
+            send_relay_stop(&stream_arc, relay_id, msg);
+            return;
+        }
+    };
+
+    let relay_stream = Arc::new(Mutex::new(unix_stream));
+    {
+        let mut guard = relays.lock().unwrap();
+        guard.insert(relay_id, relay_stream.clone());
+    }
+
+    let read_stream = {
+        let guard = relay_stream.lock().unwrap();
+        match guard.try_clone() {
+            Ok(stream) => stream,
+            Err(e) => {
+                let mut relays_guard = relays.lock().unwrap();
+                relays_guard.remove(&relay_id);
+                let msg = format!("Failed to clone relay stream for {}: {}", target, e);
+                warn!("{}", msg);
+                send_relay_stop(&stream_arc, relay_id, msg);
+                return;
+            }
+        }
+    };
+
+    thread::spawn(move || {
+        let mut reader = read_stream;
+        let mut buf = vec![0u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => {
+                    let mut relays_guard = relays.lock().unwrap();
+                    relays_guard.remove(&relay_id);
+                    drop(relays_guard);
+                    send_relay_stop(&stream_arc, relay_id, "relay upstream closed");
+                    break;
+                }
+                Ok(n) => {
+                    let msg = AgentMessage {
+                        message: Some(ProtoMessage::SocketRelayData(devcon_proto::SocketRelayData {
+                            relay_id,
+                            payload: buf[..n].to_vec(),
+                            eof: false,
+                        })),
+                    };
+                    let mut stream = match stream_arc.lock() {
+                        Ok(stream) => stream,
+                        Err(_) => break,
+                    };
+                    if let Err(e) = send_message(&mut stream, &msg) {
+                        warn!("Failed sending relay data for relay {}: {}", relay_id, e);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let mut relays_guard = relays.lock().unwrap();
+                    relays_guard.remove(&relay_id);
+                    drop(relays_guard);
+                    send_relay_stop(
+                        &stream_arc,
+                        relay_id,
+                        format!("relay upstream read error: {}", e),
+                    );
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn handle_socket_relay_data(relay_id: u32, payload: &[u8], eof: bool, relays: &RelayMap) {
+    let relay = {
+        let guard = relays.lock().unwrap();
+        guard.get(&relay_id).cloned()
+    };
+
+    let Some(relay) = relay else {
+        debug!("Ignoring relay data for unknown relay id {}", relay_id);
+        return;
+    };
+
+    let mut stream = match relay.lock() {
+        Ok(stream) => stream,
+        Err(_) => return,
+    };
+
+    if !payload.is_empty() {
+        let _ = stream.write_all(payload);
+        let _ = stream.flush();
+    }
+
+    if eof {
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+    }
+}
+
+fn handle_stop_socket_relay(relay_id: u32, relays: &RelayMap) {
+    let relay = {
+        let mut guard = relays.lock().unwrap();
+        guard.remove(&relay_id)
+    };
+    if let Some(relay) = relay
+        && let Ok(stream) = relay.lock()
+    {
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+    }
+}
+
 /// Handle a single agent connection
 fn handle_agent_connection(mut stream: TcpStream, manager: PortForwardManager) -> Result<()> {
     let peer_addr = stream.peer_addr()?;
@@ -555,6 +706,7 @@ fn handle_agent_connection(mut stream: TcpStream, manager: PortForwardManager) -
         workspace_name: peer_addr.port().to_string(),
     };
     let mut container_info = Some(peer_info);
+    let relay_streams: RelayMap = Arc::new(Mutex::new(HashMap::new()));
 
     loop {
         match read_message(&mut stream) {
@@ -629,6 +781,38 @@ fn handle_agent_connection(mut stream: TcpStream, manager: PortForwardManager) -
                         container_name: hello.container_name,
                         workspace_name: hello.workspace_name,
                     });
+                }
+                Some(ProtoMessage::StartSocketRelay(req)) => {
+                    info!(
+                        "Starting socket relay id={} socket={} target={}",
+                        req.relay_id,
+                        req.socket_name,
+                        req.upstream_target
+                    );
+                    handle_start_socket_relay(
+                        req.relay_id,
+                        &req.socket_name,
+                        &req.upstream_target,
+                        stream_arc.clone(),
+                        relay_streams.clone(),
+                    );
+                }
+                Some(ProtoMessage::SocketRelayData(data)) => {
+                    handle_socket_relay_data(
+                        data.relay_id,
+                        &data.payload,
+                        data.eof,
+                        &relay_streams,
+                    );
+                }
+                Some(ProtoMessage::StopSocketRelay(stop)) => {
+                    if !stop.error.is_empty() {
+                        info!(
+                            "Stopping socket relay id={} with agent message: {}",
+                            stop.relay_id, stop.error
+                        );
+                    }
+                    handle_stop_socket_relay(stop.relay_id, &relay_streams);
                 }
                 None => {
                     warn!("Received message with no content");
@@ -755,4 +939,5 @@ mod tests {
         drop(stream_a_client);
         drop(stream_b_client);
     }
+
 }
