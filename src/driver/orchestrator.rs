@@ -66,7 +66,6 @@ use dialoguer::Select;
 use dialoguer::theme::ColorfulTheme;
 use pidlock::Pidlock;
 use sha2::{Digest, Sha256};
-use tempfile::TempDir;
 use tracing::{debug, info, trace, warn};
 
 use crate::devcontainer::{
@@ -74,8 +73,9 @@ use crate::devcontainer::{
 };
 use crate::driver::agent::{self, AgentConfig};
 use crate::driver::agent_socket::{
-    detect_gh_config, detect_gpg_socket, detect_public_ssh_key, detect_ssh_socket,
-    ensure_ssh_port_forwarded, ensure_stable_ssh_agent_socket, shell_single_quote,
+    detect_gh_config, detect_gpg_homedir, detect_gpg_keyboxd_socket, detect_gpg_socket,
+    detect_public_ssh_key, detect_ssh_socket, ensure_ssh_port_forwarded,
+    ensure_stable_ssh_agent_socket, shell_single_quote,
 };
 use crate::driver::dockerfile::{BuildContext, DockerfileParams, apply_feature_order_override};
 use crate::driver::environment::{
@@ -1074,8 +1074,6 @@ impl ContainerOrchestrator {
         let mut ssh_agent_available = false;
         let mut gpg_agent_available = false;
         let mut ssh_socket_in_container: Option<String> = None;
-        let mut gpg_socket_in_container: Option<String> = None;
-        let mut gpg_public_keyring_path: Option<PathBuf> = None;
 
         // Configure agent forwarding via direct bind mounts.
         if let Some(ref agent_fwd) = self.config.agent_forwarding {
@@ -1119,8 +1117,11 @@ impl ContainerOrchestrator {
                 }
             }
 
-            // GPG agent forwarding — bind-mount the host gpg-agent socket directly.
-            // The path from gpgconf is stable across reboots, so no socat bridge needed.
+            // GPG agent forwarding.
+            // Mount the agent socket as an individual file bind-mount directly into
+            // {home}/.gnupg/S.gpg-agent so Docker Desktop's socket proxy handles it
+            // correctly (directory-mount sockets appear as '?????????' and are unusable).
+            // Mount the rest of the homedir read-only at a staging path for data copying.
             if agent_fwd.gpg_enabled.unwrap_or(false) {
                 let gpg_socket = if let Some(ref override_path) = agent_fwd.gpg_socket_path {
                     let path = PathBuf::from(override_path);
@@ -1137,88 +1138,40 @@ impl ContainerOrchestrator {
                     detect_gpg_socket()
                 };
 
-                if let Some(socket) = gpg_socket {
-                    info!("Forwarding GPG agent socket into container via bind mount");
-                    all_mounts.push(crate::devcontainer::Mount::String(format!(
-                        "{}:/tmp/devcon-S.gpg-agent",
-                        socket.display()
-                    )));
-                    gpg_socket_in_container = Some("/tmp/devcon-S.gpg-agent".to_string());
+                let gpg_homedir = detect_gpg_homedir();
 
-                    // Export public keyring
-                    let temp_dir = TempDir::new()?;
-                    let keyring_file = temp_dir.path().join("gpg-public-keys.asc");
-
-                    let export_output = std::process::Command::new("gpg")
-                        .arg("--export")
-                        .arg("--armor")
-                        .output()
-                        .map_err(|e| {
-                            Error::Generic(format!("Failed to export GPG public keys: {}", e))
-                        })?;
-
-                    if !export_output.status.success() {
-                        warn!(
-                            "Failed to export GPG public keys: {}",
-                            String::from_utf8_lossy(&export_output.stderr)
+                match (gpg_socket, gpg_homedir) {
+                    (Some(socket), Some(homedir)) => {
+                        info!(
+                            "Forwarding GPG agent: socket={:?}, homedir={:?}",
+                            socket, homedir
                         );
-                    } else {
-                        fs::write(&keyring_file, export_output.stdout)?;
-                        debug!("GPG public keyring exported to: {:?}", keyring_file);
-
-                        // Mount the exported keyring into the container
+                        // Individual socket bind-mounts → Docker Desktop's proxy handles
+                        // these correctly (unlike sockets inside a directory mount).
                         all_mounts.push(crate::devcontainer::Mount::String(format!(
-                            "{}:/tmp/gpg-public-keys.asc",
-                            keyring_file.display()
+                            "{}:{}/.gnupg/S.gpg-agent",
+                            socket.display(),
+                            &resolved_users.remote_user_home,
                         )));
-
-                        // Export secret subkeys if configured (for commit signing).
-                        // For YubiKey/smartcard-backed keys this produces shadowed stubs only.
-                        // gpg exits 0 with empty stdout when no subkeys exist — skip silently.
-                        if agent_fwd.gpg_export_secret_subkeys.unwrap_or(false) {
-                            let subkeys_file = temp_dir.path().join("gpg-secret-subkeys.asc");
-                            match std::process::Command::new("gpg")
-                                .args(["--export-secret-subkeys", "--armor"])
-                                .output()
-                            {
-                                Err(e) => warn!("Failed to run gpg --export-secret-subkeys: {}", e),
-                                Ok(out) if !out.status.success() => {
-                                    warn!(
-                                        "gpg --export-secret-subkeys failed: {}",
-                                        String::from_utf8_lossy(&out.stderr)
-                                    );
-                                }
-                                Ok(out) if out.stdout.is_empty() => {
-                                    warn!(
-                                        "No GPG secret subkeys found on host; skipping secret subkey mount"
-                                    );
-                                }
-                                Ok(out) => {
-                                    if let Err(e) = fs::write(&subkeys_file, out.stdout) {
-                                        warn!("Failed to write GPG secret subkeys file: {}", e);
-                                    } else {
-                                        debug!(
-                                            "GPG secret subkeys exported to: {:?}",
-                                            subkeys_file
-                                        );
-                                        all_mounts.push(crate::devcontainer::Mount::String(
-                                            format!(
-                                                "{}:/tmp/gpg-secret-subkeys.asc",
-                                                subkeys_file.display()
-                                            ),
-                                        ));
-                                    }
-                                }
-                            }
+                        // Also mount keyboxd socket if present — required for
+                        // `gpg --list-keys` / `gpg --list-secret-keys` on modern GnuPG.
+                        if let Some(keyboxd_socket) = detect_gpg_keyboxd_socket() {
+                            info!("Forwarding GPG keyboxd socket: {:?}", keyboxd_socket);
+                            all_mounts.push(crate::devcontainer::Mount::String(format!(
+                                "{}:{}/.gnupg/S.keyboxd",
+                                keyboxd_socket.display(),
+                                &resolved_users.remote_user_home,
+                            )));
                         }
-
-                        // Keep track of the temp directory to prevent cleanup
-                        gpg_public_keyring_path = Some(temp_dir.keep());
+                        // Homedir staged read-only for data file copying in post-start.
+                        all_mounts.push(crate::devcontainer::Mount::String(format!(
+                            "{}:/tmp/devcon-gnupg-host:ro",
+                            homedir.display(),
+                        )));
+                        gpg_agent_available = true;
                     }
-
-                    gpg_agent_available = true;
-                } else {
-                    info!("GPG agent forwarding enabled but no socket found");
+                    (None, _) => info!("GPG agent forwarding enabled but no socket found"),
+                    (_, None) => info!("GPG agent forwarding enabled but homedir not found"),
                 }
             }
 
@@ -1372,35 +1325,30 @@ impl ContainerOrchestrator {
             )?;
         }
 
-        // Fix file permissions on gpg agent socket
+        // Set up GPG inside the container: copy data files from the staged host
+        // homedir (skipping socket files), then fix permissions.
+        // S.gpg-agent and S.keyboxd are already bind-mounted directly at their
+        // natural paths inside {home}/.gnupg.
         if gpg_agent_available {
-            debug!("Setting permissions on GPG agent socket inside container");
-            let mut gpg_cmd = format!(
-                "sudo chmod -R 0700 {home}/.gnupg && sudo chown -R $(id -u):$(id -g) {home}/.gnupg",
-                home = &resolved_users.remote_user_home
+            debug!("Setting up GPG homedir inside container from staged host copy");
+            let home = &resolved_users.remote_user_home;
+            let gpg_cmd = format!(
+                r#"sudo mkdir -p {home}/.gnupg && sudo chmod 0700 {home}/.gnupg && sudo chown $(id -u):$(id -g) {home}/.gnupg
+ for src in /tmp/devcon-gnupg-host/*; do
+   name=$(basename "$src")
+   case "$name" in S.*) continue ;; esac
+   if [ -d "$src" ]; then
+     sudo cp -rp "$src" "{home}/.gnupg/$name"
+   elif [ -f "$src" ]; then
+     sudo cp -p "$src" "{home}/.gnupg/$name"
+   fi
+ done
+ sudo chown -R $(id -u):$(id -g) {home}/.gnupg
+ sudo chmod -R u=rwX,go= {home}/.gnupg
+ grep -qF no-autostart {home}/.gnupg/gpg.conf 2>/dev/null || printf 'no-autostart\n' >> {home}/.gnupg/gpg.conf
+ grep -qF allow-loopback-pinentry {home}/.gnupg/gpg-agent.conf 2>/dev/null || printf 'allow-loopback-pinentry\n' >> {home}/.gnupg/gpg-agent.conf"#,
+                home = home,
             );
-            if let Some(ref gpg_sock_path) = gpg_socket_in_container {
-                // Always wire the user-visible GPG agent socket path to the mounted forwarding socket.
-                gpg_cmd.push_str(&format!(
-                    " && ln -sf {sock} {home}/.gnupg/S.gpg-agent",
-                    sock = gpg_sock_path,
-                    home = &resolved_users.remote_user_home
-                ));
-            }
-            if gpg_public_keyring_path.is_some() {
-                info!("Importing GPG public keyring into container");
-                gpg_cmd.push_str(" && gpg --import /tmp/gpg-public-keys.asc 2>&1 || true");
-            }
-            // Prevent container gpg-agent from spawning and overwriting the forwarded socket symlink.
-            gpg_cmd.push_str(&format!(
-                " && (grep -qF no-autostart {home}/.gnupg/gpg.conf 2>/dev/null || printf 'no-autostart\\n' >> {home}/.gnupg/gpg.conf)",
-                home = &resolved_users.remote_user_home
-            ));
-            // Enable loopback pinentry for headless GPG operations in SSH sessions.
-            gpg_cmd.push_str(&format!(
-                " && (grep -qF allow-loopback-pinentry {home}/.gnupg/gpg-agent.conf 2>/dev/null || printf 'allow-loopback-pinentry\\n' >> {home}/.gnupg/gpg-agent.conf)",
-                home = &resolved_users.remote_user_home
-            ));
             let guarded = guard_with_marker(&gpg_cmd, "gpgAgentSetup");
             self.runtime.exec(
                 handle.as_ref(),
@@ -1669,11 +1617,7 @@ impl ContainerOrchestrator {
             return Ok(());
         }
 
-        let command = "\
-            if [ -r /tmp/gpg-public-keys.asc ]; then gpg --import /tmp/gpg-public-keys.asc >/dev/null 2>&1 || true; fi; \
-            if [ -r /tmp/gpg-secret-subkeys.asc ]; then gpg --import /tmp/gpg-secret-subkeys.asc >/dev/null 2>&1 || true; fi; \
-            gpg --list-keys --with-colons 2>/dev/null | awk -F: '/^fpr/{print $10\"\\:6\\:\"}' | gpg --import-ownertrust >/dev/null 2>&1 || true; \
-            gpgconf --reload gpg-agent >/dev/null 2>&1 || true";
+        let command = "gpgconf --reload gpg-agent >/dev/null 2>&1 || true";
         self.runtime
             .exec(handle, vec!["sh", "-lc", command], &[], false, false)
     }

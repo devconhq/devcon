@@ -125,6 +125,101 @@ pub(crate) fn detect_gpg_socket() -> Option<PathBuf> {
     None
 }
 
+/// Detects the GPG home directory (the key database).
+///
+/// Checks the `GNUPGHOME` environment variable first, then falls back to
+/// `gpgconf --list-dir homedir`.
+///
+/// # Returns
+///
+/// Returns `Some(PathBuf)` with the homedir path if it exists as a directory, `None` otherwise.
+pub(crate) fn detect_gpg_homedir() -> Option<PathBuf> {
+    // Respect user-overridden GNUPGHOME first.
+    if let Ok(val) = std::env::var("GNUPGHOME") {
+        let path = PathBuf::from(val.trim());
+        if path.is_dir() {
+            debug!("Using GNUPGHOME for GPG homedir: {:?}", path);
+            return Some(path);
+        }
+        debug!("GNUPGHOME set but not a directory: {:?}", path);
+    }
+
+    let output = std::process::Command::new("gpgconf")
+        .arg("--list-dir")
+        .arg("homedir")
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        debug!("gpgconf --list-dir homedir failed");
+        return None;
+    }
+
+    let homedir = String::from_utf8(output.stdout).ok()?;
+    let path = PathBuf::from(homedir.trim());
+
+    if path.is_dir() {
+        debug!("Detected GPG homedir at: {:?}", path);
+        Some(path)
+    } else {
+        debug!("GPG homedir reported by gpgconf does not exist: {:?}", path);
+        None
+    }
+}
+
+/// Detects the GPG keyboxd socket path using gpgconf.
+///
+/// Attempts to find the keyboxd socket by running `gpgconf --list-dir keyboxd-socket`.
+/// If the socket doesn't exist, attempts to launch keyboxd via `gpgconf --launch keyboxd`.
+///
+/// # Returns
+///
+/// Returns `Some(PathBuf)` if the socket exists, `None` otherwise.
+pub(crate) fn detect_gpg_keyboxd_socket() -> Option<PathBuf> {
+    let output = std::process::Command::new("gpgconf")
+        .args(["--list-dir", "keyboxd-socket"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        debug!("gpgconf --list-dir keyboxd-socket failed; keyboxd may not be in use");
+        return None;
+    }
+
+    let socket_path = String::from_utf8(output.stdout).ok()?;
+    let socket_path = socket_path.trim();
+    let path = PathBuf::from(socket_path);
+
+    if path.exists() {
+        debug!("Detected GPG keyboxd socket at: {}", socket_path);
+        return Some(path);
+    }
+
+    // Not running — attempt to launch it.
+    debug!(
+        "GPG keyboxd socket not found at {}, attempting to start keyboxd",
+        socket_path
+    );
+
+    match std::process::Command::new("gpgconf")
+        .args(["--launch", "keyboxd"])
+        .status()
+    {
+        Ok(s) if s.success() => {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if path.exists() {
+                info!("GPG keyboxd socket now available at: {}", socket_path);
+                return Some(path);
+            }
+            warn!("keyboxd launched but socket not found at {}", socket_path);
+        }
+        Ok(_) => debug!("gpgconf --launch keyboxd returned non-zero"),
+        Err(e) => debug!("Failed to launch keyboxd: {}", e),
+    }
+
+    None
+}
+
 /// Detects the GitHub CLI configuration directory path.
 ///
 /// Attempts to find the GitHub CLI config directory at `~/.config/gh`.
