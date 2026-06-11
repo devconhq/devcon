@@ -23,10 +23,6 @@ use std::sync::mpsc::{self, TryRecvError};
 use std::time::Duration;
 
 const DEFAULT_SSH_PORT: u16 = 22;
-const RELAY_SSH_SOCKET_PATH: &str = "/tmp/devcon-ssh-agent";
-const RELAY_GPG_SOCKET_PATH: &str = "/tmp/devcon-S.gpg-agent";
-const RELAY_SSH_TARGET_ENV: &str = "DEVCON_AGENT_SOCKET_RELAY_SSH_TARGET";
-const RELAY_GPG_TARGET_ENV: &str = "DEVCON_AGENT_SOCKET_RELAY_GPG_TARGET";
 
 type RelayStreamMap = Arc<Mutex<std::collections::HashMap<u32, Arc<Mutex<UnixStream>>>>>;
 
@@ -308,14 +304,6 @@ fn run_daemon(
     let mut stream = connect_to_control_server(host, port)?;
     eprintln!("Connected to control server");
 
-    let relay_enabled = std::env::var("DEVCON_AGENT_SOCKET_RELAY")
-        .ok()
-        .map(|value| {
-            let lowered = value.trim().to_ascii_lowercase();
-            lowered == "1" || lowered == "true" || lowered == "yes"
-        })
-        .unwrap_or(false);
-
     // Send AgentHello message to identify this container
     let workspace_name =
         std::env::var("DEVCON_WORKSPACE_NAME").unwrap_or_else(|_| "unknown".to_string());
@@ -342,39 +330,9 @@ fn run_daemon(
 
     let scan_failed_warning_shown = Arc::new(AtomicBool::new(false));
     let relay_streams: RelayStreamMap = Arc::new(Mutex::new(std::collections::HashMap::new()));
-    let relay_id_counter = Arc::new(AtomicU32::new(1));
 
     // Create channel for port scanner to send messages to main thread
     let (tx, rx) = mpsc::channel::<AgentMessage>();
-
-    if relay_enabled {
-        eprintln!("Socket relay listeners enabled");
-        if let Ok(ssh_target) = std::env::var(RELAY_SSH_TARGET_ENV)
-            && !ssh_target.trim().is_empty()
-        {
-            start_socket_relay_listener(
-                "ssh-agent",
-                RELAY_SSH_SOCKET_PATH,
-                ssh_target,
-                tx.clone(),
-                relay_streams.clone(),
-                relay_id_counter.clone(),
-            )?;
-        }
-
-        if let Ok(gpg_target) = std::env::var(RELAY_GPG_TARGET_ENV)
-            && !gpg_target.trim().is_empty()
-        {
-            start_socket_relay_listener(
-                "S.gpg-agent",
-                RELAY_GPG_SOCKET_PATH,
-                gpg_target,
-                tx.clone(),
-                relay_streams.clone(),
-                relay_id_counter,
-            )?;
-        }
-    }
 
     // Spawn port scanner thread
     {
@@ -549,6 +507,7 @@ fn run_daemon(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn start_socket_relay_listener(
     socket_name: &'static str,
     socket_path: &'static str,

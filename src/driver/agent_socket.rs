@@ -26,7 +26,8 @@
 //! and related utilities used during container start.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 use tracing::{debug, info, warn};
 
@@ -175,6 +176,102 @@ pub(crate) fn ensure_ssh_port_forwarded(ports: &mut Vec<ForwardPort>, ssh_port: 
 
 pub(crate) fn shell_single_quote(input: &str) -> String {
     input.replace('\'', "'\"'\"'")
+}
+
+/// Ensures a stable (persistent-path) Unix socket exists that bridges the current
+/// ephemeral `ssh_auth_sock` (e.g. macOS `com.apple.launchd.*/Listeners`).
+///
+/// The stable socket lives at `$XDG_RUNTIME_DIR/devcon/ssh-agent.sock` and can
+/// be bind-mounted into containers without the mount source changing across
+/// reboots.  A `socat` helper process performs the actual forwarding.
+///
+/// Returns `Some(stable_path)` on success.  Returns `None` (with a warning) if
+/// `socat` is not installed or the socket cannot be created.
+pub(crate) fn ensure_stable_ssh_agent_socket(ssh_auth_sock: &Path) -> Option<PathBuf> {
+    let dir = dirs::runtime_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("devcon");
+    let stable_path = dir.join("ssh-agent.sock");
+    let pid_path = dir.join("ssh-socat.pid");
+
+    // Kill any existing socat we spawned previously.
+    if let Ok(pid_str) = fs::read_to_string(&pid_path)
+        && let Ok(pid) = pid_str.trim().parse::<u32>()
+    {
+        // best-effort kill; ignore errors (process may already be gone)
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .output();
+        debug!("Sent kill to previous socat pid {}", pid);
+    }
+
+    // Remove stale socket file if present.
+    let _ = fs::remove_file(&stable_path);
+
+    if let Err(e) = fs::create_dir_all(&dir) {
+        warn!("Failed to create SSH agent socket dir {:?}: {}", dir, e);
+        return None;
+    }
+
+    // Verify socat is available.
+    let socat_check = std::process::Command::new("socat")
+        .arg("-V")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if socat_check.is_err() || !socat_check.unwrap().success() {
+        warn!(
+            "socat not found or not executable; SSH agent socket forwarding skipped. \
+             Install socat to enable SSH agent forwarding via bind mount."
+        );
+        return None;
+    }
+
+    // Spawn socat as a background process.
+    let listen_arg = format!(
+        "UNIX-LISTEN:{},fork,reuseaddr",
+        stable_path.to_string_lossy()
+    );
+    let connect_arg = format!("UNIX-CONNECT:{}", ssh_auth_sock.to_string_lossy());
+
+    let child = std::process::Command::new("socat")
+        .arg(&listen_arg)
+        .arg(&connect_arg)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+
+    match child {
+        Err(e) => {
+            warn!("Failed to spawn socat for SSH agent forwarding: {}", e);
+            return None;
+        }
+        Ok(child) => {
+            if let Err(e) = fs::write(&pid_path, child.id().to_string()) {
+                warn!("Failed to write socat PID file: {}", e);
+            }
+            debug!(
+                "Spawned socat (pid {}) for SSH agent forwarding",
+                child.id()
+            );
+        }
+    }
+
+    // Give socat a moment to create the socket.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    if stable_path.exists() {
+        info!("Stable SSH agent socket ready at {:?}", stable_path);
+        Some(stable_path)
+    } else {
+        warn!(
+            "socat started but stable SSH agent socket {:?} did not appear; \
+             SSH agent forwarding skipped",
+            stable_path
+        );
+        None
+    }
 }
 
 pub(crate) fn detect_public_ssh_key() -> Option<String> {
