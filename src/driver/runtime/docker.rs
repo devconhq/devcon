@@ -387,10 +387,6 @@ impl ContainerRuntime for DockerRuntime {
         let mut cmd = Command::new("docker");
         cmd.arg("run").arg("-d");
 
-        if runtime_parameters.platform_architecture_translation {
-            cmd.arg("--platform").arg("linux/amd64");
-        }
-
         cmd.arg("-v").arg(volume_mount).arg("--label").arg(label);
 
         // Add privileged flag if required
