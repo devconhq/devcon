@@ -455,6 +455,44 @@ macro_rules! skip_if_unavailable {
     };
 }
 
+/// Skip the current test when no SSH agent socket is available on the host.
+///
+/// ```ignore
+/// skip_if_no_ssh_agent!();
+/// ```
+#[macro_export]
+macro_rules! skip_if_no_ssh_agent {
+    () => {
+        match std::env::var("SSH_AUTH_SOCK") {
+            Ok(path) if std::path::Path::new(&path).exists() => {}
+            _ => {
+                println!("Skipping test: no SSH agent socket available (SSH_AUTH_SOCK)");
+                return;
+            }
+        }
+    };
+}
+
+/// Skip the current test when no GPG agent is available on the host.
+///
+/// ```ignore
+/// skip_if_no_gpg_agent!();
+/// ```
+#[macro_export]
+macro_rules! skip_if_no_gpg_agent {
+    () => {
+        let gpg_ok = std::process::Command::new("gpgconf")
+            .args(["--list-dir", "agent-socket"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !gpg_ok {
+            println!("Skipping test: no GPG agent available (gpgconf)");
+            return;
+        }
+    };
+}
+
 // ─── TestConfig ───────────────────────────────────────────────────────────────
 
 /// Builder for the devcon YAML config used in tests.
@@ -500,6 +538,27 @@ impl TestConfig {
     pub fn from_raw(yaml: &str) -> Self {
         Self::from_yaml(yaml)
     }
+
+    /// Config for dotfiles cloning (agents disabled for speed).
+    pub fn with_dotfiles(url: &str) -> Self {
+        Self::from_yaml(&format!(
+            "dotfilesRepository: {url}\nagents:\n  disable: true\n"
+        ))
+    }
+
+    /// Config with SSH agent forwarding enabled (requires `devcon serve` to be running).
+    pub fn with_ssh_forwarding() -> Self {
+        Self::from_yaml(
+            "agents:\n  disable: false\n  skipSshSetup: false\nagentForwarding:\n  sshEnabled: true\n",
+        )
+    }
+
+    /// Config with GPG agent forwarding enabled (requires `devcon serve` to be running).
+    pub fn with_gpg_forwarding() -> Self {
+        Self::from_yaml(
+            "agents:\n  disable: false\n  skipSshSetup: false\nagentForwarding:\n  gpgEnabled: true\n",
+        )
+    }
 }
 
 // ─── DevcontainerBuilder ──────────────────────────────────────────────────────
@@ -507,6 +566,13 @@ impl TestConfig {
 enum DevcontainerSource {
     Image(String),
     Dockerfile(String),
+}
+
+/// A feature whose source lives on the local filesystem (inside the workspace).
+struct LocalFeatureSpec {
+    dir_name: String,
+    install_sh: String,
+    opts: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Fluent builder for a temporary devcontainer workspace.
@@ -525,6 +591,8 @@ pub struct DevcontainerBuilder {
     on_create: Option<serde_json::Value>,
     post_create: Option<serde_json::Value>,
     remote_env: HashMap<String, String>,
+    container_env: HashMap<String, String>,
+    local_features: Vec<LocalFeatureSpec>,
 }
 
 impl DevcontainerBuilder {
@@ -536,6 +604,8 @@ impl DevcontainerBuilder {
             on_create: None,
             post_create: None,
             remote_env: HashMap::new(),
+            container_env: HashMap::new(),
+            local_features: Vec::new(),
         }
     }
 
@@ -592,8 +662,37 @@ impl DevcontainerBuilder {
         self
     }
 
+    /// Add a `containerEnv` variable.
+    pub fn container_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.container_env.insert(key.into(), value.into());
+        self
+    }
+
+    /// Add a local filesystem feature.
+    ///
+    /// Creates `.devcontainer/<dir_name>/devcontainer-feature.json` and
+    /// `.devcontainer/<dir_name>/install.sh` (executable) in the workspace, then
+    /// registers `"./<dir_name>"` in the features map.
+    pub fn local_feature(
+        mut self,
+        dir_name: impl Into<String>,
+        install_sh: impl Into<String>,
+        opts: &[(&str, &str)],
+    ) -> Self {
+        let opts_map: serde_json::Map<String, serde_json::Value> = opts
+            .iter()
+            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+            .collect();
+        self.local_features.push(LocalFeatureSpec {
+            dir_name: dir_name.into(),
+            install_sh: install_sh.into(),
+            opts: opts_map,
+        });
+        self
+    }
+
     /// Write the workspace to a `TempDir` and return the handle.
-    pub fn build(self) -> TempDir {
+    pub fn build(mut self) -> TempDir {
         let dir = tempfile::tempdir().expect("Failed to create temp workspace dir");
         let dc_path = dir.path().join(".devcontainer");
         std::fs::create_dir_all(&dc_path).expect("Failed to create .devcontainer dir");
@@ -611,6 +710,41 @@ impl DevcontainerBuilder {
             }
         }
 
+        // Write local feature directories and register them in the features map.
+        for lf in &self.local_features {
+            let lf_dir = dc_path.join(&lf.dir_name);
+            std::fs::create_dir_all(&lf_dir).expect("Failed to create local feature dir");
+
+            let feature_json = serde_json::json!({
+                "id": &lf.dir_name,
+                "version": "1.0.0",
+                "name": &lf.dir_name,
+                "description": "Local test feature"
+            });
+            std::fs::write(
+                lf_dir.join("devcontainer-feature.json"),
+                serde_json::to_string_pretty(&feature_json)
+                    .expect("Failed to serialise feature JSON"),
+            )
+            .expect("Failed to write devcontainer-feature.json");
+
+            let install_sh_path = lf_dir.join("install.sh");
+            std::fs::write(&install_sh_path, &lf.install_sh).expect("Failed to write install.sh");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&install_sh_path).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&install_sh_path, perms)
+                    .expect("Failed to chmod install.sh");
+            }
+
+            self.features.insert(
+                format!("./{}", lf.dir_name),
+                serde_json::Value::Object(lf.opts.clone()),
+            );
+        }
+
         if !self.features.is_empty() {
             config["features"] = serde_json::Value::Object(self.features.into_iter().collect());
         }
@@ -620,6 +754,14 @@ impl DevcontainerBuilder {
         }
         if let Some(cmd) = self.post_create {
             config["postCreateCommand"] = cmd;
+        }
+        if !self.container_env.is_empty() {
+            config["containerEnv"] = serde_json::Value::Object(
+                self.container_env
+                    .into_iter()
+                    .map(|(k, v)| (k, serde_json::Value::String(v)))
+                    .collect(),
+            );
         }
         if !self.remote_env.is_empty() {
             config["remoteEnv"] = serde_json::Value::Object(
@@ -820,6 +962,39 @@ impl DevconRun {
             "--proxy",
         ])
     }
+
+    /// Spawn `devcon serve` on an unused port in the background.
+    ///
+    /// Returns a [`ServeGuard`] (kills the process on drop) and the port it is
+    /// listening on.  Sleeps briefly after spawning to give the server time to bind.
+    pub fn serve_in_background(config: &TestConfig) -> (ServeGuard, u16) {
+        let port = openport::pick_unused_port(15001..=u16::MAX)
+            .expect("No free port available for test devcon serve");
+        let bin_path = assert_cmd::cargo::cargo_bin("devcon");
+        let child = std::process::Command::new(&bin_path)
+            .arg("--config")
+            .arg(config.path.to_str().unwrap())
+            .arg("serve")
+            .arg("--port")
+            .arg(port.to_string())
+            .spawn()
+            .expect("Failed to spawn devcon serve");
+        // Give the server time to bind before returning.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        (ServeGuard(child), port)
+    }
+}
+
+// ─── ServeGuard ───────────────────────────────────────────────────────────────
+
+/// RAII guard that kills a background `devcon serve` process when dropped.
+pub struct ServeGuard(std::process::Child);
+
+impl Drop for ServeGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 // ─── ContainerHandle ─────────────────────────────────────────────────────────
@@ -873,6 +1048,31 @@ impl ContainerHandle {
         assert_eq!(
             actual, expected,
             "Expected {var}={expected:?} but got {actual:?}"
+        );
+    }
+
+    /// Assert that an environment variable is set and non-empty inside the container.
+    #[track_caller]
+    pub fn assert_env_set(&self, var: &str) {
+        let out = self
+            .exec(&["printenv", var])
+            .unwrap_or_else(|e| panic!("{var} is not set in container {}: {e}", self.id));
+        assert!(
+            !out.trim().is_empty(),
+            "Expected env var {var} to be set and non-empty in container {}",
+            self.id
+        );
+    }
+
+    /// Assert that a file at `path` inside the container contains `needle`.
+    #[track_caller]
+    pub fn assert_file_contains(&self, path: &str, needle: &str) {
+        let out = self
+            .exec(&["cat", path])
+            .unwrap_or_else(|e| panic!("cat {path:?} failed in container {}: {e}", self.id));
+        assert!(
+            out.contains(needle),
+            "Expected file {path:?} to contain {needle:?}.\nGot: {out}"
         );
     }
 }
