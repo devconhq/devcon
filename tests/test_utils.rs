@@ -612,8 +612,7 @@ impl DevcontainerBuilder {
         }
 
         if !self.features.is_empty() {
-            config["features"] =
-                serde_json::Value::Object(self.features.into_iter().map(|(k, v)| (k, v)).collect());
+            config["features"] = serde_json::Value::Object(self.features.into_iter().collect());
         }
 
         if let Some(cmd) = self.on_create {
