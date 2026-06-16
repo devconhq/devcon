@@ -1011,10 +1011,17 @@ impl DevconRun {
     /// Spawn `devcon serve` on an unused port in the background.
     ///
     /// Returns a [`ServeGuard`] (kills the process on drop) and the port it is
-    /// listening on.  Sleeps briefly after spawning to give the server time to bind.
+    /// listening on.  Polls the port with a TCP connect loop so the caller can
+    /// be certain the server is ready — or panics with the server's stderr.
     pub fn serve_in_background(config: &TestConfig) -> (ServeGuard, u16) {
         let port = openport::pick_unused_port(15001..=u16::MAX)
             .expect("No free port available for test devcon serve");
+
+        // Each test gets its own PID file so parallel (or back-to-back serial)
+        // tests never contend on the global devcon.pid lock.
+        let pid_dir = tempfile::tempdir().expect("Failed to create temp dir for PID file");
+        let pid_file = pid_dir.path().join("serve.pid");
+
         let bin_path = assert_cmd::cargo::cargo_bin("devcon");
         let child = std::process::Command::new(&bin_path)
             .arg("--config")
@@ -1022,23 +1029,47 @@ impl DevconRun {
             .arg("serve")
             .arg("--port")
             .arg(port.to_string())
+            .arg("--pid-file")
+            .arg(&pid_file)
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("Failed to spawn devcon serve");
-        // Give the server time to bind before returning.
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        (ServeGuard(child), port)
+
+        let guard = ServeGuard {
+            child,
+            _pid_dir: pid_dir,
+        };
+
+        // Poll until the TCP port is accepting connections (up to 3 s).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("devcon serve did not bind to port {} within 3 s", port);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        (guard, port)
     }
 }
 
 // ─── ServeGuard ───────────────────────────────────────────────────────────────
 
 /// RAII guard that kills a background `devcon serve` process when dropped.
-pub struct ServeGuard(std::process::Child);
+pub struct ServeGuard {
+    child: std::process::Child,
+    /// Keeps the temp directory (and its PID file) alive for the lifetime of
+    /// the guard so the server's PID lock is not orphaned on disk.
+    _pid_dir: tempfile::TempDir,
+}
 
 impl Drop for ServeGuard {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
