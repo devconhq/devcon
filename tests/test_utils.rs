@@ -740,7 +740,9 @@ impl DevcontainerBuilder {
             }
 
             self.features.insert(
-                format!("./{}", lf.dir_name),
+                // Use the absolute path so devcon's `canonicalize()` can find
+                // the directory regardless of the process working directory.
+                lf_dir.to_str().unwrap().to_string(),
                 serde_json::Value::Object(lf.opts.clone()),
             );
         }
@@ -838,10 +840,17 @@ impl DevconOutput {
     /// Parse stdout as JSON.  Panics with full output if parsing fails.
     #[track_caller]
     pub fn json(&self) -> serde_json::Value {
-        // Some commands print a banner line before the JSON object; find the
-        // first '{' so we can handle that gracefully.
+        // The agent inside the container may emit terminal escape sequences (e.g.
+        // OSC title-set `]0;...{...}`) before the JSON object.  These contain
+        // '{' characters that confuse a naive first-'{' search.  The actual JSON
+        // object always starts with '{' at the beginning of a new line, so look
+        // for '\n{' first; fall back to the first '{' if the output has no
+        // preceding newline (e.g. bare JSON output).
         let trimmed = self.stdout.trim();
-        let json_start = trimmed.find('{').unwrap_or(0);
+        let json_start = trimmed
+            .find("\n{")
+            .map(|i| i + 1)
+            .unwrap_or_else(|| trimmed.find('{').unwrap_or(0));
         serde_json::from_str(&trimmed[json_start..]).unwrap_or_else(|err| {
             panic!(
                 "devcon output is not valid JSON: {err}\nStdout:\n{}\nStderr:\n{}",
