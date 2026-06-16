@@ -30,9 +30,14 @@ pub fn runtime_cmd(runtime: Runtime) -> &'static str {
 
 /// Check if a runtime is available
 pub fn is_runtime_available(runtime: Runtime) -> bool {
-    Command::new(runtime_cmd(runtime))
-        .arg("info")
-        .output()
+    let mut cmd = Command::new(runtime_cmd(runtime));
+    match runtime {
+        // `docker info` confirms the daemon is reachable
+        Runtime::Docker => cmd.arg("info"),
+        // `container system status` is the equivalent for Apple container
+        Runtime::Container => cmd.args(["system", "status"]),
+    };
+    cmd.output()
         .map(|output| output.status.success())
         .unwrap_or(false)
 }
