@@ -164,6 +164,8 @@ jobs:
             sleep 1
           done
           container system status
+          # Download and install the recommended kernel (required for image builds).
+          container system kernel set --recommended
 
       - name: Cache Cargo dependencies
         uses: actions/cache@v3

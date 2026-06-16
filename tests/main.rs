@@ -405,34 +405,29 @@ fn test_feature_combined_git_gh_node() {
 #[cfg(target_os = "macos")]
 fn test_build_container_runtime() {
     let runtime = Runtime::Container;
-    if !is_runtime_available(runtime) {
-        println!("Skipping test: Container runtime not available");
-        return;
-    }
+    skip_if_unavailable!(runtime);
+    cleanup_test_artifacts(runtime, "test-container");
 
-    unsafe { std::env::set_var("CONTAINER_RUNTIME", "container") };
-
-    let home_dir = std::env::var("HOME").expect("HOME env var not set");
     let config = TestConfig::agents_disabled();
     let workspace = DevcontainerBuilder::new("test-container").build();
 
+    // Pass CONTAINER_RUNTIME only to the child process so this test does not
+    // mutate the parent process's environment (which would race with parallel tests).
     use assert_cmd::cargo::cargo_bin_cmd;
-    let result = cargo_bin_cmd!("devcon")
+    let out = cargo_bin_cmd!("devcon")
+        .env("CONTAINER_RUNTIME", "container")
         .arg("--config")
         .arg(&config.path)
         .arg("build")
-        .arg("--build-path")
-        .arg(&home_dir)
         .arg(workspace.path())
-        .output();
+        .output()
+        .expect("Failed to execute build command");
 
-    unsafe { std::env::remove_var("CONTAINER_RUNTIME") };
-
-    let output = result.expect("Failed to execute build command");
     assert!(
-        output.status.success(),
-        "Build command failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        out.status.success(),
+        "Build command failed.\nStdout:\n{}\nStderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
@@ -440,36 +435,29 @@ fn test_build_container_runtime() {
 #[cfg(target_os = "macos")]
 fn test_build_container_runtime_with_features() {
     let runtime = Runtime::Container;
-    if !is_runtime_available(runtime) {
-        println!("Skipping test: Container runtime not available");
-        return;
-    }
+    skip_if_unavailable!(runtime);
+    cleanup_test_artifacts(runtime, "test-container-features");
 
-    unsafe { std::env::set_var("CONTAINER_RUNTIME", "container") };
-
-    let home_dir = std::env::var("HOME").expect("HOME env var not set");
     let config = TestConfig::agents_disabled();
     let workspace = DevcontainerBuilder::new("test-container-features")
         .feature("ghcr.io/devcontainers/features/git", &[])
         .build();
 
     use assert_cmd::cargo::cargo_bin_cmd;
-    let result = cargo_bin_cmd!("devcon")
+    let out = cargo_bin_cmd!("devcon")
+        .env("CONTAINER_RUNTIME", "container")
         .arg("--config")
         .arg(&config.path)
         .arg("build")
-        .arg("--build-path")
-        .arg(&home_dir)
         .arg(workspace.path())
-        .output();
+        .output()
+        .expect("Failed to execute build command");
 
-    unsafe { std::env::remove_var("CONTAINER_RUNTIME") };
-
-    let output = result.expect("Failed to execute build command");
     assert!(
-        output.status.success(),
-        "Build command failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        out.status.success(),
+        "Build command failed.\nStdout:\n{}\nStderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
