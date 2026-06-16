@@ -1,653 +1,189 @@
 mod test_utils;
 
-use assert_cmd::cargo::cargo_bin_cmd;
 use serde_json::json;
 use test_utils::*;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Build-only tests
+// ─────────────────────────────────────────────────────────────────────────────
+
 #[test]
 fn test_build_simple() {
-    let runtime = get_runtime();
-    if !is_runtime_available(runtime) {
-        println!("Skipping test: {:?} runtime not available", runtime);
-        return;
-    }
-
-    let test_config = create_test_config();
-    let temp_dir = create_test_devcontainer(
-        "test-simple",
-        "mcr.microsoft.com/devcontainers/base:ubuntu",
-        None,
-    );
-
-    let mut cmd = cargo_bin_cmd!("devcon");
-    let result = cmd
-        .arg("--config")
-        .arg(&test_config)
-        .arg("build")
-        .arg(temp_dir.path().to_str().unwrap())
-        .output();
-
-    assert!(result.is_ok(), "Failed to execute build command");
-    let output = result.unwrap();
-    assert!(
-        output.status.success(),
-        "Build command failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[test]
-fn test_build_with_features() {
-    let runtime = get_runtime();
-    if !is_runtime_available(runtime) {
-        println!("Skipping test: {:?} runtime not available", runtime);
-        return;
-    }
-
-    let test_config = create_test_config();
-    let features = r#"{"ghcr.io/devcontainers/features/node": {"version": "18"}}"#;
-    let temp_dir = create_test_devcontainer(
-        "test-features",
-        "mcr.microsoft.com/devcontainers/base:ubuntu",
-        Some(features),
-    );
-
-    let mut cmd = cargo_bin_cmd!("devcon");
-    let result = cmd
-        .arg("--config")
-        .arg(&test_config)
-        .arg("build")
-        .arg(temp_dir.path().to_str().unwrap())
-        .output();
-
-    assert!(result.is_ok(), "Failed to execute build command");
-    let output = result.unwrap();
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        output.status.success(),
-        "Build command failed.\nStdout: {}\nStderr: {}",
-        stdout,
-        stderr
-    );
-
-    // Verify that the feature was processed
-    let combined = format!("{}\n{}", stdout, stderr);
-    assert!(
-        combined.contains("node") || combined.contains("Node"),
-        "Build output does not mention node feature"
-    );
-    assert!(
-        combined.contains("Evaluated feature order:"),
-        "Build output does not include evaluated feature order section"
-    );
-    assert!(
-        combined.contains("Evaluated environment summary:"),
-        "Build output does not include evaluated environment summary section"
-    );
-    assert!(
-        combined.contains("Feature build progress:"),
-        "Build output does not include feature build progress checklist"
-    );
+    skip_if_unavailable!(get_runtime());
+    let config = TestConfig::agents_disabled();
+    let workspace = DevcontainerBuilder::new("test-simple").build();
+    DevconRun::build(workspace.path(), &config).assert_success();
 }
 
 #[test]
 fn test_build_with_name() {
-    let runtime = get_runtime();
-    if !is_runtime_available(runtime) {
-        println!("Skipping test: {:?} runtime not available", runtime);
-        return;
-    }
-
-    let test_config = create_test_config();
-    let temp_dir = create_test_devcontainer(
-        "Test Devcontainer Name",
-        "mcr.microsoft.com/devcontainers/base:ubuntu",
-        None,
-    );
-
-    let mut cmd = cargo_bin_cmd!("devcon");
-    let result = cmd
-        .arg("--config")
-        .arg(&test_config)
-        .arg("build")
-        .arg(temp_dir.path().to_str().unwrap())
-        .output();
-
-    assert!(result.is_ok(), "Failed to execute build command");
-    let output = result.unwrap();
-    assert!(
-        output.status.success(),
-        "Build command failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    skip_if_unavailable!(get_runtime());
+    let config = TestConfig::agents_disabled();
+    let workspace = DevcontainerBuilder::new("Test Devcontainer Name").build();
+    DevconRun::build(workspace.path(), &config).assert_success();
 }
 
 #[test]
 fn test_build_and_verify_image() {
     let runtime = get_runtime();
-    if !is_runtime_available(runtime) {
-        println!("Skipping test: {:?} runtime not available", runtime);
-        return;
-    }
-    let test_config = create_test_config();
-
-    let temp_dir = create_test_devcontainer(
-        "test-verify",
-        "mcr.microsoft.com/devcontainers/base:ubuntu",
-        None,
-    );
-
-    let mut cmd = cargo_bin_cmd!("devcon");
-    let result = cmd
-        .arg("--config")
-        .arg(&test_config)
-        .arg("build")
-        .arg(temp_dir.path().to_str().unwrap())
-        .output();
-
-    assert!(result.is_ok(), "Failed to execute build command");
-    let output = result.unwrap();
-    assert!(
-        output.status.success(),
-        "Build command failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
+    skip_if_unavailable!(runtime);
+    let config = TestConfig::agents_disabled();
+    let workspace = DevcontainerBuilder::new("test-verify").build();
+    DevconRun::build(workspace.path(), &config).assert_success();
     assert!(verify_image_exists(runtime, "devcon-test-verify:latest"));
 }
 
 #[test]
-fn test_build_with_dockerfile() {
-    let runtime = get_runtime();
-    if !is_runtime_available(runtime) {
-        println!("Skipping test: {:?} runtime not available", runtime);
-        return;
-    }
-    cleanup_test_artifacts(runtime, "test-dockerfile");
-    let test_config = create_test_config();
+fn test_build_with_features() {
+    skip_if_unavailable!(get_runtime());
+    let config = TestConfig::agents_disabled();
+    let workspace = DevcontainerBuilder::new("test-features")
+        .feature("ghcr.io/devcontainers/features/node", &[("version", "18")])
+        .build();
+    let out = DevconRun::build(workspace.path(), &config);
+    out.assert_success();
+    out.assert_output_contains("Evaluated feature order:");
+    out.assert_output_contains("Evaluated environment summary:");
+    out.assert_output_contains("Feature build progress:");
+}
 
-    let dockerfile_content = r#"FROM mcr.microsoft.com/devcontainers/base:ubuntu
-RUN echo "Custom Dockerfile build" > /custom-marker.txt
-"#;
-
-    let temp_dir = create_test_devcontainer_with_dockerfile("test-dockerfile", dockerfile_content);
-
-    let mut cmd = cargo_bin_cmd!("devcon");
-    let result = cmd
-        .arg("--config")
-        .arg(&test_config)
-        .arg("--output")
-        .arg("json")
-        .arg("-ddddd")
-        .arg("up")
-        .arg(temp_dir.path().to_str().unwrap())
-        .output();
-
-    assert!(result.is_ok(), "Failed to execute build command");
-    let output = result.unwrap();
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        output.status.success(),
-        "Build command failed.\nStdout: {}\nStderr: {}",
-        stdout,
-        stderr
-    );
-
-    let output_json =
-        serde_json::from_str::<serde_json::Value>(&stdout).expect("Output is not valid JSON");
-
-    let container_id = output_json["container_id"]
-        .as_str()
-        .expect("Output JSON does not contain container_id");
-
-    let container_output = exec_in_container(runtime, container_id, &["cat", "/custom-marker.txt"]);
-    assert!(
-        container_output.is_ok(),
-        "Failed to execute command in container"
-    );
-    let marker_content = &container_output.unwrap();
-    assert!(
-        marker_content.contains("Custom Dockerfile build"),
-        "Dockerfile changes not present in container"
-    );
-
-    drop(temp_dir);
+#[test]
+fn test_build_multiple_features() {
+    skip_if_unavailable!(get_runtime());
+    let config = TestConfig::agents_disabled();
+    let workspace = DevcontainerBuilder::new("test-multi-features")
+        .feature("ghcr.io/devcontainers/features/git", &[])
+        .feature("ghcr.io/devcontainers/features/github-cli", &[])
+        .build();
+    DevconRun::build(workspace.path(), &config).assert_success();
 }
 
 #[test]
 fn test_build_with_lifecycle_hooks() {
+    skip_if_unavailable!(get_runtime());
+    let config = TestConfig::agents_disabled();
+    let workspace = DevcontainerBuilder::new("test-hooks")
+        .on_create("echo 'onCreate executed'")
+        .post_create("echo 'postCreate executed'")
+        .build();
+    DevconRun::build(workspace.path(), &config).assert_success();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Up (build + start) tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_build_with_dockerfile() {
     let runtime = get_runtime();
-    if !is_runtime_available(runtime) {
-        println!("Skipping test: {:?} runtime not available", runtime);
-        return;
-    }
-    let test_config = create_test_config();
+    skip_if_unavailable!(runtime);
+    cleanup_test_artifacts(runtime, "test-dockerfile");
+    let config = TestConfig::agents_disabled();
+    let workspace = DevcontainerBuilder::new("test-dockerfile")
+        .dockerfile(
+            "FROM mcr.microsoft.com/devcontainers/base:ubuntu\n\
+             RUN echo \"Custom Dockerfile build\" > /custom-marker.txt\n",
+        )
+        .build();
 
-    let temp_dir = create_test_devcontainer_with_hooks(
-        "test-hooks",
-        "mcr.microsoft.com/devcontainers/base:ubuntu",
-        Some(json!("echo 'onCreate executed'")),
-        Some(json!("echo 'postCreate executed'")),
-    );
-
-    let mut cmd = cargo_bin_cmd!("devcon");
-    let result = cmd
-        .arg("--config")
-        .arg(&test_config)
-        .arg("build")
-        .arg(temp_dir.path().to_str().unwrap())
-        .output();
-
-    assert!(result.is_ok(), "Failed to execute build command");
-    let output = result.unwrap();
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        output.status.success(),
-        "Build command failed.\nStdout: {}\nStderr: {}",
-        stdout,
-        stderr
-    );
+    let out = DevconRun::up_verbose(workspace.path(), &config);
+    out.assert_success();
+    ContainerHandle::new(out.container_id(), runtime)
+        .assert_exec_contains(&["cat", "/custom-marker.txt"], "Custom Dockerfile build");
 }
 
 #[test]
 fn test_up_on_create_array_command_executes_without_shell_joining() {
     let runtime = get_runtime();
-    if !is_runtime_available(runtime) {
-        println!("Skipping test: {:?} runtime not available", runtime);
-        return;
-    }
-
+    skip_if_unavailable!(runtime);
     cleanup_test_artifacts(runtime, "test-array-hook");
-    let test_config = create_test_config();
-    let temp_dir = create_test_devcontainer_with_hooks(
-        "test-array-hook",
-        "mcr.microsoft.com/devcontainers/base:ubuntu",
-        Some(json!(["touch", "/tmp/devcon-array-&&-literal"])),
-        None,
-    );
+    let config = TestConfig::agents_disabled();
+    let workspace = DevcontainerBuilder::new("test-array-hook")
+        .on_create_value(json!(["touch", "/tmp/devcon-array-&&-literal"]))
+        .build();
 
-    let mut cmd = cargo_bin_cmd!("devcon");
-    let result = cmd
-        .arg("--config")
-        .arg(&test_config)
-        .arg("--output")
-        .arg("json")
-        .arg("up")
-        .arg(temp_dir.path().to_str().unwrap())
-        .output();
-
-    assert!(result.is_ok(), "Failed to execute up command");
-    let output = result.unwrap();
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        output.status.success(),
-        "Up command failed.\nStdout: {}\nStderr: {}",
-        stdout,
-        stderr
-    );
-
-    let output_json =
-        serde_json::from_str::<serde_json::Value>(&stdout).expect("Output is not valid JSON");
-    let container_id = output_json["container_id"]
-        .as_str()
-        .expect("Output JSON does not contain container_id");
-
-    let file_check = exec_in_container(
-        runtime,
-        container_id,
-        &["test", "-f", "/tmp/devcon-array-&&-literal"],
-    );
-    assert!(
-        file_check.is_ok(),
-        "Array lifecycle command should be passed through as literal argv, not shell text"
-    );
-
-    drop(temp_dir);
+    let out = DevconRun::up(workspace.path(), &config);
+    out.assert_success();
+    ContainerHandle::new(out.container_id(), runtime)
+        .assert_file_exists("/tmp/devcon-array-&&-literal");
 }
 
 #[test]
 fn test_up_on_create_object_array_values_execute_directly() {
     let runtime = get_runtime();
-    if !is_runtime_available(runtime) {
-        println!("Skipping test: {:?} runtime not available", runtime);
-        return;
-    }
-
+    skip_if_unavailable!(runtime);
     cleanup_test_artifacts(runtime, "test-object-hook");
-    let test_config = create_test_config();
-    let temp_dir = create_test_devcontainer_with_hooks(
-        "test-object-hook",
-        "mcr.microsoft.com/devcontainers/base:ubuntu",
-        Some(json!({
-            "first": ["touch", "/tmp/devcon-object-first-&&-literal"],
-            "second": ["touch", "/tmp/devcon-object-second-&&-literal"]
-        })),
-        None,
-    );
+    let config = TestConfig::agents_disabled();
+    let workspace = DevcontainerBuilder::new("test-object-hook")
+        .on_create_value(json!({
+            "first":  ["touch", "/tmp/devcon-object-first-&&-literal"],
+            "second": ["touch", "/tmp/devcon-object-second-&&-literal"],
+        }))
+        .build();
 
-    let mut cmd = cargo_bin_cmd!("devcon");
-    let result = cmd
-        .arg("--config")
-        .arg(&test_config)
-        .arg("--output")
-        .arg("json")
-        .arg("up")
-        .arg(temp_dir.path().to_str().unwrap())
-        .output();
-
-    assert!(result.is_ok(), "Failed to execute up command");
-    let output = result.unwrap();
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        output.status.success(),
-        "Up command failed.\nStdout: {}\nStderr: {}",
-        stdout,
-        stderr
-    );
-
-    let output_json =
-        serde_json::from_str::<serde_json::Value>(&stdout).expect("Output is not valid JSON");
-    let container_id = output_json["container_id"]
-        .as_str()
-        .expect("Output JSON does not contain container_id");
-
-    for path in [
-        "/tmp/devcon-object-first-&&-literal",
-        "/tmp/devcon-object-second-&&-literal",
-    ] {
-        let file_check = exec_in_container(runtime, container_id, &["test", "-f", path]);
-        assert!(
-            file_check.is_ok(),
-            "Object lifecycle array value should execute directly for path {}",
-            path
-        );
-    }
-
-    drop(temp_dir);
-}
-
-#[test]
-fn test_build_multiple_features() {
-    let runtime = get_runtime();
-    if !is_runtime_available(runtime) {
-        println!("Skipping test: {:?} runtime not available", runtime);
-        return;
-    }
-    let test_config = create_test_config();
-
-    let features = r#"{
-        "ghcr.io/devcontainers/features/git": {},
-        "ghcr.io/devcontainers/features/github-cli": {}
-    }"#;
-    let temp_dir = create_test_devcontainer(
-        "test-multi-features",
-        "mcr.microsoft.com/devcontainers/base:ubuntu",
-        Some(features),
-    );
-
-    let mut cmd = cargo_bin_cmd!("devcon");
-    let result = cmd
-        .arg("--config")
-        .arg(&test_config)
-        .arg("build")
-        .arg(temp_dir.path().to_str().unwrap())
-        .output();
-
-    assert!(result.is_ok(), "Failed to execute build command");
-    let output = result.unwrap();
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        output.status.success(),
-        "Build command failed.\nStdout: {}\nStderr: {}",
-        stdout,
-        stderr
-    );
-
-    // Verify both features were processed
-    let combined = format!("{}\n{}", stdout, stderr);
-    assert!(
-        combined.contains("git") || combined.contains("Git"),
-        "Build output does not mention git feature"
-    );
+    let out = DevconRun::up(workspace.path(), &config);
+    out.assert_success();
+    let container = ContainerHandle::new(out.container_id(), runtime);
+    container.assert_file_exists("/tmp/devcon-object-first-&&-literal");
+    container.assert_file_exists("/tmp/devcon-object-second-&&-literal");
 }
 
 /// Regression test for https://github.com/devconhq/devcon/issues/82.
 ///
-/// `mcr.microsoft.com/devcontainers/base:ubuntu` sets `Config.User = "root"` in its Docker image
-/// metadata but embeds `"remoteUser": "vscode"` in the OCI label `devcontainer.metadata`.
-/// devcon must read that label so the container's `_REMOTE_USER` resolves to `"vscode"`, not
-/// `"root"`.
+/// `mcr.microsoft.com/devcontainers/base:ubuntu` sets `Config.User = "root"` in its Docker
+/// image metadata but embeds `"remoteUser": "vscode"` in the OCI label `devcontainer.metadata`.
+/// devcon must read that label so `_REMOTE_USER` resolves to `"vscode"`, not `"root"`.
 #[test]
 fn test_up_microsoft_devcontainer_base_resolves_remote_user() {
     let runtime = get_runtime();
-    if !is_runtime_available(runtime) {
-        println!("Skipping test: {:?} runtime not available", runtime);
-        return;
-    }
-
+    skip_if_unavailable!(runtime);
     cleanup_test_artifacts(runtime, "test-remote-user-base");
-    let test_config = create_test_config();
-    let temp_dir = create_test_devcontainer(
-        "test-remote-user-base",
-        "mcr.microsoft.com/devcontainers/base:ubuntu",
-        None,
-    );
+    let config = TestConfig::agents_disabled();
+    let workspace = DevcontainerBuilder::new("test-remote-user-base").build();
 
-    let mut cmd = cargo_bin_cmd!("devcon");
-    let result = cmd
-        .arg("--config")
-        .arg(&test_config)
-        .arg("--output")
-        .arg("json")
-        .arg("up")
-        .arg(temp_dir.path().to_str().unwrap())
-        .output();
-
-    assert!(result.is_ok(), "Failed to execute up command");
-    let output = result.unwrap();
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        output.status.success(),
-        "Up command failed.\nStdout: {}\nStderr: {}",
-        stdout,
-        stderr
-    );
-
-    let output_json =
-        serde_json::from_str::<serde_json::Value>(&stdout).expect("Output is not valid JSON");
-    let container_id = output_json["container_id"]
-        .as_str()
-        .expect("Output JSON does not contain container_id");
-
-    // The Dockerfile layer written by devcon injects `ENV _REMOTE_USER=<resolved_user>`.
-    // For this image the devcontainer.metadata label specifies remoteUser=vscode, so devcon
-    // must resolve to "vscode" rather than falling back to the raw Config.User value ("root").
-    let user_output = exec_in_container(runtime, container_id, &["printenv", "_REMOTE_USER"]);
-    assert!(
-        user_output.is_ok(),
-        "Failed to read _REMOTE_USER inside container"
-    );
-    let remote_user = user_output.unwrap().trim().to_string();
-    assert_eq!(
-        remote_user, "vscode",
-        "Expected _REMOTE_USER='vscode' (from devcontainer.metadata label) but got '{}'",
-        remote_user
-    );
-
-    drop(temp_dir);
+    let out = DevconRun::up(workspace.path(), &config);
+    out.assert_success();
+    ContainerHandle::new(out.container_id(), runtime).assert_env("_REMOTE_USER", "vscode");
 }
 
 #[test]
 fn test_up_with_custom_agent_ssh_port_uses_2222() {
     let runtime = get_runtime();
-    if !is_runtime_available(runtime) {
-        println!("Skipping test: {:?} runtime not available", runtime);
-        return;
-    }
-
+    skip_if_unavailable!(runtime);
     cleanup_test_artifacts(runtime, "test-ssh-port-override");
-    let test_config = create_test_config_with_contents(
-        "agents:\n  disable: false\n  sshPort: 2222\n  skipSshSetup: false\n",
-    );
-    let temp_dir = create_test_devcontainer(
-        "test-ssh-port-override",
-        "mcr.microsoft.com/devcontainers/base:ubuntu",
-        None,
-    );
 
-    let mut up_cmd = cargo_bin_cmd!("devcon");
-    let up_result = up_cmd
-        .arg("--config")
-        .arg(&test_config)
-        .arg("--output")
-        .arg("json")
-        .arg("up")
-        .arg(temp_dir.path().to_str().unwrap())
-        .output();
+    let config = TestConfig::with_ssh_port(2222);
+    let workspace = DevcontainerBuilder::new("test-ssh-port-override").build();
 
-    assert!(up_result.is_ok(), "Failed to execute up command");
-    let up_output = up_result.unwrap();
-    assert!(
-        up_output.status.success(),
-        "Up command failed: {}",
-        String::from_utf8_lossy(&up_output.stderr)
-    );
+    DevconRun::up(workspace.path(), &config).assert_success();
 
-    let mut ssh_proxy_ok_cmd = cargo_bin_cmd!("devcon");
-    let ssh_proxy_ok = ssh_proxy_ok_cmd
-        .arg("--config")
-        .arg(&test_config)
-        .arg("ssh")
-        .arg("connect")
-        .arg(temp_dir.path().to_str().unwrap())
-        .arg("--proxy")
-        .output();
+    // Port 2222 should be mapped → --proxy succeeds.
+    DevconRun::ssh_proxy(workspace.path(), &config).assert_success();
 
-    assert!(
-        ssh_proxy_ok.is_ok(),
-        "Failed to execute ssh connect --proxy"
-    );
-    let ssh_proxy_ok_output = ssh_proxy_ok.unwrap();
-    assert!(
-        ssh_proxy_ok_output.status.success(),
-        "ssh connect --proxy with sshPort=2222 failed: {}",
-        String::from_utf8_lossy(&ssh_proxy_ok_output.stderr)
-    );
-
-    let wrong_port_config = create_test_config_with_contents("agents:\n  disable: false\n");
-    let mut ssh_proxy_fail_cmd = cargo_bin_cmd!("devcon");
-    let ssh_proxy_fail = ssh_proxy_fail_cmd
-        .arg("--config")
-        .arg(&wrong_port_config)
-        .arg("ssh")
-        .arg("connect")
-        .arg(temp_dir.path().to_str().unwrap())
-        .arg("--proxy")
-        .output();
-
-    assert!(
-        ssh_proxy_fail.is_ok(),
-        "Failed to execute ssh connect --proxy with wrong port config"
-    );
-    let ssh_proxy_fail_output = ssh_proxy_fail.unwrap();
-    assert!(
-        !ssh_proxy_fail_output.status.success(),
-        "ssh connect --proxy unexpectedly succeeded when looking for port 22"
-    );
-    assert!(
-        String::from_utf8_lossy(&ssh_proxy_fail_output.stderr)
-            .contains("Container SSH port 22 is not mapped"),
-        "Expected missing port 22 mapping error, got: {}",
-        String::from_utf8_lossy(&ssh_proxy_fail_output.stderr)
-    );
-
-    drop(temp_dir);
+    // A config expecting port 22 should fail because 22 is not mapped.
+    let wrong_config = TestConfig::agents_enabled();
+    let out = DevconRun::ssh_proxy(workspace.path(), &wrong_config);
+    out.assert_failure();
+    out.assert_stderr_contains("Container SSH port 22 is not mapped");
 }
 
 #[test]
 fn test_up_with_skip_agent_ssh_setup_skips_forwarding_and_sshd() {
     let runtime = get_runtime();
-    if !is_runtime_available(runtime) {
-        println!("Skipping test: {:?} runtime not available", runtime);
-        return;
-    }
-
+    skip_if_unavailable!(runtime);
     cleanup_test_artifacts(runtime, "test-skip-ssh-setup");
-    let test_config =
-        create_test_config_with_contents("agents:\n  disable: false\n  skipSshSetup: true\n");
-    let temp_dir = create_test_devcontainer(
-        "test-skip-ssh-setup",
-        "mcr.microsoft.com/devcontainers/base:ubuntu",
-        None,
-    );
 
-    let mut up_cmd = cargo_bin_cmd!("devcon");
-    let up_result = up_cmd
-        .arg("--config")
-        .arg(&test_config)
-        .arg("up")
-        .arg(temp_dir.path().to_str().unwrap())
-        .output();
+    let config = TestConfig::skip_ssh_setup();
+    let workspace = DevcontainerBuilder::new("test-skip-ssh-setup").build();
 
-    assert!(up_result.is_ok(), "Failed to execute up command");
-    let up_output = up_result.unwrap();
-    let stdout = String::from_utf8_lossy(&up_output.stdout);
-    let stderr = String::from_utf8_lossy(&up_output.stderr);
-    assert!(
-        up_output.status.success(),
-        "Up command failed.\nStdout: {}\nStderr: {}",
-        stdout,
-        stderr
-    );
+    DevconRun::up(workspace.path(), &config).assert_success();
+
     let container_id = get_running_container_id(runtime, "test-skip-ssh-setup")
-        .expect("Failed to resolve running container id for test-skip-ssh-setup");
+        .expect("Failed to resolve running container id");
 
-    let mut ssh_proxy_cmd = cargo_bin_cmd!("devcon");
-    let ssh_proxy_result = ssh_proxy_cmd
-        .arg("--config")
-        .arg(&test_config)
-        .arg("ssh")
-        .arg("connect")
-        .arg(temp_dir.path().to_str().unwrap())
-        .arg("--proxy")
-        .output();
-
-    assert!(
-        ssh_proxy_result.is_ok(),
-        "Failed to execute ssh connect --proxy"
-    );
-    let ssh_proxy_output = ssh_proxy_result.unwrap();
-    assert!(
-        !ssh_proxy_output.status.success(),
-        "ssh connect --proxy unexpectedly succeeded when SSH setup is skipped"
-    );
-    assert!(
-        String::from_utf8_lossy(&ssh_proxy_output.stderr)
-            .contains("Container SSH port 22 is not mapped"),
-        "Expected missing SSH mapping error, got: {}",
-        String::from_utf8_lossy(&ssh_proxy_output.stderr)
-    );
+    let out = DevconRun::ssh_proxy(workspace.path(), &config);
+    out.assert_failure();
+    out.assert_stderr_contains("Container SSH port 22 is not mapped");
 
     let sshd_running = exec_in_container(
         runtime,
@@ -658,215 +194,78 @@ fn test_up_with_skip_agent_ssh_setup_skips_forwarding_and_sshd() {
         sshd_running.is_err(),
         "sshd should not be running when agents.skipSshSetup=true"
     );
-
-    drop(temp_dir);
 }
 
-/// Regression test for the `devcon start` command always creating a new container.
-///
-/// `list()` calls `docker ps` (no `-a` flag), which only returns *running*
-/// containers.  When the container is stopped, `start_with_features` cannot
-/// find it and calls `docker run` again, spawning a duplicate container.
-/// The correct behaviour is to restart the existing stopped container and
-/// return its original ID.
+/// Regression: `devcon start` must restart a stopped container, not spawn a new one.
 #[test]
 fn test_start_reuses_stopped_container() {
     let runtime = get_runtime();
-    if !is_runtime_available(runtime) {
-        println!("Skipping test: {:?} runtime not available", runtime);
-        return;
-    }
-
-    let test_config = create_test_config();
+    skip_if_unavailable!(runtime);
     cleanup_test_artifacts(runtime, "test-start-reuse");
-    let temp_dir = create_test_devcontainer(
-        "test-start-reuse",
-        "mcr.microsoft.com/devcontainers/base:ubuntu",
-        None,
-    );
 
-    // First `up` — build and start the container.
-    let mut cmd = cargo_bin_cmd!("devcon");
-    let result = cmd
-        .arg("--config")
-        .arg(&test_config)
-        .arg("--output")
-        .arg("json")
-        .arg("up")
-        .arg(temp_dir.path().to_str().unwrap())
-        .output();
+    let config = TestConfig::agents_disabled();
+    let workspace = DevcontainerBuilder::new("test-start-reuse").build();
 
-    assert!(result.is_ok(), "Failed to execute up command");
-    let output = result.unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "Up command failed.\nStdout: {}\nStderr: {}",
-        stdout,
-        stderr
-    );
+    let up_out = DevconRun::up(workspace.path(), &config);
+    up_out.assert_success();
+    let id_after_up = up_out.container_id();
 
-    let up_json =
-        serde_json::from_str::<serde_json::Value>(&stdout).expect("up output is not valid JSON");
-    let container_id_after_up = up_json["container_id"]
-        .as_str()
-        .expect("up output JSON does not contain container_id")
-        .to_string();
+    stop_container(runtime, &id_after_up);
 
-    // Stop the container so it is in an exited (not running) state.
-    stop_container(runtime, &container_id_after_up);
-
-    // `devcon start` — must restart the existing stopped container, not spawn a new one.
-    let mut cmd = cargo_bin_cmd!("devcon");
-    let result = cmd
-        .arg("--config")
-        .arg(&test_config)
-        .arg("--output")
-        .arg("json")
-        .arg("start")
-        .arg(temp_dir.path().to_str().unwrap())
-        .output();
-
-    assert!(result.is_ok(), "Failed to execute start command");
-    let output = result.unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "Start command failed.\nStdout: {}\nStderr: {}",
-        stdout,
-        stderr
-    );
-
-    let start_json =
-        serde_json::from_str::<serde_json::Value>(&stdout).expect("start output is not valid JSON");
-    let container_id_after_start = start_json["container_id"]
-        .as_str()
-        .expect("start output JSON does not contain container_id")
-        .to_string();
+    let start_out = DevconRun::start(workspace.path(), &config);
+    start_out.assert_success();
+    let id_after_start = start_out.container_id();
 
     assert_eq!(
-        container_id_after_up, container_id_after_start,
-        "devcon start created a new container instead of restarting the existing stopped one"
+        id_after_up, id_after_start,
+        "devcon start created a new container instead of restarting the stopped one"
     );
-
-    drop(temp_dir);
 }
 
-/// Regression test for https://github.com/devconhq/devcon/issues/85.
-///
-/// Running `devcon up` a second time on an already-built image must reuse the
-/// cached image rather than rebuilding it from scratch.  If the image ID
-/// reported by the runtime changes between two consecutive `up` invocations
-/// (with no changes to the devcontainer configuration), the cache is broken.
+/// Regression (#85): second `devcon up` without config changes must not rebuild the image.
 #[test]
 fn test_up_does_not_rebuild_existing_image() {
     let runtime = get_runtime();
-    if !is_runtime_available(runtime) {
-        println!("Skipping test: {:?} runtime not available", runtime);
-        return;
-    }
-
-    let test_config = create_test_config();
+    skip_if_unavailable!(runtime);
     cleanup_test_artifacts(runtime, "test-no-rebuild");
-    let temp_dir = create_test_devcontainer(
-        "test-no-rebuild",
-        "mcr.microsoft.com/devcontainers/base:ubuntu",
-        None,
-    );
 
-    // First `up` — builds and starts the container.
-    let mut cmd = cargo_bin_cmd!("devcon");
-    let result = cmd
-        .arg("--config")
-        .arg(&test_config)
-        .arg("up")
-        .arg(temp_dir.path().to_str().unwrap())
-        .output();
+    let config = TestConfig::agents_disabled();
+    let workspace = DevcontainerBuilder::new("test-no-rebuild").build();
 
-    assert!(result.is_ok(), "Failed to execute first up command");
-    let output = result.unwrap();
-    assert!(
-        output.status.success(),
-        "First up command failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    DevconRun::up(workspace.path(), &config).assert_success();
+    let id_first = get_image_id(runtime, "devcon-test-no-rebuild:latest")
+        .expect("Image not found after first up");
 
-    let image_id_after_first_up = get_image_id(runtime, "devcon-test-no-rebuild:latest")
-        .expect("Image devcon-test-no-rebuild:latest not found after first up");
-
-    // Second `up` — must reuse the cached image, not rebuild it.
-    let mut cmd = cargo_bin_cmd!("devcon");
-    let result = cmd
-        .arg("--config")
-        .arg(&test_config)
-        .arg("up")
-        .arg(temp_dir.path().to_str().unwrap())
-        .output();
-
-    assert!(result.is_ok(), "Failed to execute second up command");
-    let output = result.unwrap();
-    assert!(
-        output.status.success(),
-        "Second up command failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let image_id_after_second_up = get_image_id(runtime, "devcon-test-no-rebuild:latest")
-        .expect("Image devcon-test-no-rebuild:latest not found after second up");
+    DevconRun::up(workspace.path(), &config).assert_success();
+    let id_second = get_image_id(runtime, "devcon-test-no-rebuild:latest")
+        .expect("Image not found after second up");
 
     assert_eq!(
-        image_id_after_first_up, image_id_after_second_up,
-        "Image was rebuilt on second 'devcon up' even though nothing changed (issue #85)"
+        id_first, id_second,
+        "Image was rebuilt on second `devcon up` even though nothing changed (issue #85)"
     );
-
-    drop(temp_dir);
 }
 
 #[test]
 fn test_up_rebuilds_when_config_changes() {
     let runtime = get_runtime();
-    if !is_runtime_available(runtime) {
-        println!("Skipping test: {:?} runtime not available", runtime);
-        return;
-    }
-
-    let test_config = create_test_config();
+    skip_if_unavailable!(runtime);
     cleanup_test_artifacts(runtime, "test-rebuild-on-change");
-    let temp_dir = create_test_devcontainer(
-        "test-rebuild-on-change",
-        "mcr.microsoft.com/devcontainers/base:ubuntu",
-        None,
-    );
 
-    // First `up` — builds the image with the initial config hash label.
-    let mut cmd = cargo_bin_cmd!("devcon");
-    let result = cmd
-        .arg("--config")
-        .arg(&test_config)
-        .arg("up")
-        .arg(temp_dir.path().to_str().unwrap())
-        .output();
+    let config = TestConfig::agents_disabled();
+    let workspace = DevcontainerBuilder::new("test-rebuild-on-change").build();
 
-    assert!(result.is_ok(), "Failed to execute first up command");
-    let output = result.unwrap();
-    assert!(
-        output.status.success(),
-        "First up command failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let image_id_after_first_up = get_image_id(runtime, "devcon-test-rebuild-on-change:latest")
+    DevconRun::up(workspace.path(), &config).assert_success();
+    let id_before = get_image_id(runtime, "devcon-test-rebuild-on-change:latest")
         .expect("Image not found after first up");
 
     // Mutate devcontainer.json so the config hash changes.
-    let devcontainer_path = temp_dir
+    let dc_path = workspace
         .path()
         .join(".devcontainer")
         .join("devcontainer.json");
     std::fs::write(
-        &devcontainer_path,
+        &dc_path,
         r#"{
     "name": "test-rebuild-on-change",
     "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
@@ -875,98 +274,149 @@ fn test_up_rebuilds_when_config_changes() {
     )
     .expect("Failed to update devcontainer.json");
 
-    // Second `up` — config changed, must rebuild the image.
-    let mut cmd = cargo_bin_cmd!("devcon");
-    let result = cmd
-        .arg("--config")
-        .arg(&test_config)
-        .arg("up")
-        .arg(temp_dir.path().to_str().unwrap())
-        .output();
-
-    assert!(result.is_ok(), "Failed to execute second up command");
-    let output = result.unwrap();
-    assert!(
-        output.status.success(),
-        "Second up command failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let image_id_after_second_up = get_image_id(runtime, "devcon-test-rebuild-on-change:latest")
+    DevconRun::up(workspace.path(), &config).assert_success();
+    let id_after = get_image_id(runtime, "devcon-test-rebuild-on-change:latest")
         .expect("Image not found after second up");
 
     assert_ne!(
-        image_id_after_first_up, image_id_after_second_up,
+        id_before, id_after,
         "Image was NOT rebuilt after devcontainer.json changed"
     );
-
-    drop(temp_dir);
 }
 
 #[test]
 fn test_up_force_rebuild() {
     let runtime = get_runtime();
-    if !is_runtime_available(runtime) {
-        println!("Skipping test: {:?} runtime not available", runtime);
-        return;
-    }
-
-    let test_config = create_test_config();
+    skip_if_unavailable!(runtime);
     cleanup_test_artifacts(runtime, "test-force-rebuild");
-    let temp_dir = create_test_devcontainer(
-        "test-force-rebuild",
-        "mcr.microsoft.com/devcontainers/base:ubuntu",
-        None,
-    );
 
-    // First `up` — builds the image normally.
-    let mut cmd = cargo_bin_cmd!("devcon");
-    let result = cmd
-        .arg("--config")
-        .arg(&test_config)
-        .arg("up")
-        .arg(temp_dir.path().to_str().unwrap())
-        .output();
+    let config = TestConfig::agents_disabled();
+    let workspace = DevcontainerBuilder::new("test-force-rebuild").build();
 
-    assert!(result.is_ok(), "Failed to execute first up command");
-    let output = result.unwrap();
-    assert!(
-        output.status.success(),
-        "First up command failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let image_id_after_first_up = get_image_id(runtime, "devcon-test-force-rebuild:latest")
+    DevconRun::up(workspace.path(), &config).assert_success();
+    let id_first = get_image_id(runtime, "devcon-test-force-rebuild:latest")
         .expect("Image not found after first up");
 
-    // Second `up` with --force-rebuild — config is unchanged, but must rebuild anyway.
-    let mut cmd = cargo_bin_cmd!("devcon");
-    let result = cmd
-        .arg("--config")
-        .arg(&test_config)
-        .arg("up")
-        .arg("--force-rebuild")
-        .arg(temp_dir.path().to_str().unwrap())
-        .output();
-
-    assert!(result.is_ok(), "Failed to execute second up command");
-    let output = result.unwrap();
-    assert!(
-        output.status.success(),
-        "Second up command failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let image_id_after_force_rebuild = get_image_id(runtime, "devcon-test-force-rebuild:latest")
+    DevconRun::up_force_rebuild(workspace.path(), &config).assert_success();
+    let id_after = get_image_id(runtime, "devcon-test-force-rebuild:latest")
         .expect("Image not found after force rebuild");
 
     assert_ne!(
-        image_id_after_first_up, image_id_after_force_rebuild,
+        id_first, id_after,
         "Image was NOT rebuilt when --force-rebuild was passed"
     );
-
-    drop(temp_dir);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// New feature scenario tests  (verify binaries are present in the container)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// python feature installs python3 into the container.
+#[test]
+fn test_feature_python_installs_python3() {
+    let runtime = get_runtime();
+    skip_if_unavailable!(runtime);
+    cleanup_test_artifacts(runtime, "test-feature-python");
+
+    let config = TestConfig::agents_disabled();
+    let workspace = DevcontainerBuilder::new("test-feature-python")
+        .feature(
+            "ghcr.io/devcontainers/features/python",
+            &[("version", "3.12")],
+        )
+        .build();
+
+    let out = DevconRun::up(workspace.path(), &config);
+    out.assert_success();
+    ContainerHandle::new(out.container_id(), runtime)
+        .assert_exec_contains(&["python3", "--version"], "Python 3");
+}
+
+/// dotnet feature installs the .NET SDK into the container.
+#[test]
+fn test_feature_dotnet_installs_dotnet() {
+    let runtime = get_runtime();
+    skip_if_unavailable!(runtime);
+    cleanup_test_artifacts(runtime, "test-feature-dotnet");
+
+    let config = TestConfig::agents_disabled();
+    let workspace = DevcontainerBuilder::new("test-feature-dotnet")
+        .feature(
+            "ghcr.io/devcontainers/features/dotnet",
+            &[("version", "latest")],
+        )
+        .build();
+
+    let out = DevconRun::up(workspace.path(), &config);
+    out.assert_success();
+    ContainerHandle::new(out.container_id(), runtime)
+        .assert_exec_contains(&["sh", "-lc", "dotnet --version"], ".");
+}
+
+/// rust feature installs rustup / rustc into the container.
+#[test]
+fn test_feature_rust_installs_rustc() {
+    let runtime = get_runtime();
+    skip_if_unavailable!(runtime);
+    cleanup_test_artifacts(runtime, "test-feature-rust");
+
+    let config = TestConfig::agents_disabled();
+    let workspace = DevcontainerBuilder::new("test-feature-rust")
+        .feature(
+            "ghcr.io/devcontainers/features/rust",
+            &[("version", "latest")],
+        )
+        .build();
+
+    let out = DevconRun::up(workspace.path(), &config);
+    out.assert_success();
+    ContainerHandle::new(out.container_id(), runtime)
+        .assert_exec_contains(&["sh", "-lc", "rustc --version"], "rustc");
+}
+
+/// node feature with a pinned version installs that exact major version.
+#[test]
+fn test_feature_node_with_version_option() {
+    let runtime = get_runtime();
+    skip_if_unavailable!(runtime);
+    cleanup_test_artifacts(runtime, "test-feature-node-version");
+
+    let config = TestConfig::agents_disabled();
+    let workspace = DevcontainerBuilder::new("test-feature-node-version")
+        .feature("ghcr.io/devcontainers/features/node", &[("version", "20")])
+        .build();
+
+    let out = DevconRun::up(workspace.path(), &config);
+    out.assert_success();
+    ContainerHandle::new(out.container_id(), runtime)
+        .assert_exec_contains(&["node", "--version"], "v20.");
+}
+
+/// Combined features: git + github-cli + node must all be present.
+#[test]
+fn test_feature_combined_git_gh_node() {
+    let runtime = get_runtime();
+    skip_if_unavailable!(runtime);
+    cleanup_test_artifacts(runtime, "test-feature-combined");
+
+    let config = TestConfig::agents_disabled();
+    let workspace = DevcontainerBuilder::new("test-feature-combined")
+        .feature("ghcr.io/devcontainers/features/git", &[])
+        .feature("ghcr.io/devcontainers/features/github-cli", &[])
+        .feature("ghcr.io/devcontainers/features/node", &[("version", "lts")])
+        .build();
+
+    let out = DevconRun::up(workspace.path(), &config);
+    out.assert_success();
+    let container = ContainerHandle::new(out.container_id(), runtime);
+    container.assert_exec_contains(&["git", "--version"], "git version");
+    container.assert_exec_contains(&["gh", "--version"], "gh version");
+    container.assert_exec_contains(&["node", "--version"], "v");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// macOS `container` runtime tests
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
 #[cfg(target_os = "macos")]
@@ -977,37 +427,25 @@ fn test_build_container_runtime() {
         return;
     }
 
-    unsafe {
-        std::env::set_var("CONTAINER_RUNTIME", "container");
-    }
+    unsafe { std::env::set_var("CONTAINER_RUNTIME", "container") };
 
-    let test_config = create_test_config();
-    let temp_dir = create_test_devcontainer(
-        "test-container",
-        "mcr.microsoft.com/devcontainers/base:ubuntu",
-        None,
-    );
-
-    // The container runtime has a bug with default temp directories
-    // Use home directory as build path
     let home_dir = std::env::var("HOME").expect("HOME env var not set");
+    let config = TestConfig::agents_disabled();
+    let workspace = DevcontainerBuilder::new("test-container").build();
 
-    let mut cmd = cargo_bin_cmd!("devcon");
-    let result = cmd
+    use assert_cmd::cargo::cargo_bin_cmd;
+    let result = cargo_bin_cmd!("devcon")
         .arg("--config")
-        .arg(&test_config)
+        .arg(&config.path)
         .arg("build")
         .arg("--build-path")
         .arg(&home_dir)
-        .arg(temp_dir.path().to_str().unwrap())
+        .arg(workspace.path())
         .output();
 
-    unsafe {
-        std::env::remove_var("CONTAINER_RUNTIME");
-    }
+    unsafe { std::env::remove_var("CONTAINER_RUNTIME") };
 
-    assert!(result.is_ok(), "Failed to execute build command");
-    let output = result.unwrap();
+    let output = result.expect("Failed to execute build command");
     assert!(
         output.status.success(),
         "Build command failed: {}",
@@ -1023,47 +461,31 @@ fn test_build_container_runtime_with_features() {
         println!("Skipping test: Container runtime not available");
         return;
     }
-    let test_config = create_test_config();
 
-    unsafe {
-        std::env::set_var("CONTAINER_RUNTIME", "container");
-    }
+    unsafe { std::env::set_var("CONTAINER_RUNTIME", "container") };
 
-    let features = r#"{"ghcr.io/devcontainers/features/git": {}}"#;
-    let temp_dir = create_test_devcontainer(
-        "test-container-features",
-        "mcr.microsoft.com/devcontainers/base:ubuntu",
-        Some(features),
-    );
-
-    // The container runtime has a bug with default temp directories
-    // Use home directory as build path
     let home_dir = std::env::var("HOME").expect("HOME env var not set");
+    let config = TestConfig::agents_disabled();
+    let workspace = DevcontainerBuilder::new("test-container-features")
+        .feature("ghcr.io/devcontainers/features/git", &[])
+        .build();
 
-    let mut cmd = cargo_bin_cmd!("devcon");
-    let result = cmd
+    use assert_cmd::cargo::cargo_bin_cmd;
+    let result = cargo_bin_cmd!("devcon")
         .arg("--config")
-        .arg(&test_config)
+        .arg(&config.path)
         .arg("build")
         .arg("--build-path")
         .arg(&home_dir)
-        .arg(temp_dir.path().to_str().unwrap())
+        .arg(workspace.path())
         .output();
 
-    unsafe {
-        std::env::remove_var("CONTAINER_RUNTIME");
-    }
+    unsafe { std::env::remove_var("CONTAINER_RUNTIME") };
 
-    assert!(result.is_ok(), "Failed to execute build command");
-    let output = result.unwrap();
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
+    let output = result.expect("Failed to execute build command");
     assert!(
         output.status.success(),
-        "Build command failed.\nStdout: {}\nStderr: {}",
-        stdout,
-        stderr
+        "Build command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }

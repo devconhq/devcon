@@ -1,4 +1,5 @@
-use std::process::Command;
+#![allow(dead_code)]
+use std::{collections::HashMap, path::PathBuf, process::Command};
 use tempfile::TempDir;
 
 /// Represents a container runtime type
@@ -432,6 +433,449 @@ pub fn generate_test_image_name(test_name: &str) -> String {
         .unwrap()
         .as_secs();
     format!("devcon-test-{}:{}", test_name, timestamp)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Fluent builder helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Skip the current test when the given runtime is not available.
+///
+/// ```ignore
+/// skip_if_unavailable!(get_runtime());
+/// ```
+#[macro_export]
+macro_rules! skip_if_unavailable {
+    ($runtime:expr) => {
+        let runtime = $runtime;
+        if !$crate::test_utils::is_runtime_available(runtime) {
+            println!("Skipping test: {:?} runtime not available", runtime);
+            return;
+        }
+    };
+}
+
+// ─── TestConfig ───────────────────────────────────────────────────────────────
+
+/// Builder for the devcon YAML config used in tests.
+///
+/// Holds the `TempDir` so the file stays alive until the builder is dropped,
+/// avoiding the `mem::forget` leak in the old `create_test_config_with_contents`.
+pub struct TestConfig {
+    _dir: TempDir,
+    pub path: PathBuf,
+}
+
+impl TestConfig {
+    fn from_yaml(yaml: &str) -> Self {
+        let dir = tempfile::tempdir().expect("Failed to create temp dir for TestConfig");
+        let path = dir.path().join("test-config.yaml");
+        std::fs::write(&path, yaml).expect("Failed to write test config");
+        TestConfig { _dir: dir, path }
+    }
+
+    /// Config with agents disabled (fastest; no SSH setup).
+    pub fn agents_disabled() -> Self {
+        Self::from_yaml("# Test config\nagents:\n    disable: true\n")
+    }
+
+    /// Config with agents enabled at a custom SSH port.
+    pub fn with_ssh_port(port: u16) -> Self {
+        Self::from_yaml(&format!(
+            "agents:\n  disable: false\n  sshPort: {port}\n  skipSshSetup: false\n"
+        ))
+    }
+
+    /// Config with agents enabled but SSH setup skipped.
+    pub fn skip_ssh_setup() -> Self {
+        Self::from_yaml("agents:\n  disable: false\n  skipSshSetup: true\n")
+    }
+
+    /// Config with agents enabled (default port 22, no SSH skip).
+    pub fn agents_enabled() -> Self {
+        Self::from_yaml("agents:\n  disable: false\n")
+    }
+
+    /// Config from raw YAML string.
+    pub fn from_raw(yaml: &str) -> Self {
+        Self::from_yaml(yaml)
+    }
+}
+
+// ─── DevcontainerBuilder ──────────────────────────────────────────────────────
+
+enum DevcontainerSource {
+    Image(String),
+    Dockerfile(String),
+}
+
+/// Fluent builder for a temporary devcontainer workspace.
+///
+/// ```ignore
+/// let workspace = DevcontainerBuilder::new("test-python")
+///     .image("mcr.microsoft.com/devcontainers/base:ubuntu")
+///     .feature("ghcr.io/devcontainers/features/python", &[("version", "3.12")])
+///     .on_create("echo hello")
+///     .build();
+/// ```
+pub struct DevcontainerBuilder {
+    name: String,
+    source: DevcontainerSource,
+    features: HashMap<String, serde_json::Value>,
+    on_create: Option<serde_json::Value>,
+    post_create: Option<serde_json::Value>,
+    remote_env: HashMap<String, String>,
+}
+
+impl DevcontainerBuilder {
+    pub fn new(name: impl Into<String>) -> Self {
+        DevcontainerBuilder {
+            name: name.into(),
+            source: DevcontainerSource::Image("mcr.microsoft.com/devcontainers/base:ubuntu".into()),
+            features: HashMap::new(),
+            on_create: None,
+            post_create: None,
+            remote_env: HashMap::new(),
+        }
+    }
+
+    /// Use a registry image as the base.
+    pub fn image(mut self, image: impl Into<String>) -> Self {
+        self.source = DevcontainerSource::Image(image.into());
+        self
+    }
+
+    /// Use an inline Dockerfile as the build source.
+    pub fn dockerfile(mut self, content: impl Into<String>) -> Self {
+        self.source = DevcontainerSource::Dockerfile(content.into());
+        self
+    }
+
+    /// Add a devcontainer feature.  `opts` is a slice of `(key, value)` option pairs.
+    pub fn feature(mut self, id: impl Into<String>, opts: &[(&str, &str)]) -> Self {
+        let opts_map: serde_json::Map<String, serde_json::Value> = opts
+            .iter()
+            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+            .collect();
+        self.features
+            .insert(id.into(), serde_json::Value::Object(opts_map));
+        self
+    }
+
+    /// Set `onCreateCommand` to a shell string.
+    pub fn on_create(mut self, cmd: impl Into<String>) -> Self {
+        self.on_create = Some(serde_json::Value::String(cmd.into()));
+        self
+    }
+
+    /// Set `onCreateCommand` to a JSON value (string, array, or object).
+    pub fn on_create_value(mut self, cmd: serde_json::Value) -> Self {
+        self.on_create = Some(cmd);
+        self
+    }
+
+    /// Set `postCreateCommand` to a shell string.
+    pub fn post_create(mut self, cmd: impl Into<String>) -> Self {
+        self.post_create = Some(serde_json::Value::String(cmd.into()));
+        self
+    }
+
+    /// Set `postCreateCommand` to a JSON value.
+    pub fn post_create_value(mut self, cmd: serde_json::Value) -> Self {
+        self.post_create = Some(cmd);
+        self
+    }
+
+    /// Add a `remoteEnv` variable.
+    pub fn remote_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.remote_env.insert(key.into(), value.into());
+        self
+    }
+
+    /// Write the workspace to a `TempDir` and return the handle.
+    pub fn build(self) -> TempDir {
+        let dir = tempfile::tempdir().expect("Failed to create temp workspace dir");
+        let dc_path = dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&dc_path).expect("Failed to create .devcontainer dir");
+
+        let mut config = serde_json::json!({ "name": self.name });
+
+        match self.source {
+            DevcontainerSource::Image(img) => {
+                config["image"] = serde_json::Value::String(img);
+            }
+            DevcontainerSource::Dockerfile(content) => {
+                std::fs::write(dc_path.join("Dockerfile"), content)
+                    .expect("Failed to write Dockerfile");
+                config["build"] = serde_json::json!({ "dockerfile": "Dockerfile" });
+            }
+        }
+
+        if !self.features.is_empty() {
+            config["features"] =
+                serde_json::Value::Object(self.features.into_iter().map(|(k, v)| (k, v)).collect());
+        }
+
+        if let Some(cmd) = self.on_create {
+            config["onCreateCommand"] = cmd;
+        }
+        if let Some(cmd) = self.post_create {
+            config["postCreateCommand"] = cmd;
+        }
+        if !self.remote_env.is_empty() {
+            config["remoteEnv"] = serde_json::Value::Object(
+                self.remote_env
+                    .into_iter()
+                    .map(|(k, v)| (k, serde_json::Value::String(v)))
+                    .collect(),
+            );
+        }
+
+        let json =
+            serde_json::to_string_pretty(&config).expect("Failed to serialise devcontainer.json");
+        std::fs::write(dc_path.join("devcontainer.json"), json)
+            .expect("Failed to write devcontainer.json");
+
+        dir
+    }
+}
+
+// ─── DevconOutput ─────────────────────────────────────────────────────────────
+
+/// The result of a `devcon` invocation.  Panics with full stdout/stderr on assertion failures.
+pub struct DevconOutput {
+    pub status: std::process::ExitStatus,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl DevconOutput {
+    /// Assert the command exited successfully, printing full output on failure.
+    #[track_caller]
+    pub fn assert_success(&self) {
+        assert!(
+            self.status.success(),
+            "devcon command failed.\nStdout:\n{}\nStderr:\n{}",
+            self.stdout,
+            self.stderr
+        );
+    }
+
+    /// Assert the command failed (non-zero exit).
+    #[track_caller]
+    pub fn assert_failure(&self) {
+        assert!(
+            !self.status.success(),
+            "devcon command unexpectedly succeeded.\nStdout:\n{}\nStderr:\n{}",
+            self.stdout,
+            self.stderr
+        );
+    }
+
+    /// Assert that either stdout or stderr contains `needle`.
+    #[track_caller]
+    pub fn assert_output_contains(&self, needle: &str) {
+        let combined = format!("{}\n{}", self.stdout, self.stderr);
+        assert!(
+            combined.contains(needle),
+            "Expected output to contain {needle:?}.\nStdout:\n{}\nStderr:\n{}",
+            self.stdout,
+            self.stderr
+        );
+    }
+
+    /// Assert that stderr contains `needle`.
+    #[track_caller]
+    pub fn assert_stderr_contains(&self, needle: &str) {
+        assert!(
+            self.stderr.contains(needle),
+            "Expected stderr to contain {needle:?}.\nStderr:\n{}",
+            self.stderr
+        );
+    }
+
+    /// Parse stdout as JSON.  Panics with full output if parsing fails.
+    #[track_caller]
+    pub fn json(&self) -> serde_json::Value {
+        // Some commands print a banner line before the JSON object; find the
+        // first '{' so we can handle that gracefully.
+        let trimmed = self.stdout.trim();
+        let json_start = trimmed.find('{').unwrap_or(0);
+        serde_json::from_str(&trimmed[json_start..]).unwrap_or_else(|err| {
+            panic!(
+                "devcon output is not valid JSON: {err}\nStdout:\n{}\nStderr:\n{}",
+                self.stdout, self.stderr
+            )
+        })
+    }
+
+    /// Extract the `container_id` field from JSON stdout.
+    #[track_caller]
+    pub fn container_id(&self) -> String {
+        let v = self.json();
+        v["container_id"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!(
+                    "JSON output does not contain container_id.\nStdout:\n{}\nStderr:\n{}",
+                    self.stdout, self.stderr
+                )
+            })
+            .to_string()
+    }
+}
+
+// ─── DevconRun ────────────────────────────────────────────────────────────────
+
+/// Runs `devcon` subcommands against a workspace directory.
+///
+/// ```ignore
+/// let out = DevconRun::build(workspace.path(), &config);
+/// out.assert_success();
+/// ```
+pub struct DevconRun;
+
+impl DevconRun {
+    fn run(args: &[&str]) -> DevconOutput {
+        use assert_cmd::cargo::cargo_bin_cmd;
+        let mut cmd = cargo_bin_cmd!("devcon");
+        for a in args {
+            cmd.arg(a);
+        }
+        let output = cmd.output().expect("Failed to spawn devcon");
+        DevconOutput {
+            status: output.status,
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }
+    }
+
+    /// Run `devcon build <workspace>` with the given config.
+    pub fn build(workspace: &std::path::Path, config: &TestConfig) -> DevconOutput {
+        Self::run(&[
+            "--config",
+            config.path.to_str().unwrap(),
+            "build",
+            workspace.to_str().unwrap(),
+        ])
+    }
+
+    /// Run `devcon up --output json <workspace>` with the given config.
+    pub fn up(workspace: &std::path::Path, config: &TestConfig) -> DevconOutput {
+        Self::run(&[
+            "--config",
+            config.path.to_str().unwrap(),
+            "--output",
+            "json",
+            "up",
+            workspace.to_str().unwrap(),
+        ])
+    }
+
+    /// Run `devcon up --output json --force-rebuild <workspace>`.
+    pub fn up_force_rebuild(workspace: &std::path::Path, config: &TestConfig) -> DevconOutput {
+        Self::run(&[
+            "--config",
+            config.path.to_str().unwrap(),
+            "--output",
+            "json",
+            "up",
+            "--force-rebuild",
+            workspace.to_str().unwrap(),
+        ])
+    }
+
+    /// Run `devcon up --output json -ddddd <workspace>` (verbose, for Dockerfile tests).
+    pub fn up_verbose(workspace: &std::path::Path, config: &TestConfig) -> DevconOutput {
+        Self::run(&[
+            "--config",
+            config.path.to_str().unwrap(),
+            "--output",
+            "json",
+            "-ddddd",
+            "up",
+            workspace.to_str().unwrap(),
+        ])
+    }
+
+    /// Run `devcon start --output json <workspace>`.
+    pub fn start(workspace: &std::path::Path, config: &TestConfig) -> DevconOutput {
+        Self::run(&[
+            "--config",
+            config.path.to_str().unwrap(),
+            "--output",
+            "json",
+            "start",
+            workspace.to_str().unwrap(),
+        ])
+    }
+
+    /// Run `devcon ssh connect --proxy <workspace>`.
+    pub fn ssh_proxy(workspace: &std::path::Path, config: &TestConfig) -> DevconOutput {
+        Self::run(&[
+            "--config",
+            config.path.to_str().unwrap(),
+            "ssh",
+            "connect",
+            workspace.to_str().unwrap(),
+            "--proxy",
+        ])
+    }
+}
+
+// ─── ContainerHandle ─────────────────────────────────────────────────────────
+
+/// A handle to a running container, returned from `DevconRun::up`.
+pub struct ContainerHandle {
+    pub id: String,
+    runtime: Runtime,
+}
+
+impl ContainerHandle {
+    pub fn new(id: impl Into<String>, runtime: Runtime) -> Self {
+        ContainerHandle {
+            id: id.into(),
+            runtime,
+        }
+    }
+
+    /// Execute a command inside the container.
+    pub fn exec(&self, cmd: &[&str]) -> Result<String, String> {
+        exec_in_container(self.runtime, &self.id, cmd)
+    }
+
+    /// Assert that a command succeeds and its stdout contains `expected`.
+    #[track_caller]
+    pub fn assert_exec_contains(&self, cmd: &[&str], expected: &str) {
+        let out = self
+            .exec(cmd)
+            .unwrap_or_else(|e| panic!("exec {:?} failed: {e}", cmd));
+        assert!(
+            out.contains(expected),
+            "exec {:?} output did not contain {expected:?}.\nGot: {out}",
+            cmd
+        );
+    }
+
+    /// Assert that a file path exists inside the container.
+    #[track_caller]
+    pub fn assert_file_exists(&self, path: &str) {
+        self.exec(&["test", "-f", path])
+            .unwrap_or_else(|_| panic!("Expected file {path:?} to exist in container {}", self.id));
+    }
+
+    /// Assert that an environment variable has the expected value.
+    #[track_caller]
+    pub fn assert_env(&self, var: &str, expected: &str) {
+        let out = self
+            .exec(&["printenv", var])
+            .unwrap_or_else(|e| panic!("printenv {var} failed: {e}"));
+        let actual = out.trim();
+        assert_eq!(
+            actual, expected,
+            "Expected {var}={expected:?} but got {actual:?}"
+        );
+    }
 }
 
 #[cfg(test)]
