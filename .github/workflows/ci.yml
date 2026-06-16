@@ -127,10 +127,11 @@ jobs:
             runtime: docker
             timeout: 30
             protoc: action
-          - os: macos-15
-            runtime: container
-            timeout: 60
-            protoc: brew
+          ## Container virtualization not possible under github runners
+          # - os: macos-15
+          #   runtime: container
+          #   timeout: 60
+          #   protoc: brew
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
