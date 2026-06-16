@@ -734,13 +734,14 @@ pub fn handle_up_command(
 /// ```
 pub fn handle_serve_command(
     port: u16,
+    pid_file: Option<PathBuf>,
     config_path: Option<PathBuf>,
     output: OutputFormat,
 ) -> Result<()> {
     let config = Config::load(config_path)?;
     trace!("Config loaded {:?}", config);
 
-    let pid_path = get_pid_file_path();
+    let pid_path = pid_file.unwrap_or_else(get_pid_file_path);
     let mut pid_lock = Pidlock::new_validated(&pid_path)
         .map_err(|e| Error::runtime(format!("Failed to create PID file: {e}")))?;
     pid_lock.acquire().map_err(|e| {

@@ -186,6 +186,9 @@ enum Commands {
             default_value = "15000"
         )]
         port: u16,
+        /// Override the PID file path (defaults to the XDG runtime dir)
+        #[arg(long, help = "Path to the PID lock file")]
+        pid_file: Option<std::path::PathBuf>,
     },
 }
 
@@ -288,8 +291,8 @@ fn main() {
                     output,
                 )?;
             }
-            Commands::Serve { port } => {
-                handle_serve_command(*port, config_path, output)?;
+            Commands::Serve { port, pid_file } => {
+                handle_serve_command(*port, pid_file.clone(), config_path, output)?;
             }
         }
         Ok(())
