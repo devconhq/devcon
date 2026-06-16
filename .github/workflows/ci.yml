@@ -184,21 +184,6 @@ jobs:
           RUST_BACKTRACE: full
           CONTAINER_RUNTIME: ${{ matrix.runtime }}
 
-      - name: Cleanup test artifacts (Docker)
-        if: always() && matrix.runtime == 'docker'
-        run: |
-          docker ps -a --filter "name=devcon-test" -q | xargs -r docker rm -f || true
-          docker images --filter "reference=devcon-test-*" -q | xargs -r docker rmi -f || true
-        shell: bash
-
-      - name: Cleanup test artifacts (container)
-        if: always() && matrix.runtime == 'container'
-        run: |
-          container container list --all --format json 2>/dev/null \
-            | python3 -c "import sys,json; [print(c['name']) for c in json.load(sys.stdin) if 'devcon-test' in c.get('name','')]" \
-            | xargs -I{} container container rm -f {} 2>/dev/null || true
-        shell: bash
-
   build:
     name: Build
     runs-on: ${{ matrix.os }}
