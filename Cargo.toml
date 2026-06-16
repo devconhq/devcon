@@ -39,6 +39,7 @@ daemonize = "0.5"
 pidlock = "0.2.2"
 tokio = "1.52.3"
 openport = "0.3.0"
+serial_test = "3"
 devcon-proto = { path = "proto" }
 schema = { path = "schema" }
 
@@ -94,3 +95,4 @@ assert_cmd.workspace = true
 tempfile.workspace = true
 serde_json.workspace = true
 openport.workspace = true
+serial_test.workspace = true

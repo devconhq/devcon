@@ -351,7 +351,11 @@ pub fn exec_in_container(
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     } else {
-        Err(String::from_utf8_lossy(&output.stderr).to_string())
+        Err(format!(
+            "Failed to execute command:\nStdErr:{}\nStdOut:{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        ))
     }
 }
 
@@ -1072,11 +1076,19 @@ impl ContainerHandle {
         );
     }
 
-    /// Assert that a file path exists inside the container.
+    /// Assert that a regular file exists inside the container.
     #[track_caller]
     pub fn assert_file_exists(&self, path: &str) {
         self.exec(&["test", "-f", path])
             .unwrap_or_else(|_| panic!("Expected file {path:?} to exist in container {}", self.id));
+    }
+
+    /// Assert that a Unix domain socket exists at `path` inside the container.
+    #[track_caller]
+    pub fn assert_socket_exists(&self, path: &str) {
+        self.exec(&["test", "-S", path]).unwrap_or_else(|_| {
+            panic!("Expected socket {path:?} to exist in container {}", self.id)
+        });
     }
 
     /// Assert that an environment variable has the expected value.
