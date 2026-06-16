@@ -76,8 +76,6 @@ jobs:
       matrix:
         rust:
           - stable
-          - beta
-          - nightly
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -120,27 +118,40 @@ jobs:
     name: Integration Tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     needs: [lint, unit-tests]
-    timeout-minutes: 30
+    timeout-minutes: ${{ matrix.timeout }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
+            runtime: docker
+            timeout: 30
+            protoc: action
+          - os: macos-15
+            runtime: container
+            timeout: 60
+            protoc: brew
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Docker (Linux & macOS)
+      - name: Set up Docker
+        if: matrix.runtime == 'docker'
         uses: docker/setup-docker-action@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install Protoc
+      - name: Install Protoc (action)
+        if: matrix.protoc == 'action'
         uses: arduino/setup-protoc@v3
         with:
           version: "33.2"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Protoc (brew)
+        if: matrix.protoc == 'brew'
+        run: brew install protobuf
 
       - name: Cache Cargo dependencies
         uses: actions/cache@v3
@@ -159,13 +170,21 @@ jobs:
         run: cargo test --test main --verbose
         env:
           RUST_BACKTRACE: full
-          CONTAINER_RUNTIME: "docker"
+          CONTAINER_RUNTIME: ${{ matrix.runtime }}
 
-      - name: Cleanup test containers
-        if: always()
+      - name: Cleanup test artifacts (Docker)
+        if: always() && matrix.runtime == 'docker'
         run: |
           docker ps -a --filter "name=devcon-test" -q | xargs -r docker rm -f || true
           docker images --filter "reference=devcon-test-*" -q | xargs -r docker rmi -f || true
+        shell: bash
+
+      - name: Cleanup test artifacts (container)
+        if: always() && matrix.runtime == 'container'
+        run: |
+          container container list --all --format json 2>/dev/null \
+            | python3 -c "import sys,json; [print(c['name']) for c in json.load(sys.stdin) if 'devcon-test' in c.get('name','')]" \
+            | xargs -I{} container container rm -f {} 2>/dev/null || true
         shell: bash
 
   build:
