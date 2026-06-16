@@ -545,7 +545,14 @@ impl Config {
     }
 
     /// Checks if OpenSSH setup should be skipped for the in-container agent.
+    ///
+    /// Returns `true` when either `agents.skipSshSetup` is explicitly set **or**
+    /// `agents.disable` is `true` — there is no point preparing SSH infrastructure
+    /// when the agent is not going to run.
     pub fn should_skip_agent_ssh_setup(&self) -> bool {
+        if self.is_agent_disabled() {
+            return true;
+        }
         self.agents
             .as_ref()
             .and_then(|a| a.skip_ssh_setup)
@@ -656,5 +663,32 @@ envVariables:
 
         assert_eq!(config.get_agent_ssh_port(), 2222);
         assert!(config.should_skip_agent_ssh_setup());
+    }
+
+    #[test]
+    fn test_should_skip_ssh_setup_when_agents_disabled() {
+        // agents.disable=true must imply skip_ssh_setup even when skip_ssh_setup is not set.
+        let config = Config {
+            agents: Some(AgentConfig {
+                disable: Some(true),
+                skip_ssh_setup: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(config.should_skip_agent_ssh_setup());
+    }
+
+    #[test]
+    fn test_should_not_skip_ssh_setup_when_agents_enabled_and_flag_unset() {
+        let config = Config {
+            agents: Some(AgentConfig {
+                disable: Some(false),
+                skip_ssh_setup: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!config.should_skip_agent_ssh_setup());
     }
 }

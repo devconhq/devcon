@@ -329,13 +329,22 @@ pub fn exec_in_container(
 ) -> Result<String, String> {
     let cmd = runtime_cmd(runtime);
     let mut cmd_builder = Command::new(cmd);
-    cmd_builder.arg("exec").arg(container_name);
+    // Pass --workdir / so that docker exec does not inherit the test process's
+    // CWD (a host tempdir) as the container working directory, which would
+    // trigger "current working directory is outside of container mount namespace
+    // root" on newer containerd versions.
+    cmd_builder
+        .arg("exec")
+        .arg("--workdir")
+        .arg("/")
+        .arg(container_name);
 
     for arg in command {
         cmd_builder.arg(arg);
     }
 
     let output = cmd_builder
+        .current_dir("/")
         .output()
         .map_err(|e| format!("Failed to execute command: {}", e))?;
 
