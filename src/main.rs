@@ -189,7 +189,7 @@ enum Commands {
     },
 }
 
-fn main() -> devcon::error::Result<()> {
+fn main() {
     let indicatif_layer = IndicatifLayer::new();
     let cli = Cli::parse();
     let level = match cli.debug {
@@ -222,75 +222,92 @@ fn main() -> devcon::error::Result<()> {
     let config_path = cli.config.clone();
     let output = cli.output.clone();
 
-    match &cli.command {
-        Commands::Build {
-            path,
-            build_path,
-            frozen_lockfile,
-        } => {
-            handle_build_command(
-                path.clone().unwrap_or(PathBuf::from(".").to_path_buf()),
-                build_path.clone(),
-                config_path,
-                output,
-                *frozen_lockfile,
-            )?;
-        }
-        Commands::Start { path } => {
-            handle_start_command(
-                path.clone().unwrap_or(PathBuf::from(".").to_path_buf()),
-                config_path,
-                output,
-            )?;
-        }
-        Commands::Up {
-            path,
-            build_path,
-            force_rebuild,
-            frozen_lockfile,
-        } => {
-            handle_up_command(
-                path.clone().unwrap_or(PathBuf::from(".").to_path_buf()),
-                build_path.clone(),
-                config_path,
-                output,
-                *force_rebuild,
-                *frozen_lockfile,
-            )?;
-        }
-        Commands::Shell { path, env } => {
-            handle_shell_command(
-                path.clone().unwrap_or(PathBuf::from(".").to_path_buf()),
-                env,
-                config_path,
-            )?;
-        }
-        Commands::Ssh { action } => match action {
-            SshAction::Connect { path, proxy } => {
-                handle_ssh_command(
+    let result: devcon::error::Result<()> = (|| {
+        match &cli.command {
+            Commands::Build {
+                path,
+                build_path,
+                frozen_lockfile,
+            } => {
+                handle_build_command(
                     path.clone().unwrap_or(PathBuf::from(".").to_path_buf()),
+                    build_path.clone(),
                     config_path,
-                    *proxy,
+                    output,
+                    *frozen_lockfile,
                 )?;
             }
-            SshAction::CreateConfig { path } => {
-                handle_ssh_create_config_command(
+            Commands::Start { path } => {
+                handle_start_command(
                     path.clone().unwrap_or(PathBuf::from(".").to_path_buf()),
+                    config_path,
+                    output,
+                )?;
+            }
+            Commands::Up {
+                path,
+                build_path,
+                force_rebuild,
+                frozen_lockfile,
+            } => {
+                handle_up_command(
+                    path.clone().unwrap_or(PathBuf::from(".").to_path_buf()),
+                    build_path.clone(),
+                    config_path,
+                    output,
+                    *force_rebuild,
+                    *frozen_lockfile,
+                )?;
+            }
+            Commands::Shell { path, env } => {
+                handle_shell_command(
+                    path.clone().unwrap_or(PathBuf::from(".").to_path_buf()),
+                    env,
                     config_path,
                 )?;
             }
-        },
-        Commands::Info { path } => {
-            handle_info_command(
-                path.clone().unwrap_or(PathBuf::from(".").to_path_buf()),
-                config_path,
-                output,
-            )?;
+            Commands::Ssh { action } => match action {
+                SshAction::Connect { path, proxy } => {
+                    handle_ssh_command(
+                        path.clone().unwrap_or(PathBuf::from(".").to_path_buf()),
+                        config_path,
+                        *proxy,
+                    )?;
+                }
+                SshAction::CreateConfig { path } => {
+                    handle_ssh_create_config_command(
+                        path.clone().unwrap_or(PathBuf::from(".").to_path_buf()),
+                        config_path,
+                    )?;
+                }
+            },
+            Commands::Info { path } => {
+                handle_info_command(
+                    path.clone().unwrap_or(PathBuf::from(".").to_path_buf()),
+                    config_path,
+                    output,
+                )?;
+            }
+            Commands::Serve { port } => {
+                handle_serve_command(*port, config_path, output)?;
+            }
         }
-        Commands::Serve { port } => {
-            handle_serve_command(*port, config_path, output)?;
-        }
-    }
+        Ok(())
+    })();
 
-    Ok(())
+    if let Err(err) = result {
+        if cli.output == OutputFormat::Json {
+            // Emit a machine-readable error on stdout so callers that requested
+            // JSON output always receive valid JSON regardless of whether the
+            // command succeeded or failed.
+            println!(
+                "{{\"error\":{}}}",
+                serde_json::to_string(&err.to_string())
+                    .unwrap_or_else(|_| "\"unknown error\"".to_string())
+            );
+        } else {
+            eprintln!("Error: {err}");
+        }
+        std::process::exit(1);
+    }
 }

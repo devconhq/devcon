@@ -347,7 +347,7 @@ fn test_feature_dotnet_installs_dotnet() {
         )
         .build();
 
-    let out = DevconRun::up(workspace.path(), &config);
+    let out = DevconRun::up_verbose(workspace.path(), &config);
     out.assert_success();
     ContainerHandle::new(out.container_id(), runtime)
         .assert_exec_contains(&["sh", "-lc", "dotnet --version"], ".");
