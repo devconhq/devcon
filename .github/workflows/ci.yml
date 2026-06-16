@@ -157,7 +157,13 @@ jobs:
         if: matrix.runtime == 'container'
         run: |
           brew install container
-          container system start
+          brew services start container
+          # Wait until the API server is accepting connections (up to 30 s).
+          for i in $(seq 1 30); do
+            container info > /dev/null 2>&1 && break
+            sleep 1
+          done
+          container info
 
       - name: Cache Cargo dependencies
         uses: actions/cache@v3
