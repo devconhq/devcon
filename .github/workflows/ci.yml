@@ -153,6 +153,12 @@ jobs:
         if: matrix.protoc == 'brew'
         run: brew install protobuf
 
+      - name: Install container runtime
+        if: matrix.runtime == 'container'
+        run: |
+          brew install container
+          container system start
+
       - name: Cache Cargo dependencies
         uses: actions/cache@v3
         with:
