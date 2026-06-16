@@ -37,6 +37,13 @@ pub fn is_runtime_available(runtime: Runtime) -> bool {
         .unwrap_or(false)
 }
 
+/// Returns true when the caller explicitly set `CONTAINER_RUNTIME` in the
+/// environment.  When the env var is present, tests must not silently skip on
+/// an unavailable runtime — they should fail loudly so CI catches misconfigurations.
+pub fn is_runtime_explicitly_requested() -> bool {
+    std::env::var("CONTAINER_RUNTIME").is_ok()
+}
+
 /// Create an empty test config file in a temp directory
 /// Returns the path to the config file
 pub fn create_test_config() -> std::path::PathBuf {
@@ -441,6 +448,10 @@ pub fn generate_test_image_name(test_name: &str) -> String {
 
 /// Skip the current test when the given runtime is not available.
 ///
+/// If `CONTAINER_RUNTIME` was explicitly set in the environment the test
+/// **panics** instead of skipping, so CI immediately surfaces a misconfigured
+/// or not-started runtime rather than reporting a false-green "0 tests run".
+///
 /// ```ignore
 /// skip_if_unavailable!(get_runtime());
 /// ```
@@ -449,6 +460,13 @@ macro_rules! skip_if_unavailable {
     ($runtime:expr) => {
         let runtime = $runtime;
         if !$crate::test_utils::is_runtime_available(runtime) {
+            if $crate::test_utils::is_runtime_explicitly_requested() {
+                panic!(
+                    "{:?} runtime was requested via CONTAINER_RUNTIME but is not available. \
+                     Ensure the runtime daemon is running before executing integration tests.",
+                    runtime
+                );
+            }
             println!("Skipping test: {:?} runtime not available", runtime);
             return;
         }
