@@ -93,3 +93,4 @@ openport.workspace = true
 assert_cmd.workspace = true
 tempfile.workspace = true
 serde_json.workspace = true
+openport.workspace = true

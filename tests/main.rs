@@ -489,3 +489,153 @@ fn test_build_container_runtime_with_features() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Serve / agent / dotfiles / local feature / env var tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `devcon serve` accepts connections from the in-container agent.
+///
+/// Starts a background serve process on a dynamic port, injects that port via
+/// `containerEnv`, runs `devcon up`, then confirms the `devcon-agent` process
+/// is running inside the container.
+#[test]
+fn test_serve_connection_works() {
+    let runtime = get_runtime();
+    skip_if_unavailable!(runtime);
+    cleanup_test_artifacts(runtime, "test-serve-connection");
+
+    let config = TestConfig::agents_enabled();
+    let (_serve, port) = DevconRun::serve_in_background(&config);
+
+    let workspace = DevcontainerBuilder::new("test-serve-connection")
+        .container_env("DEVCON_CONTROL_PORT", port.to_string())
+        .build();
+
+    let out = DevconRun::up(workspace.path(), &config);
+    out.assert_success();
+
+    ContainerHandle::new(out.container_id(), runtime).assert_exec_contains(
+        &["sh", "-c", "ps -ef | grep '[d]evcon-agent'"],
+        "devcon-agent",
+    );
+}
+
+/// SSH agent socket is forwarded into the container when `agentForwarding.sshEnabled` is set.
+///
+/// Skips automatically when no SSH agent is running on the host.
+#[test]
+fn test_ssh_agent_forwarding() {
+    let runtime = get_runtime();
+    skip_if_unavailable!(runtime);
+    skip_if_no_ssh_agent!();
+    cleanup_test_artifacts(runtime, "test-ssh-agent");
+
+    let config = TestConfig::with_ssh_forwarding();
+    let (_serve, port) = DevconRun::serve_in_background(&config);
+
+    let workspace = DevcontainerBuilder::new("test-ssh-agent")
+        .container_env("DEVCON_CONTROL_PORT", port.to_string())
+        .build();
+
+    let out = DevconRun::up(workspace.path(), &config);
+    out.assert_success();
+
+    ContainerHandle::new(out.container_id(), runtime).assert_env_set("SSH_AUTH_SOCK");
+}
+
+/// GPG agent socket is forwarded into the container when `agentForwarding.gpgEnabled` is set.
+///
+/// Skips automatically when no GPG agent is running on the host.
+#[test]
+fn test_gpg_agent_forwarding() {
+    let runtime = get_runtime();
+    skip_if_unavailable!(runtime);
+    skip_if_no_gpg_agent!();
+    cleanup_test_artifacts(runtime, "test-gpg-agent");
+
+    let config = TestConfig::with_gpg_forwarding();
+    let (_serve, port) = DevconRun::serve_in_background(&config);
+
+    let workspace = DevcontainerBuilder::new("test-gpg-agent")
+        .container_env("DEVCON_CONTROL_PORT", port.to_string())
+        .build();
+
+    let out = DevconRun::up(workspace.path(), &config);
+    out.assert_success();
+
+    ContainerHandle::new(out.container_id(), runtime).assert_env_set("GPG_AGENT_INFO");
+}
+
+/// `dotfilesRepository` in config causes the repo to be cloned into `~/.dotfiles`
+/// inside the container during the build.
+#[test]
+fn test_dotfiles_repo_clones() {
+    let runtime = get_runtime();
+    skip_if_unavailable!(runtime);
+    cleanup_test_artifacts(runtime, "test-dotfiles");
+
+    let config = TestConfig::with_dotfiles("https://github.com/octocat/Hello-World");
+    let workspace = DevcontainerBuilder::new("test-dotfiles").build();
+
+    let out = DevconRun::up(workspace.path(), &config);
+    out.assert_success();
+
+    // Confirm the repo was cloned — a valid git clone always has .git/config.
+    ContainerHandle::new(out.container_id(), runtime)
+        .assert_exec_contains(&["sh", "-lc", "ls ~/.dotfiles/.git"], "config");
+}
+
+/// A feature referenced by a local path (`"./dir"`) is installed into the container.
+#[test]
+fn test_local_feature_installs() {
+    let runtime = get_runtime();
+    skip_if_unavailable!(runtime);
+    cleanup_test_artifacts(runtime, "test-local-feature");
+
+    let config = TestConfig::agents_disabled();
+    let workspace = DevcontainerBuilder::new("test-local-feature")
+        .local_feature(
+            "hello-feature",
+            "#!/bin/sh\nset -e\ntouch /tmp/local-feature-installed\n",
+            &[],
+        )
+        .build();
+
+    let out = DevconRun::up(workspace.path(), &config);
+    out.assert_success();
+
+    ContainerHandle::new(out.container_id(), runtime)
+        .assert_file_exists("/tmp/local-feature-installed");
+}
+
+/// `containerEnv` variables are available in every exec context;
+/// `remoteEnv` variables are available in login shells and recorded in
+/// `~/.ssh/environment` for SSH sessions (requires agents to be enabled).
+#[test]
+fn test_env_variables_in_shell() {
+    let runtime = get_runtime();
+    skip_if_unavailable!(runtime);
+    cleanup_test_artifacts(runtime, "test-env-vars");
+
+    let config = TestConfig::agents_enabled();
+    let workspace = DevcontainerBuilder::new("test-env-vars")
+        .container_env("DEVCON_CONTAINER_VAR", "container-value")
+        .remote_env("DEVCON_REMOTE_VAR", "remote-value")
+        .build();
+
+    let out = DevconRun::up(workspace.path(), &config);
+    out.assert_success();
+
+    let container = ContainerHandle::new(out.container_id(), runtime);
+
+    // containerEnv is visible in every exec context.
+    container.assert_env("DEVCON_CONTAINER_VAR", "container-value");
+
+    // remoteEnv is injected into login shells via ~/.profile.
+    container.assert_exec_contains(&["sh", "-lc", "printenv DEVCON_REMOTE_VAR"], "remote-value");
+
+    // devcon writes a ~/.ssh/environment file when SSH setup is enabled so that
+    // env vars reach SSH sessions — confirm the file exists.
+    container.assert_file_exists("/home/vscode/.ssh/environment");
+}
