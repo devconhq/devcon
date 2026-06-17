@@ -181,6 +181,20 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      - name: Start GPG agent and create test key
+        run: |
+          gpg --batch --gen-key <<'EOF'
+          %no-protection
+          Key-Type: EdDSA
+          Key-Curve: ed25519
+          Name-Real: CI Test
+          Name-Email: ci@test.local
+          Expire-Date: 0
+          %commit
+          EOF
+          # Ensure the agent socket is present
+          gpgconf --list-dir agent-socket
+
       - name: Run integration tests
         run: cargo test --test main --verbose
         env:
