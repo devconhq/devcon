@@ -30,8 +30,14 @@ fn test_build_and_verify_image() {
     skip_if_unavailable!(runtime);
     let config = TestConfig::agents_disabled();
     let workspace = DevcontainerBuilder::new("test-verify").build();
-    DevconRun::build(workspace.path(), &config).assert_success();
-    assert!(verify_image_exists(runtime, "devcon-test-verify:latest"));
+    let out = DevconRun::build(workspace.path(), &config);
+    out.assert_success();
+    assert!(
+        verify_image_exists(runtime, "devcon-test-verify:latest"),
+        "Image devcon-test-verify:latest does not exist after build (Stdout: {}, Stderr: {})",
+        out.stdout,
+        out.stderr
+    );
 }
 
 #[test]
