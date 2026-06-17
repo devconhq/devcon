@@ -517,13 +517,15 @@ macro_rules! skip_if_no_ssh_agent {
 #[macro_export]
 macro_rules! skip_if_no_gpg_agent {
     () => {
-        let gpg_ok = std::process::Command::new("gpgconf")
+        let gpg_socket_exists = std::process::Command::new("gpgconf")
             .args(["--list-dir", "agent-socket"])
             .output()
-            .map(|o| o.status.success())
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|path| std::path::Path::new(path.trim()).exists())
             .unwrap_or(false);
-        if !gpg_ok {
-            println!("Skipping test: no GPG agent available (gpgconf)");
+        if !gpg_socket_exists {
+            println!("Skipping test: no GPG agent socket found");
             return;
         }
     };
