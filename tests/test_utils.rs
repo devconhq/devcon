@@ -253,7 +253,7 @@ pub fn cleanup_test_artifacts(runtime: Runtime, project_name: &str) {
         Runtime::Container => {
             // Container: list all containers and filter by name prefix
             let ls_output = Command::new(cmd)
-                .args(["container", "list", "--all", "--format", "json"])
+                .args(["list", "--all", "--format", "json"])
                 .output();
             if let Ok(out) = ls_output
                 && let Ok(entries) = serde_json::from_slice::<Vec<serde_json::Value>>(&out.stdout)
@@ -262,9 +262,7 @@ pub fn cleanup_test_artifacts(runtime: Runtime, project_name: &str) {
                     let name = entry["name"].as_str().unwrap_or("");
                     // devcon container name is devcon.<project_name>
                     if name == format!("devcon.{}", project_name) {
-                        let _ = Command::new(cmd)
-                            .args(["container", "rm", "-f", name])
-                            .output();
+                        let _ = Command::new(cmd).args(["rm", "-f", name]).output();
                     }
                 }
             }
