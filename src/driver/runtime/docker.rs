@@ -389,6 +389,13 @@ impl ContainerRuntime for DockerRuntime {
 
         cmd.arg("-v").arg(volume_mount).arg("--label").arg(label);
 
+        // On Linux, Docker Engine does not resolve `host.docker.internal` by
+        // default (unlike Docker Desktop on macOS/Windows).  Inject the special
+        // `host-gateway` alias so the in-container agent can reach the host
+        // control server at the same hostname regardless of platform.
+        #[cfg(target_os = "linux")]
+        cmd.arg("--add-host=host.docker.internal:host-gateway");
+
         // Add privileged flag if required
         if runtime_parameters.requires_privileged {
             cmd.arg("--privileged");
