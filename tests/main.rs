@@ -487,7 +487,16 @@ fn test_serve_connection_works() {
     let out = DevconRun::up(workspace.path(), &config);
     out.assert_success();
 
-    ContainerHandle::new(out.container_id(), runtime).assert_exec_contains(
+    let container = ContainerHandle::new(out.container_id(), runtime);
+
+    // Debug: print all env vars visible inside the container so CI logs show
+    // whether DEVCON_CONTROL_PORT and DEVCON_CONTROL_HOST were injected.
+    match container.exec(&["printenv"]) {
+        Ok(env_output) => eprintln!("[debug] container env:\n{}", env_output),
+        Err(e) => eprintln!("[debug] printenv failed: {}", e),
+    }
+
+    container.assert_exec_contains(
         &["sh", "-lc", "ps -ef | grep '[d]evcon-agent'"],
         "devcon-agent",
     );

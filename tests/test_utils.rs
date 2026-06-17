@@ -1026,6 +1026,7 @@ impl DevconRun {
 
         let bin_path = assert_cmd::cargo::cargo_bin("devcon");
         let child = std::process::Command::new(&bin_path)
+            .arg("-ddd")
             .arg("--config")
             .arg(config.path.to_str().unwrap())
             .arg("serve")
@@ -1033,7 +1034,7 @@ impl DevconRun {
             .arg(port.to_string())
             .arg("--pid-file")
             .arg(&pid_file)
-            .stderr(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
             .spawn()
             .expect("Failed to spawn devcon serve");
 
