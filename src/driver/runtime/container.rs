@@ -565,11 +565,13 @@ impl ContainerCliRuntime {
         &self,
         all: bool,
     ) -> Result<Vec<(String, String, Box<dyn super::ContainerHandle>)>> {
-        let output = Command::new("container")
-            .arg("list")
-            .arg("--format")
-            .arg("json")
-            .output()?;
+        let mut cmd = Command::new("container");
+        cmd.arg("list");
+        if all {
+            cmd.arg("--all");
+        }
+        cmd.arg("--format").arg("json");
+        let output = cmd.output()?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let containers: Vec<serde_json::Value> = serde_json::from_str(&stdout)?;

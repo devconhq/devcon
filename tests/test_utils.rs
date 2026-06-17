@@ -416,20 +416,60 @@ pub fn get_running_container_id(runtime: Runtime, project_name: &str) -> Option<
 #[allow(dead_code)]
 pub fn get_image_id(runtime: Runtime, image_tag: &str) -> Option<String> {
     let cmd = runtime_cmd(runtime);
-    let output = Command::new(cmd)
-        .arg("image")
-        .arg("inspect")
-        .arg(image_tag)
-        .arg("--format")
-        .arg("{{.Id}}")
-        .output()
-        .ok()?;
-
-    if output.status.success() {
-        let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if id.is_empty() { None } else { Some(id) }
-    } else {
-        None
+    match runtime {
+        Runtime::Docker => {
+            let output = Command::new(cmd)
+                .arg("image")
+                .arg("inspect")
+                .arg(image_tag)
+                .arg("--format")
+                .arg("{{.Id}}")
+                .output()
+                .ok()?;
+            if output.status.success() {
+                let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if id.is_empty() { None } else { Some(id) }
+            } else {
+                None
+            }
+        }
+        Runtime::Container => {
+            // The Apple `container` CLI does not support --format templates.
+            // Parse the raw JSON response instead.
+            let output = Command::new(cmd)
+                .arg("image")
+                .arg("inspect")
+                .arg(image_tag)
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+            // Response is an array; take the first entry.
+            let entry = match &parsed {
+                serde_json::Value::Array(items) => items.first()?,
+                obj @ serde_json::Value::Object(_) => obj,
+                _ => return None,
+            };
+            // Try top-level "id" first, then configuration.descriptor.digest.
+            if let Some(id) = entry
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return Some(id.to_string());
+            }
+            entry
+                .get("configuration")
+                .and_then(|v| v.get("descriptor"))
+                .and_then(|v| v.get("digest"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+        }
     }
 }
 
@@ -544,9 +584,16 @@ pub struct TestConfig {
 
 impl TestConfig {
     fn from_yaml(yaml: &str) -> Self {
+        let runtime_line = match std::env::var("CONTAINER_RUNTIME").as_deref() {
+            Ok("container") => "runtime: container\n",
+            Ok("docker") => "runtime: docker\n",
+            _ => "",
+        };
+        let full_yaml = format!("{runtime_line}{yaml}");
+
         let dir = tempfile::tempdir().expect("Failed to create temp dir for TestConfig");
         let path = dir.path().join("test-config.yaml");
-        std::fs::write(&path, yaml).expect("Failed to write test config");
+        std::fs::write(&path, &full_yaml).expect("Failed to write test config");
         TestConfig { _dir: dir, path }
     }
 
@@ -730,8 +777,26 @@ impl DevcontainerBuilder {
     }
 
     /// Write the workspace to a `TempDir` and return the handle.
+    ///
+    /// The workspace is created under the XDG cache directory
+    /// (`$XDG_CACHE_HOME/devcon/test-workspaces` or `~/.cache/devcon/test-workspaces`) so
+    /// that container runtimes (e.g. the macOS `container` tool) which restrict access to
+    /// `/tmp` can still reach the build context.
     pub fn build(mut self) -> TempDir {
-        let dir = tempfile::tempdir().expect("Failed to create temp workspace dir");
+        let cache_base = std::env::var("XDG_CACHE_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::env::var("HOME")
+                    .map(|h| std::path::PathBuf::from(h).join(".cache"))
+                    .unwrap_or_else(|_| std::env::temp_dir())
+            })
+            .join("devcon")
+            .join("test-workspaces");
+        std::fs::create_dir_all(&cache_base)
+            .expect("Failed to create XDG cache dir for test workspaces");
+        let dir = tempfile::Builder::new()
+            .tempdir_in(&cache_base)
+            .expect("Failed to create temp workspace dir");
         let dc_path = dir.path().join(".devcontainer");
         std::fs::create_dir_all(&dc_path).expect("Failed to create .devcontainer dir");
 
@@ -943,6 +1008,7 @@ impl DevconRun {
         Self::run(&[
             "--config",
             config.path.to_str().unwrap(),
+            "-ddddd",
             "build",
             workspace.to_str().unwrap(),
         ])
@@ -1025,7 +1091,7 @@ impl DevconRun {
         let pid_file = pid_dir.path().join("serve.pid");
 
         let bin_path = assert_cmd::cargo::cargo_bin("devcon");
-        let child = std::process::Command::new(&bin_path)
+        let mut child = std::process::Command::new(&bin_path)
             .arg("-ddd")
             .arg("--config")
             .arg(config.path.to_str().unwrap())
@@ -1034,9 +1100,26 @@ impl DevconRun {
             .arg(port.to_string())
             .arg("--pid-file")
             .arg(&pid_file)
-            .stderr(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("Failed to spawn devcon serve");
+
+        // Drain stderr line-by-line into a shared buffer on a background thread.
+        // Nothing is printed unless the server fails to start within the deadline.
+        let stderr_pipe = child.stderr.take().unwrap();
+        let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let stderr_buf_writer = stderr_buf.clone();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(stderr_pipe)
+                .lines()
+                .map_while(Result::ok)
+            {
+                let mut buf = stderr_buf_writer.lock().unwrap();
+                buf.push_str(&line);
+                buf.push('\n');
+            }
+        });
 
         let guard = ServeGuard {
             child,
@@ -1050,7 +1133,11 @@ impl DevconRun {
                 break;
             }
             if std::time::Instant::now() >= deadline {
-                panic!("devcon serve did not bind to port {} within 3 s", port);
+                let captured = stderr_buf.lock().unwrap().clone();
+                panic!(
+                    "devcon serve did not bind to port {} within 3 s\nStderr:\n{}",
+                    port, captured
+                );
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }

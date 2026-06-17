@@ -67,16 +67,24 @@ pub(crate) struct BuildContext {
 impl BuildContext {
     /// Creates a new build context, optionally rooted at `build_path`.
     ///
-    /// When `build_path` is `None` a system temp directory is used.
-    /// In debug builds the directory is kept on disk (not cleaned up) so
-    /// the generated Dockerfile can be inspected.
+    /// When `build_path` is `None` a directory under the XDG cache home
+    /// (`$XDG_CACHE_HOME/devcon/build` or `~/.cache/devcon/build`) is used
+    /// so that container runtimes that restrict access to `/tmp` (e.g. the
+    /// macOS `container` tool) can still reach the build context.
     pub(crate) fn new(build_path: Option<PathBuf>) -> Result<Self> {
         let temp = match build_path {
             Some(path) => {
                 std::fs::create_dir_all(&path)?;
                 TempDir::new_in(path)?
             }
-            None => TempDir::new()?,
+            None => {
+                let cache_base = dirs::cache_dir()
+                    .unwrap_or_else(std::env::temp_dir)
+                    .join("devcon")
+                    .join("build");
+                std::fs::create_dir_all(&cache_base)?;
+                TempDir::new_in(cache_base)?
+            }
         };
 
         let (dir, temp) = if tracing::event_enabled!(Level::DEBUG) {
