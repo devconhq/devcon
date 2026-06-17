@@ -904,8 +904,19 @@ impl ContainerOrchestrator {
 
             if is_current {
                 info!("Restarting stopped container with latest image");
-                let restarted = self.runtime.start_container(handle.id())?;
-                return Ok(restarted.id().to_string());
+                match self.runtime.start_container(handle.id()) {
+                    Ok(restarted) => return Ok(restarted.id().to_string()),
+                    Err(e) => {
+                        // Some runtimes (e.g. Apple container) can fail to restart a stopped
+                        // container when mount source paths cannot be re-validated (e.g. after
+                        // the virtio-fs share is torn down on stop). Fall back to creating a
+                        // fresh container so the user is not left without a working environment.
+                        debug!(
+                            "Failed to restart stopped container ({}); will create a new one",
+                            e
+                        );
+                    }
+                }
             }
 
             debug!(
