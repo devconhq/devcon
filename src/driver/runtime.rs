@@ -632,6 +632,17 @@ pub trait ContainerRuntime: Send {
     /// Returns an error if the start command fails.
     fn start_container(&self, container_id: &str) -> Result<Box<dyn ContainerHandle>>;
 
+    /// Remove a container by ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `container_id` - The ID of the container to remove
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the remove command fails.
+    fn remove_container(&self, container_id: &str) -> Result<()>;
+
     /// List images.
     ///
     /// # Returns

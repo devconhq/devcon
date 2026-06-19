@@ -907,14 +907,22 @@ impl ContainerOrchestrator {
                 match self.runtime.start_container(handle.id()) {
                     Ok(restarted) => return Ok(restarted.id().to_string()),
                     Err(e) => {
-                        // Some runtimes (e.g. Apple container) can fail to restart a stopped
-                        // container when mount source paths cannot be re-validated (e.g. after
-                        // the virtio-fs share is torn down on stop). Fall back to creating a
-                        // fresh container so the user is not left without a working environment.
-                        debug!(
-                            "Failed to restart stopped container ({}); will create a new one",
+                        // start_container can fail after a host reboot when bind-mount sources
+                        // (e.g. the stable SSH/GPG agent socket) no longer exist at their
+                        // recorded paths.  Remove the stale container so it doesn't accumulate
+                        // across reboots and fall through to create a fresh one.
+                        warn!(
+                            "Failed to restart stopped container (stale mounts after reboot?): {}. \
+                             Removing stale container and creating a new one.",
                             e
                         );
+                        if let Err(rm_err) = self.runtime.remove_container(handle.id()) {
+                            debug!(
+                                "Failed to remove stale container {}: {}",
+                                handle.id(),
+                                rm_err
+                            );
+                        }
                     }
                 }
             }
