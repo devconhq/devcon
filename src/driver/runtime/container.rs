@@ -949,6 +949,22 @@ impl ContainerRuntime for ContainerCliRuntime {
         }))
     }
 
+    fn remove_container(&self, container_id: &str) -> Result<()> {
+        let output = Command::new("container")
+            .arg("delete")
+            .arg(container_id)
+            .output()?;
+
+        if !output.status.success() {
+            return Err(Error::runtime(format!(
+                "container delete failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+
+        Ok(())
+    }
+
     fn images(&self) -> Result<Vec<String>> {
         let output = Command::new("container")
             .arg("image")
