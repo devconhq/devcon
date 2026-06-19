@@ -904,13 +904,39 @@ impl ContainerOrchestrator {
 
             if is_current {
                 info!("Restarting stopped container with latest image");
+
+                // Before attempting to start the container, refresh any agent
+                // socket bridges that may have gone away during a host reboot.
+                // The stable SSH socket is backed by a socat process; if the
+                // host was rebooted the socat is gone and the socket file has
+                // been cleaned up, which causes Docker to reject the bind-mount.
+                // Re-running ensure_stable_ssh_agent_socket respawns socat and
+                // recreates the socket at the same stable path, so the existing
+                // container can be started without removing/recreating it.
+                if let Some(ref agent_fwd) = self.config.agent_forwarding {
+                    if agent_fwd.ssh_enabled.unwrap_or(false) {
+                        let ssh_socket = if let Some(ref override_path) = agent_fwd.ssh_socket_path
+                        {
+                            PathBuf::from(override_path)
+                                .exists()
+                                .then(|| PathBuf::from(override_path))
+                        } else {
+                            detect_ssh_socket()
+                        };
+                        if let Some(socket) = ssh_socket {
+                            debug!("Refreshing stable SSH agent socket before container restart");
+                            ensure_stable_ssh_agent_socket(&socket);
+                        }
+                    }
+                }
+
                 match self.runtime.start_container(handle.id()) {
                     Ok(restarted) => return Ok(restarted.id().to_string()),
                     Err(e) => {
-                        // start_container can fail after a host reboot when bind-mount sources
-                        // (e.g. the stable SSH/GPG agent socket) no longer exist at their
-                        // recorded paths.  Remove the stale container so it doesn't accumulate
-                        // across reboots and fall through to create a fresh one.
+                        // start_container can still fail for other reasons (e.g. GPG socket
+                        // path moved, other stale mounts, or runtime error). Remove the stale
+                        // container so it doesn't accumulate and fall through to create a
+                        // fresh one.
                         warn!(
                             "Failed to restart stopped container (stale mounts after reboot?): {}. \
                              Removing stale container and creating a new one.",
