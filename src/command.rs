@@ -35,6 +35,8 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 use std::{io, io::IsTerminal};
 
 use dirs;
@@ -162,6 +164,18 @@ pub struct InfoResponse {
     pub container_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container_id: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct ControlServerListResponse {
+    pub containers: Vec<control_server::ContainerForwardSnapshot>,
+}
+
+#[derive(Serialize)]
+pub struct ControlServerForwardResponse {
+    pub container_name: String,
+    pub port: u16,
+    pub host_port: u16,
 }
 
 /// Handles the build command for creating a development container.
@@ -766,6 +780,105 @@ pub fn handle_serve_command(
     }
 
     control_server::start_control_server(port, output)
+}
+
+pub fn handle_control_server_list_command(
+    host: &str,
+    port: u16,
+    watch: bool,
+    interval_secs: u64,
+    output: OutputFormat,
+) -> Result<()> {
+    let interval = Duration::from_secs(interval_secs.max(1));
+
+    loop {
+        let snapshot = control_server::fetch_control_server_snapshot(host, port)?;
+        if output == OutputFormat::Json {
+            let payload = ControlServerListResponse {
+                containers: snapshot.containers,
+            };
+            if watch {
+                println!("{}", serde_json::to_string(&payload)?);
+            } else {
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+            }
+        } else if snapshot.containers.is_empty() {
+            println!("No connected containers.");
+        } else {
+            println!("Connected containers:");
+            for container in snapshot.containers {
+                println!(
+                    "- {} (workspace: {})",
+                    container.container_name, container.workspace_name
+                );
+                if container.mappings.is_empty() {
+                    println!("  no forwarded ports");
+                } else {
+                    for mapping in container.mappings {
+                        println!(
+                            "  container {} -> host {}",
+                            mapping.container_port, mapping.host_port
+                        );
+                    }
+                }
+            }
+        }
+
+        if !watch {
+            break;
+        }
+        thread::sleep(interval);
+    }
+
+    Ok(())
+}
+
+pub fn handle_control_server_start_forward_command(
+    host: &str,
+    server_port: u16,
+    container_name: &str,
+    port: u16,
+    output: OutputFormat,
+) -> Result<()> {
+    let started = control_server::request_start_forward(host, server_port, container_name, port)?;
+    if output == OutputFormat::Json {
+        let response = ControlServerForwardResponse {
+            container_name: started.container_name,
+            port: started.port,
+            host_port: started.host_port,
+        };
+        println!("{}", serde_json::to_string_pretty(&response)?);
+    } else {
+        println!(
+            "Started forwarding for {}: container {} -> host {}",
+            started.container_name, started.port, started.host_port
+        );
+    }
+    Ok(())
+}
+
+pub fn handle_control_server_end_forward_command(
+    host: &str,
+    server_port: u16,
+    container_name: &str,
+    port: u16,
+    output: OutputFormat,
+) -> Result<()> {
+    let ended = control_server::request_end_forward(host, server_port, container_name, port)?;
+    if output == OutputFormat::Json {
+        let response = ControlServerForwardResponse {
+            container_name: ended.container_name,
+            port: ended.port,
+            host_port: ended.host_port,
+        };
+        println!("{}", serde_json::to_string_pretty(&response)?);
+    } else {
+        println!(
+            "Ended forwarding for {}: container {} (host {} released)",
+            ended.container_name, ended.port, ended.host_port
+        );
+    }
+    Ok(())
 }
 
 /// Handles the info command to display devcontainer information.

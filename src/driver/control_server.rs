@@ -27,9 +27,13 @@
 
 use crate::error::{Error, Result};
 use crate::output::OutputFormat;
-use devcon_proto::AgentMessage;
 use devcon_proto::agent_message::Message as ProtoMessage;
+use devcon_proto::{
+    AgentMessage, ContainerPortMappings, ControlError, EndForwardResponse, ListForwardsResponse,
+    PortMapping, StartForwardResponse,
+};
 use prost::Message;
+use serde::Serialize;
 use serde_json::json;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -114,6 +118,44 @@ struct ContainerInfo {
     workspace_name: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ForwardMapping {
+    pub container_port: u16,
+    pub host_port: u16,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContainerForwardSnapshot {
+    pub container_name: String,
+    pub workspace_name: String,
+    pub mappings: Vec<ForwardMapping>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ControlServerListSnapshot {
+    pub containers: Vec<ContainerForwardSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StartForwardResult {
+    pub container_name: String,
+    pub port: u16,
+    pub host_port: u16,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EndForwardResult {
+    pub container_name: String,
+    pub port: u16,
+    pub host_port: u16,
+}
+
+#[derive(Clone)]
+struct ConnectedContainer {
+    workspace_name: String,
+    stream: Arc<Mutex<TcpStream>>,
+}
+
 /// Type alias for a port forward entry containing the agent stream, container port, tunnel ID counter, data port, and container info
 type ForwardEntry = (
     Arc<Mutex<TcpStream>>,
@@ -132,6 +174,8 @@ struct PortForwardManager {
     pending_tunnels: Arc<Mutex<HashMap<u32, TcpStream>>>,
     /// Output format for user-facing notifications
     output: OutputFormat,
+    /// Connected container registry keyed by container_name
+    connected_containers: Arc<Mutex<HashMap<String, ConnectedContainer>>>,
 }
 
 impl PortForwardManager {
@@ -140,11 +184,143 @@ impl PortForwardManager {
             forwards: Arc::new(Mutex::new(HashMap::new())),
             pending_tunnels: Arc::new(Mutex::new(HashMap::new())),
             output,
+            connected_containers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     fn output_format(&self) -> OutputFormat {
         self.output.clone()
+    }
+
+    fn register_container(&self, container_info: &ContainerInfo, stream: Arc<Mutex<TcpStream>>) {
+        let mut connected = self.connected_containers.lock().unwrap();
+        connected.insert(
+            container_info.container_name.clone(),
+            ConnectedContainer {
+                workspace_name: container_info.workspace_name.clone(),
+                stream,
+            },
+        );
+    }
+
+    fn unregister_container(&self, container_name: &str) {
+        let mut connected = self.connected_containers.lock().unwrap();
+        connected.remove(container_name);
+    }
+
+    fn remove_forwards_for_stream(&self, stream: &Arc<Mutex<TcpStream>>) {
+        let mut forwards = self.forwards.lock().unwrap();
+        forwards.retain(|_, (entry_stream, _, _, _, _)| !Arc::ptr_eq(entry_stream, stream));
+    }
+
+    fn list_snapshot(&self) -> ControlServerListSnapshot {
+        let connected = self.connected_containers.lock().unwrap();
+        let forwards = self.forwards.lock().unwrap();
+
+        let mut grouped: HashMap<String, ContainerForwardSnapshot> = HashMap::new();
+
+        for (name, conn) in connected.iter() {
+            grouped.insert(
+                name.clone(),
+                ContainerForwardSnapshot {
+                    container_name: name.clone(),
+                    workspace_name: conn.workspace_name.clone(),
+                    mappings: Vec::new(),
+                },
+            );
+        }
+
+        for (host_port, (_, container_port, _, _, container_info)) in forwards.iter() {
+            if let Some(info) = container_info {
+                let entry = grouped.entry(info.container_name.clone()).or_insert(
+                    ContainerForwardSnapshot {
+                        container_name: info.container_name.clone(),
+                        workspace_name: info.workspace_name.clone(),
+                        mappings: Vec::new(),
+                    },
+                );
+                entry.mappings.push(ForwardMapping {
+                    container_port: *container_port,
+                    host_port: *host_port,
+                });
+            }
+        }
+
+        let mut containers: Vec<ContainerForwardSnapshot> = grouped.into_values().collect();
+        containers.sort_by(|a, b| a.container_name.cmp(&b.container_name));
+        for container in &mut containers {
+            container
+                .mappings
+                .sort_by(|a, b| a.container_port.cmp(&b.container_port));
+        }
+
+        ControlServerListSnapshot { containers }
+    }
+
+    fn start_forward_for_container(&self, container_name: &str, port: u16) -> Result<u16> {
+        {
+            let forwards = self.forwards.lock().unwrap();
+            if let Some((host_port, _)) =
+                forwards
+                    .iter()
+                    .find(|(_, (_, container_port, _, _, info))| {
+                        *container_port == port
+                            && info
+                                .as_ref()
+                                .map(|i| i.container_name.as_str() == container_name)
+                                .unwrap_or(false)
+                    })
+            {
+                return Ok(*host_port);
+            }
+        }
+
+        let (stream, workspace_name) = {
+            let connected = self.connected_containers.lock().unwrap();
+            let conn = connected.get(container_name).ok_or_else(|| {
+                Error::new(format!("Container '{}' is not connected", container_name))
+            })?;
+            (conn.stream.clone(), conn.workspace_name.clone())
+        };
+
+        self.start_forward(
+            port,
+            port,
+            stream,
+            Some(ContainerInfo {
+                container_name: container_name.to_string(),
+                workspace_name,
+            }),
+        )
+    }
+
+    fn end_forward_for_container(&self, container_name: &str, port: u16) -> Result<u16> {
+        let mut forwards = self.forwards.lock().unwrap();
+        let local_port =
+            forwards
+                .iter()
+                .find_map(|(host_port, (_, entry_container_port, _, _, entry_info))| {
+                    if *entry_container_port == port
+                        && entry_info
+                            .as_ref()
+                            .map(|i| i.container_name.as_str() == container_name)
+                            .unwrap_or(false)
+                    {
+                        Some(*host_port)
+                    } else {
+                        None
+                    }
+                });
+
+        if let Some(local_port) = local_port {
+            let _ = forwards.remove(&local_port);
+            Ok(local_port)
+        } else {
+            Err(Error::new(format!(
+                "Container '{}' is not forwarding port {}",
+                container_name, port
+            )))
+        }
     }
 
     /// Start forwarding a port through the control connection
@@ -541,6 +717,36 @@ fn emit_port_forward_event(
     }
 }
 
+fn to_list_response(snapshot: &ControlServerListSnapshot) -> ListForwardsResponse {
+    ListForwardsResponse {
+        containers: snapshot
+            .containers
+            .iter()
+            .map(|c| ContainerPortMappings {
+                container_name: c.container_name.clone(),
+                workspace_name: c.workspace_name.clone(),
+                mappings: c
+                    .mappings
+                    .iter()
+                    .map(|m| PortMapping {
+                        container_port: m.container_port as u32,
+                        host_port: m.host_port as u32,
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
+fn send_control_error(stream: &mut TcpStream, message: impl Into<String>) -> Result<()> {
+    let response = AgentMessage {
+        message: Some(ProtoMessage::ControlError(ControlError {
+            message: message.into(),
+        })),
+    };
+    send_message(stream, &response)
+}
+
 /// Handle a single agent connection
 fn handle_agent_connection(mut stream: TcpStream, manager: PortForwardManager) -> Result<()> {
     let peer_addr = stream.peer_addr()?;
@@ -629,6 +835,9 @@ fn handle_agent_connection(mut stream: TcpStream, manager: PortForwardManager) -
                         container_name: hello.container_name,
                         workspace_name: hello.workspace_name,
                     });
+                    if let Some(ref info) = container_info {
+                        manager.register_container(info, stream_arc.clone());
+                    }
                 }
                 Some(ProtoMessage::StartSocketRelay(_)) => {
                     debug!("Received StartSocketRelay (relay not active); ignoring");
@@ -638,6 +847,78 @@ fn handle_agent_connection(mut stream: TcpStream, manager: PortForwardManager) -
                 }
                 Some(ProtoMessage::StopSocketRelay(_)) => {
                     debug!("Received StopSocketRelay (relay not active); ignoring");
+                }
+                Some(ProtoMessage::ListForwardsRequest(_)) => {
+                    let snapshot = manager.list_snapshot();
+                    let response = AgentMessage {
+                        message: Some(ProtoMessage::ListForwardsResponse(to_list_response(
+                            &snapshot,
+                        ))),
+                    };
+                    if let Err(e) = send_message(&mut stream, &response) {
+                        error!("Failed to send ListForwardsResponse: {}", e);
+                    }
+                    break;
+                }
+                Some(ProtoMessage::StartForwardRequest(req)) => {
+                    let container = req.container_name;
+                    let port = req.port as u16;
+                    match manager.start_forward_for_container(&container, port) {
+                        Ok(host_port) => {
+                            let response = AgentMessage {
+                                message: Some(ProtoMessage::StartForwardResponse(
+                                    StartForwardResponse {
+                                        container_name: container.clone(),
+                                        port: port as u32,
+                                        host_port: host_port as u32,
+                                    },
+                                )),
+                            };
+                            if let Err(e) = send_message(&mut stream, &response) {
+                                error!("Failed to send StartForwardResponse: {}", e);
+                            }
+                            emit_port_forward_event(&output, "started", port, host_port, None);
+                        }
+                        Err(e) => {
+                            if let Err(send_err) = send_control_error(&mut stream, e.to_string()) {
+                                error!("Failed to send control error response: {}", send_err);
+                            }
+                        }
+                    }
+                    break;
+                }
+                Some(ProtoMessage::EndForwardRequest(req)) => {
+                    let container = req.container_name;
+                    let port = req.port as u16;
+                    match manager.end_forward_for_container(&container, port) {
+                        Ok(host_port) => {
+                            let response = AgentMessage {
+                                message: Some(ProtoMessage::EndForwardResponse(
+                                    EndForwardResponse {
+                                        container_name: container.clone(),
+                                        port: port as u32,
+                                        host_port: host_port as u32,
+                                    },
+                                )),
+                            };
+                            if let Err(e) = send_message(&mut stream, &response) {
+                                error!("Failed to send EndForwardResponse: {}", e);
+                            }
+                            emit_port_forward_event(&output, "stopped", port, host_port, None);
+                        }
+                        Err(e) => {
+                            if let Err(send_err) = send_control_error(&mut stream, e.to_string()) {
+                                error!("Failed to send control error response: {}", send_err);
+                            }
+                        }
+                    }
+                    break;
+                }
+                Some(ProtoMessage::ListForwardsResponse(_))
+                | Some(ProtoMessage::StartForwardResponse(_))
+                | Some(ProtoMessage::EndForwardResponse(_))
+                | Some(ProtoMessage::ControlError(_)) => {
+                    warn!("Received unexpected control response message from peer");
                 }
                 None => {
                     warn!("Received message with no content");
@@ -660,7 +941,121 @@ fn handle_agent_connection(mut stream: TcpStream, manager: PortForwardManager) -
         }
     }
 
+    if let Some(ref info) = container_info {
+        manager.unregister_container(&info.container_name);
+    }
+    manager.remove_forwards_for_stream(&stream_arc);
+
     Ok(())
+}
+
+fn connect_to_control_server(host: &str, port: u16) -> Result<TcpStream> {
+    TcpStream::connect((host, port)).map_err(|e| {
+        Error::runtime(format!(
+            "Failed to connect to control server at {}:{}: {}",
+            host, port, e
+        ))
+    })
+}
+
+pub fn fetch_control_server_snapshot(host: &str, port: u16) -> Result<ControlServerListSnapshot> {
+    let mut stream = connect_to_control_server(host, port)?;
+    let request = AgentMessage {
+        message: Some(ProtoMessage::ListForwardsRequest(
+            devcon_proto::ListForwardsRequest {},
+        )),
+    };
+    send_message(&mut stream, &request)?;
+
+    let response = read_message(&mut stream)?;
+    match response.message {
+        Some(ProtoMessage::ListForwardsResponse(resp)) => {
+            let mut containers: Vec<ContainerForwardSnapshot> = resp
+                .containers
+                .into_iter()
+                .map(|c| ContainerForwardSnapshot {
+                    container_name: c.container_name,
+                    workspace_name: c.workspace_name,
+                    mappings: c
+                        .mappings
+                        .into_iter()
+                        .map(|m| ForwardMapping {
+                            container_port: m.container_port as u16,
+                            host_port: m.host_port as u16,
+                        })
+                        .collect(),
+                })
+                .collect();
+            containers.sort_by(|a, b| a.container_name.cmp(&b.container_name));
+            Ok(ControlServerListSnapshot { containers })
+        }
+        Some(ProtoMessage::ControlError(err)) => Err(Error::runtime(err.message)),
+        _ => Err(Error::runtime(
+            "Unexpected response from control server for list request".to_string(),
+        )),
+    }
+}
+
+pub fn request_start_forward(
+    host: &str,
+    port: u16,
+    container_name: &str,
+    container_port: u16,
+) -> Result<StartForwardResult> {
+    let mut stream = connect_to_control_server(host, port)?;
+    let request = AgentMessage {
+        message: Some(ProtoMessage::StartForwardRequest(
+            devcon_proto::StartForwardRequest {
+                container_name: container_name.to_string(),
+                port: container_port as u32,
+            },
+        )),
+    };
+    send_message(&mut stream, &request)?;
+
+    let response = read_message(&mut stream)?;
+    match response.message {
+        Some(ProtoMessage::StartForwardResponse(resp)) => Ok(StartForwardResult {
+            container_name: resp.container_name,
+            port: resp.port as u16,
+            host_port: resp.host_port as u16,
+        }),
+        Some(ProtoMessage::ControlError(err)) => Err(Error::runtime(err.message)),
+        _ => Err(Error::runtime(
+            "Unexpected response from control server for start-forward request".to_string(),
+        )),
+    }
+}
+
+pub fn request_end_forward(
+    host: &str,
+    port: u16,
+    container_name: &str,
+    container_port: u16,
+) -> Result<EndForwardResult> {
+    let mut stream = connect_to_control_server(host, port)?;
+    let request = AgentMessage {
+        message: Some(ProtoMessage::EndForwardRequest(
+            devcon_proto::EndForwardRequest {
+                container_name: container_name.to_string(),
+                port: container_port as u32,
+            },
+        )),
+    };
+    send_message(&mut stream, &request)?;
+
+    let response = read_message(&mut stream)?;
+    match response.message {
+        Some(ProtoMessage::EndForwardResponse(resp)) => Ok(EndForwardResult {
+            container_name: resp.container_name,
+            port: resp.port as u16,
+            host_port: resp.host_port as u16,
+        }),
+        Some(ProtoMessage::ControlError(err)) => Err(Error::runtime(err.message)),
+        _ => Err(Error::runtime(
+            "Unexpected response from control server for end-forward request".to_string(),
+        )),
+    }
 }
 
 /// Start the control server on the specified port
@@ -755,6 +1150,88 @@ mod tests {
         let stopped = manager
             .stop_forward(3000, &stream_a_server)
             .expect("stop should match stream A");
+        assert_eq!(stopped, 41000);
+
+        let forwards = manager.forwards.lock().expect("lock forwards after stop");
+        assert!(!forwards.contains_key(&41000));
+        assert!(forwards.contains_key(&42000));
+
+        drop(stream_a_client);
+        drop(stream_b_client);
+    }
+
+    #[test]
+    fn list_snapshot_includes_connected_containers_without_mappings() {
+        let manager = PortForwardManager::new(OutputFormat::Text);
+        let (stream_server, stream_client) = stream_pair();
+        let info = ContainerInfo {
+            container_name: "container-a".to_string(),
+            workspace_name: "workspace-a".to_string(),
+        };
+
+        manager.register_container(&info, stream_server.clone());
+
+        let snapshot = manager.list_snapshot();
+        assert_eq!(snapshot.containers.len(), 1);
+        assert_eq!(snapshot.containers[0].container_name, "container-a");
+        assert_eq!(snapshot.containers[0].workspace_name, "workspace-a");
+        assert!(snapshot.containers[0].mappings.is_empty());
+
+        drop(stream_client);
+    }
+
+    #[test]
+    fn start_forward_for_container_requires_connected_container() {
+        let manager = PortForwardManager::new(OutputFormat::Text);
+        let err = manager
+            .start_forward_for_container("missing-container", 8080)
+            .expect_err("start-forward should fail for disconnected container");
+        assert!(
+            err.to_string().contains("not connected"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn end_forward_for_container_matches_container_and_port() {
+        let manager = PortForwardManager::new(OutputFormat::Text);
+        let (stream_a_server, stream_a_client) = stream_pair();
+        let (stream_b_server, stream_b_client) = stream_pair();
+        let counter = Arc::new(AtomicU32::new(1));
+
+        {
+            let mut forwards = manager.forwards.lock().expect("lock forwards");
+            forwards.insert(
+                41000,
+                (
+                    stream_a_server,
+                    3000,
+                    counter.clone(),
+                    45000,
+                    Some(ContainerInfo {
+                        container_name: "container-a".to_string(),
+                        workspace_name: "workspace-a".to_string(),
+                    }),
+                ),
+            );
+            forwards.insert(
+                42000,
+                (
+                    stream_b_server,
+                    3000,
+                    counter,
+                    46000,
+                    Some(ContainerInfo {
+                        container_name: "container-b".to_string(),
+                        workspace_name: "workspace-b".to_string(),
+                    }),
+                ),
+            );
+        }
+
+        let stopped = manager
+            .end_forward_for_container("container-a", 3000)
+            .expect("end-forward should match container-a");
         assert_eq!(stopped, 41000);
 
         let forwards = manager.forwards.lock().expect("lock forwards after stop");

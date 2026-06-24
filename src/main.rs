@@ -84,6 +84,69 @@ enum SshAction {
 }
 
 #[derive(Subcommand, Debug)]
+enum ControlServerAction {
+    /// List connected containers and active forwarded ports
+    #[command(about = "List connected containers and their forwarded ports")]
+    List {
+        /// Host where devcon serve is listening
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+
+        /// Port where devcon serve is listening
+        #[arg(long, default_value = "15000")]
+        port: u16,
+
+        /// Continuously refresh the list
+        #[arg(long)]
+        watch: bool,
+
+        /// Refresh interval in seconds for watch mode
+        #[arg(long, default_value = "2")]
+        interval: u64,
+    },
+
+    /// Start forwarding a container port for a connected container
+    #[command(about = "Start forwarding a container port for a connected container")]
+    StartForward {
+        /// Target connected container name (from AgentHello)
+        #[arg(value_name = "CONTAINER")]
+        container: String,
+
+        /// Container port to forward
+        #[arg(value_name = "PORT")]
+        port: u16,
+
+        /// Host where devcon serve is listening
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+
+        /// Port where devcon serve is listening
+        #[arg(long, default_value = "15000")]
+        server_port: u16,
+    },
+
+    /// End forwarding a container port for a connected container
+    #[command(about = "End forwarding a container port for a connected container")]
+    EndForward {
+        /// Target connected container name (from AgentHello)
+        #[arg(value_name = "CONTAINER")]
+        container: String,
+
+        /// Container port to stop forwarding
+        #[arg(value_name = "PORT")]
+        port: u16,
+
+        /// Host where devcon serve is listening
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+
+        /// Port where devcon serve is listening
+        #[arg(long, default_value = "15000")]
+        server_port: u16,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum Commands {
     /// Builds a development container for the specified path
     #[command(about = "Create a development container")]
@@ -190,6 +253,12 @@ enum Commands {
         #[arg(long, help = "Path to the PID lock file")]
         pid_file: Option<std::path::PathBuf>,
     },
+    /// Manage a running control server instance
+    #[command(about = "Manage forwarded ports on a running control server")]
+    ControlServer {
+        #[command(subcommand)]
+        action: ControlServerAction,
+    },
 }
 
 fn main() {
@@ -294,6 +363,44 @@ fn main() {
             Commands::Serve { port, pid_file } => {
                 handle_serve_command(*port, pid_file.clone(), config_path, output)?;
             }
+            Commands::ControlServer { action } => match action {
+                ControlServerAction::List {
+                    host,
+                    port,
+                    watch,
+                    interval,
+                } => {
+                    handle_control_server_list_command(host, *port, *watch, *interval, output)?;
+                }
+                ControlServerAction::StartForward {
+                    container,
+                    port,
+                    host,
+                    server_port,
+                } => {
+                    handle_control_server_start_forward_command(
+                        host,
+                        *server_port,
+                        container,
+                        *port,
+                        output,
+                    )?;
+                }
+                ControlServerAction::EndForward {
+                    container,
+                    port,
+                    host,
+                    server_port,
+                } => {
+                    handle_control_server_end_forward_command(
+                        host,
+                        *server_port,
+                        container,
+                        *port,
+                        output,
+                    )?;
+                }
+            },
         }
         Ok(())
     })();

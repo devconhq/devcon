@@ -50,6 +50,50 @@ message StopSocketRelay {
   string error = 2;
 }
 
+// Request host-side snapshot of connected containers and forwarded ports.
+message ListForwardsRequest {}
+
+message PortMapping {
+  uint32 container_port = 1;
+  uint32 host_port = 2;
+}
+
+message ContainerPortMappings {
+  string container_name = 1;
+  string workspace_name = 2;
+  repeated PortMapping mappings = 3;
+}
+
+message ListForwardsResponse {
+  repeated ContainerPortMappings containers = 1;
+}
+
+message StartForwardRequest {
+  string container_name = 1;
+  uint32 port = 2;
+}
+
+message StartForwardResponse {
+  string container_name = 1;
+  uint32 port = 2;
+  uint32 host_port = 3;
+}
+
+message EndForwardRequest {
+  string container_name = 1;
+  uint32 port = 2;
+}
+
+message EndForwardResponse {
+  string container_name = 1;
+  uint32 port = 2;
+  uint32 host_port = 3;
+}
+
+message ControlError {
+  string message = 1;
+}
+
 // Wrapper message for all agent communication
 message AgentMessage {
   oneof message {
@@ -61,5 +105,12 @@ message AgentMessage {
     StartSocketRelay start_socket_relay = 6;
     SocketRelayData socket_relay_data = 7;
     StopSocketRelay stop_socket_relay = 8;
+    ListForwardsRequest list_forwards_request = 9;
+    ListForwardsResponse list_forwards_response = 10;
+    StartForwardRequest start_forward_request = 11;
+    StartForwardResponse start_forward_response = 12;
+    EndForwardRequest end_forward_request = 13;
+    EndForwardResponse end_forward_response = 14;
+    ControlError control_error = 15;
   }
 }
