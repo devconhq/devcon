@@ -25,6 +25,81 @@ A blazingly fast CLI tool for managing and launching development containers. Dev
 - **SSH Access**: Connect to containers via in-container OpenSSH with automatic random host-port mapping and `ProxyCommand` support for `~/.ssh/config`
 - **Flexible Configuration**: User-level YAML config with XDG directory support
 
+## Dev Container Spec Compatibility Matrix
+
+Scope: this matrix tracks effective runtime behavior, not just JSON parsing. A property can be parsed from `devcontainer.json` but still be marked `Missing` if it is not applied by runtime/orchestration code.
+
+Status legend:
+
+- `Implemented`: behavior is applied by DevCon today.
+- `Partial`: some behavior is implemented, but not all required spec semantics.
+- `Missing`: parser-only or not implemented.
+
+### Matrix
+
+| Spec area | Property / Requirement | Status | Notes / Tracking |
+|---|---|---|---|
+| General | `name` | Implemented | Used for image/container identity and labeling. |
+| General | `features` | Implemented | OCI and local features are processed and installed. |
+| General | `overrideFeatureInstallOrder` | Implemented | Explicit feature ordering is supported. |
+| General | `forwardPorts` | Implemented | Port forwarding/publishing is applied at container start. |
+| General | `portsAttributes` | Missing | Parsed, but not used to control forwarding behavior yet. |
+| General | `otherPortsAttributes` | Missing | Parsed, but not applied. |
+| General | `containerEnv` | Implemented | Merged and applied to container startup environment. |
+| General | `remoteEnv` | Implemented | Applied to remote/SSH session processes with merge semantics. |
+| General | `remoteUser` | Implemented | Supported, including user probing and runtime resolution. |
+| General | `containerUser` | Partial | Used for user resolution; full spec parity still depends on metadata parity work (#106). |
+| General | `updateRemoteUserUID` | Missing | Parsed, but no Linux UID/GID sync step is implemented. |
+| General | `userEnvProbe` | Missing | Parsed, but no spec-driven probe mode behavior is implemented. |
+| General | `overrideCommand` | Missing | Parsed, but runtime command behavior is not controlled by this property. |
+| General | `shutdownAction` | Missing | Parsed, but stop behavior is not controlled by this property. |
+| General | `init` | Missing | Parsed, but no `--init` equivalent is applied today. |
+| General | `privileged` | Implemented | Applied to runtime flags; merged with feature requirements. |
+| General | `capAdd` | Implemented | Capability set is applied and merged with feature requirements. |
+| General | `securityOpt` | Implemented | Security options are applied and merged with feature requirements. |
+| General | `mounts` | Implemented | String and structured mounts are supported. |
+| General | `customizations` | Missing | Parsed, but tool-specific customization processing is not implemented. |
+| General | `hostRequirements` | Missing | Parsed, but no host requirement validation/enforcement is implemented. |
+| Image/Dockerfile | `image` | Implemented | Image-based environments are supported. |
+| Image/Dockerfile | `build.dockerfile` / `dockerFile` | Implemented | Dockerfile-based environments are supported. |
+| Image/Dockerfile | `build.context` / `context` | Implemented | Build context is resolved and applied. |
+| Image/Dockerfile | `build.args` | Implemented | Build arguments are passed through to image build. |
+| Image/Dockerfile | `build.options` | Implemented | Additional build options are passed through. |
+| Image/Dockerfile | `build.target` | Implemented | Multi-stage build target is supported. |
+| Image/Dockerfile | `build.cacheFrom` | Missing | Parsed, but build cache sources are not wired through runtime build call. |
+| Image/Dockerfile | `workspaceMount` | Implemented | Workspace mount override is supported (image/dockerfile scenarios). |
+| Image/Dockerfile | `workspaceFolder` | Implemented | Workspace folder inside container is supported. |
+| Image/Dockerfile | `runArgs` | Missing | Parsed, but not passed through to runtime invocation. |
+| Image/Dockerfile | `appPort` | Missing | Parsed, but not actively used for runtime publishing behavior. |
+| Compose | `dockerComposeFile` + `service` | Missing | Docker Compose orchestration not implemented yet (#41). |
+| Compose | `runServices` | Missing | Not implemented yet (#41). |
+| Lifecycle | `initializeCommand` host-side execution | Missing | Parsed, but host initialization phase command is not executed. |
+| Lifecycle | `onCreateCommand` | Implemented | Executed in container lifecycle flow. |
+| Lifecycle | `updateContentCommand` | Missing | Parsed, but not executed in lifecycle flow. |
+| Lifecycle | `postCreateCommand` | Implemented | Executed in container lifecycle flow. |
+| Lifecycle | `postStartCommand` | Implemented | Executed in container lifecycle flow (on create/start paths). |
+| Lifecycle | `postAttachCommand` | Implemented | Executed on attach workflows. |
+| Lifecycle | `waitFor` gating semantics | Missing | Parsed, but command-stage gating behavior is not implemented. |
+| Lifecycle | String vs array command semantics | Implemented | Array commands are executed directly without shell; syntax conformance tracked in #91. |
+| Lifecycle | Object command parallel execution | Missing | Object commands are currently executed sequentially (#105). |
+| Metadata | `devcontainer.metadata` merge semantics | Partial | Metadata label is read for selected behavior (for example user hints), but full spec merge/write parity is pending (#106). |
+| Metadata | Metadata write/update support | Missing | Writing/maintaining complete spec metadata is not implemented (#106). |
+
+### Spec Requirements Not Built In Yet
+
+The following implementor-spec requirements are still open and are intentionally tracked as gaps:
+
+- Docker Compose environment support (`dockerComposeFile`, `service`, `runServices`) is not implemented yet (#41).
+- Lifecycle object values are not executed in parallel; they currently run sequentially (#105).
+- Host-side `initializeCommand` phase is not implemented.
+- `updateContentCommand` execution semantics are not implemented.
+- `waitFor` stage gating behavior is not implemented.
+- Full `devcontainer.metadata` merge/write behavior is not implemented (#106).
+- `updateRemoteUserUID` Linux UID/GID sync behavior is not implemented.
+- `userEnvProbe`-driven environment probing behavior is not implemented.
+- `runArgs`, `init`, `overrideCommand`, and `shutdownAction` are parsed but not applied as spec-defined runtime behavior.
+- `customizations`, `hostRequirements`, `portsAttributes`, `otherPortsAttributes`, and `appPort` are parsed but not applied as spec-defined behavior.
+
 ## Installation
 
 ### Homebrew (recommended)
