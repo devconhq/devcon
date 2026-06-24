@@ -401,6 +401,14 @@ impl ContainerRuntime for DockerRuntime {
             cmd.arg("--privileged");
         }
 
+        for capability in &runtime_parameters.cap_add {
+            cmd.arg("--cap-add").arg(capability);
+        }
+
+        for option in &runtime_parameters.security_opt {
+            cmd.arg("--security-opt").arg(option);
+        }
+
         // Add memory and CPU limits from config
         if let Some(memory) = &self.config.run_memory {
             cmd.arg("--memory").arg(memory);

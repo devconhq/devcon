@@ -700,8 +700,12 @@ impl ContainerRuntime for ContainerCliRuntime {
             additional_mounts,
             ports,
             requires_privileged,
+            cap_add,
+            security_opt,
             platform_architecture_translation,
         } = runtime_parameters;
+
+        validate_container_runtime_security_request(requires_privileged, &security_opt)?;
 
         trace!(
             "Container start attempt with requested forwards: {:?}",
@@ -726,9 +730,8 @@ impl ContainerRuntime for ContainerCliRuntime {
         let cpu = self.config.run_cpu.as_deref().unwrap_or("2");
         cmd.arg("--cpus").arg(cpu);
 
-        // Add privileged flag if required
-        if requires_privileged {
-            cmd.arg("--virtualization");
+        for capability in &cap_add {
+            cmd.arg("--cap-add").arg(capability);
         }
 
         // Add environment variables
@@ -1083,6 +1086,26 @@ impl ContainerRuntime for ContainerCliRuntime {
     }
 }
 
+fn validate_container_runtime_security_request(
+    requires_privileged: bool,
+    security_opt: &[String],
+) -> Result<()> {
+    if requires_privileged {
+        return Err(Error::runtime(
+            "Container runtime does not support Docker-style privileged mode; switch to docker runtime or remove privileged requirements",
+        ));
+    }
+
+    if !security_opt.is_empty() {
+        return Err(Error::runtime(format!(
+            "Container runtime does not support security_opt settings: {}",
+            security_opt.join(", ")
+        )));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1285,5 +1308,24 @@ mod tests {
         });
 
         assert_eq!(parse_devcon_container_entry(&parsed), None);
+    }
+
+    #[test]
+    fn test_validate_container_runtime_security_request_rejects_privileged() {
+        let result = validate_container_runtime_security_request(true, &[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_container_runtime_security_request_rejects_security_opt() {
+        let result =
+            validate_container_runtime_security_request(false, &["seccomp=unconfined".to_string()]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_container_runtime_security_request_accepts_supported_values() {
+        let result = validate_container_runtime_security_request(false, &[]);
+        assert!(result.is_ok());
     }
 }
