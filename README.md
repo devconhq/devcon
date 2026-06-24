@@ -153,6 +153,9 @@ devcon shell
 | `devcon ssh [PATH]` | Connect via SSH |
 | `devcon info [PATH]` | Display container status and configuration |
 | `devcon serve` | Start the control server for agent connections |
+| `devcon control-server list` | List connected containers and active forwarded ports |
+| `devcon control-server start-forward CONTAINER PORT` | Start forwarding a container port for a connected container |
+| `devcon control-server end-forward CONTAINER PORT` | End forwarding a container port for a connected container |
 
 All commands default to the current directory when `PATH` is not specified.
 
@@ -197,6 +200,24 @@ DevCon writes managed start/end marker comments around workspace SSH entries so 
 DevCon also updates `~/.ssh/config` automatically after `devcon start` and `devcon up` successfully start the container.
 
 DevCon ensures the configured container SSH port is published to a random host port when starting containers. By default this is `22/tcp`, configurable via `agents.sshPort`. The `devcon-agent` feature installs and starts OpenSSH server inside supported Linux distributions (unless `agents.skipSshSetup` is enabled), and `devcon ssh connect` discovers the mapped host port and connects directly.
+
+### `devcon control-server`
+
+```bash
+# List all connected containers and current mappings
+devcon control-server list
+
+# Continuously refresh mappings every 2 seconds
+devcon control-server list --watch
+
+# Start forwarding container port 3000 for a connected container
+devcon control-server start-forward my-container 3000
+
+# End forwarding container port 3000 for a connected container
+devcon control-server end-forward my-container 3000
+```
+
+You can target a non-default control server endpoint with `--host` and `--port` (for `list`) or `--server-port` (for `start-forward` / `end-forward`).
 
 ## The control server and agent (`devcon serve`)
 
