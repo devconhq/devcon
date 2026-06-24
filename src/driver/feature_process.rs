@@ -50,6 +50,16 @@ use crate::devcontainer::{
 use crate::feature::Feature;
 use schema::lockfile::{DevcontainerLockEntry, DevcontainerLockfile, normalize_feature_identifier};
 
+#[derive(Debug, Deserialize)]
+struct OciManifest {
+    layers: Vec<OciManifestLayer>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OciManifestLayer {
+    digest: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LockMode {
     #[default]
@@ -916,10 +926,8 @@ fn fetch_manifest_digests_for_reference(
         .unwrap_or_else(|| canonical_layer_digest(reference));
 
     let manifest_json: serde_json::Value = manifest_response.json()?;
-    let manifest_str = serde_json::to_string(&manifest_json)?;
-    let reader = std::io::Cursor::new(manifest_str);
-    let manifest = oci_spec::image::ImageManifest::from_reader(reader)?;
-    let layer = manifest.layers().first().ok_or_else(|| {
+    let manifest: OciManifest = serde_json::from_value(manifest_json)?;
+    let layer = manifest.layers.first().ok_or_else(|| {
         Error::new(format!(
             "No layers found in manifest for feature: {}",
             registry.name
@@ -928,7 +936,7 @@ fn fetch_manifest_digests_for_reference(
 
     Ok(ManifestDigests {
         manifest_digest,
-        layer_digest: layer.digest().to_string(),
+        layer_digest: layer.digest.clone(),
     })
 }
 

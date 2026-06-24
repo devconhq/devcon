@@ -83,10 +83,6 @@ pub enum Error {
     #[error("Template error: {0}")]
     Template(#[from] minijinja::Error),
 
-    /// OCI specification error
-    #[error("OCI spec error: {0}")]
-    OciSpec(#[from] oci_spec::OciSpecError),
-
     /// Devcontainer configuration error
     #[error("Devcontainer error: {0}")]
     Devcontainer(String),
