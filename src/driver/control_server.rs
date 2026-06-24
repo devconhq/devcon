@@ -249,9 +249,7 @@ impl PortForwardManager {
         let mut containers: Vec<ContainerForwardSnapshot> = grouped.into_values().collect();
         containers.sort_by(|a, b| a.container_name.cmp(&b.container_name));
         for container in &mut containers {
-            container
-                .mappings
-                .sort_by(|a, b| a.container_port.cmp(&b.container_port));
+            container.mappings.sort_by_key(|a| a.container_port);
         }
 
         ControlServerListSnapshot { containers }

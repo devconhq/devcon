@@ -913,20 +913,19 @@ impl ContainerOrchestrator {
                 // Re-running ensure_stable_ssh_agent_socket respawns socat and
                 // recreates the socket at the same stable path, so the existing
                 // container can be started without removing/recreating it.
-                if let Some(ref agent_fwd) = self.config.agent_forwarding {
-                    if agent_fwd.ssh_enabled.unwrap_or(false) {
-                        let ssh_socket = if let Some(ref override_path) = agent_fwd.ssh_socket_path
-                        {
-                            PathBuf::from(override_path)
-                                .exists()
-                                .then(|| PathBuf::from(override_path))
-                        } else {
-                            detect_ssh_socket()
-                        };
-                        if let Some(socket) = ssh_socket {
-                            debug!("Refreshing stable SSH agent socket before container restart");
-                            ensure_stable_ssh_agent_socket(&socket);
-                        }
+                if let Some(ref agent_fwd) = self.config.agent_forwarding
+                    && agent_fwd.ssh_enabled.unwrap_or(false)
+                {
+                    let ssh_socket = if let Some(ref override_path) = agent_fwd.ssh_socket_path {
+                        PathBuf::from(override_path)
+                            .exists()
+                            .then(|| PathBuf::from(override_path))
+                    } else {
+                        detect_ssh_socket()
+                    };
+                    if let Some(socket) = ssh_socket {
+                        debug!("Refreshing stable SSH agent socket before container restart");
+                        ensure_stable_ssh_agent_socket(&socket);
                     }
                 }
 
