@@ -428,6 +428,12 @@ pub struct RuntimeParameters {
     /// Whether the container requires privileged mode.
     pub requires_privileged: bool,
 
+    /// Linux capabilities to add to the container process.
+    pub cap_add: Vec<String>,
+
+    /// Security options to pass to the runtime.
+    pub security_opt: Vec<String>,
+
     /// Whether to enable Rosetta (container CLI) or `--platform linux/amd64` (Docker).
     /// True when the host is ARM and the image architecture is `amd64`.
     pub platform_architecture_translation: bool,

@@ -57,7 +57,7 @@
 //! # }
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
@@ -1250,10 +1250,49 @@ impl ContainerOrchestrator {
             }
         }
 
-        // Check if container needs to run in privileged mode
-        let requires_privileged = processed_features
-            .iter()
-            .any(|f| f.feature.privileged.unwrap_or(false));
+        // Aggregate runtime security requirements from devcontainer and features.
+        let mut requires_privileged = devcontainer_workspace
+            .devcontainer
+            .privileged
+            .unwrap_or(false);
+        let mut cap_add: HashSet<String> = devcontainer_workspace
+            .devcontainer
+            .cap_add
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|cap| normalize_capability_name(&cap))
+            .collect();
+        let mut security_opt: HashSet<String> = devcontainer_workspace
+            .devcontainer
+            .security_opt
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+
+        for feature in &processed_features {
+            if feature.feature.privileged.unwrap_or(false) {
+                requires_privileged = true;
+            }
+
+            if let Some(feature_caps) = &feature.feature.cap_add {
+                cap_add.extend(
+                    feature_caps
+                        .iter()
+                        .map(|cap| normalize_capability_name(cap)),
+                );
+            }
+
+            if let Some(feature_security_opt) = &feature.feature.security_opt {
+                security_opt.extend(feature_security_opt.iter().cloned());
+            }
+        }
+
+        let mut cap_add: Vec<String> = cap_add.into_iter().collect();
+        cap_add.sort_unstable();
+        let mut security_opt: Vec<String> = security_opt.into_iter().collect();
+        security_opt.sort_unstable();
 
         // Compose the startup environment from feature defaults and user-config overrides.
         let base_container_env =
@@ -1331,6 +1370,8 @@ impl ContainerOrchestrator {
                 additional_mounts: all_mounts,
                 ports,
                 requires_privileged,
+                cap_add,
+                security_opt,
                 platform_architecture_translation: enable_rosetta,
             },
         )?;
@@ -2358,6 +2399,10 @@ impl ContainerOrchestrator {
             .replace("${remoteUserHome}", &users.remote_user_home)
             .replace("${containerUserHome}", &users.container_user_home)
     }
+}
+
+fn normalize_capability_name(capability: &str) -> String {
+    capability.trim().to_ascii_uppercase()
 }
 
 #[cfg(test)]
