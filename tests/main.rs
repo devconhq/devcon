@@ -2,6 +2,8 @@ mod test_utils;
 
 use serde_json::json;
 use serial_test::serial;
+use std::thread;
+use std::time::Duration;
 use test_utils::*;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -650,5 +652,138 @@ fn test_remote_env_written_to_ssh_environment() {
     ContainerHandle::new(out.container_id(), runtime).assert_file_contains(
         "/home/vscode/.ssh/environment",
         "DEVCON_REMOTE_VAR=remote-value",
+    );
+}
+
+#[test]
+#[serial]
+fn test_control_server_management_commands_manage_forward_lifecycle() {
+    let runtime = get_runtime();
+    skip_if_unavailable!(runtime);
+    cleanup_test_artifacts(runtime, "test-control-server-management");
+
+    let config = TestConfig::agents_enabled();
+    let (_serve, server_port) = DevconRun::serve_in_background(&config);
+
+    let workspace = DevcontainerBuilder::new("test-control-server-management")
+        .container_env("DEVCON_CONTROL_PORT", server_port.to_string())
+        .build();
+
+    let up_out = DevconRun::up(workspace.path(), &config);
+    up_out.assert_success();
+
+    let container = ContainerHandle::new(up_out.container_id(), runtime);
+    let container_name = container
+        .exec(&["hostname"])
+        .expect("Failed to resolve container hostname")
+        .trim()
+        .to_string();
+
+    // Agent registration is async; retry list until this container is visible.
+    let mut seen_container = false;
+    for _ in 0..30 {
+        let list_out = DevconRun::control_server_list("127.0.0.1", server_port, &config);
+        list_out.assert_success();
+        let v = list_out.json();
+        let containers = v["containers"]
+            .as_array()
+            .expect("Expected containers array in list output");
+        if containers
+            .iter()
+            .any(|c| c["container_name"].as_str() == Some(container_name.as_str()))
+        {
+            seen_container = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    assert!(
+        seen_container,
+        "Container {} was not observed in control-server list output",
+        container_name
+    );
+
+    let start_out = DevconRun::control_server_start_forward(
+        "127.0.0.1",
+        server_port,
+        &container_name,
+        3000,
+        &config,
+    );
+    start_out.assert_success();
+    let started = start_out.json();
+    let host_port = started["host_port"]
+        .as_u64()
+        .expect("start-forward JSON missing host_port") as u16;
+    assert_eq!(
+        started["container_name"].as_str(),
+        Some(container_name.as_str()),
+        "start-forward returned unexpected container_name"
+    );
+    assert_eq!(
+        started["port"].as_u64(),
+        Some(3000),
+        "start-forward returned unexpected container port"
+    );
+
+    let list_after_start = DevconRun::control_server_list("127.0.0.1", server_port, &config);
+    list_after_start.assert_success();
+    let started_snapshot = list_after_start.json();
+    let started_container = started_snapshot["containers"]
+        .as_array()
+        .expect("Expected containers array after start-forward")
+        .iter()
+        .find(|c| c["container_name"].as_str() == Some(container_name.as_str()))
+        .expect("Expected target container in list output after start-forward");
+    let started_mappings = started_container["mappings"]
+        .as_array()
+        .expect("Expected mappings array for target container after start-forward");
+    assert!(
+        started_mappings.iter().any(|m| {
+            m["container_port"].as_u64() == Some(3000)
+                && m["host_port"].as_u64() == Some(host_port as u64)
+        }),
+        "Expected mapping container 3000 -> host {} after start-forward",
+        host_port
+    );
+
+    let end_out = DevconRun::control_server_end_forward(
+        "127.0.0.1",
+        server_port,
+        &container_name,
+        3000,
+        &config,
+    );
+    end_out.assert_success();
+    let ended = end_out.json();
+    assert_eq!(
+        ended["container_name"].as_str(),
+        Some(container_name.as_str()),
+        "end-forward returned unexpected container_name"
+    );
+    assert_eq!(
+        ended["port"].as_u64(),
+        Some(3000),
+        "end-forward returned unexpected container port"
+    );
+
+    let list_after_end = DevconRun::control_server_list("127.0.0.1", server_port, &config);
+    list_after_end.assert_success();
+    let ended_snapshot = list_after_end.json();
+    let ended_container = ended_snapshot["containers"]
+        .as_array()
+        .expect("Expected containers array after end-forward")
+        .iter()
+        .find(|c| c["container_name"].as_str() == Some(container_name.as_str()))
+        .expect("Expected target container in list output after end-forward");
+    let ended_mappings = ended_container["mappings"]
+        .as_array()
+        .expect("Expected mappings array for target container after end-forward");
+    assert!(
+        !ended_mappings
+            .iter()
+            .any(|m| m["container_port"].as_u64() == Some(3000)),
+        "Did not expect container port 3000 mapping after end-forward"
     );
 }

@@ -1074,6 +1074,75 @@ impl DevconRun {
         ])
     }
 
+    /// Run `devcon control-server list --output json --host <host> --port <port>`.
+    pub fn control_server_list(host: &str, port: u16, config: &TestConfig) -> DevconOutput {
+        let port_s = port.to_string();
+        Self::run(&[
+            "--config",
+            config.path.to_str().unwrap(),
+            "--output",
+            "json",
+            "control-server",
+            "list",
+            "--host",
+            host,
+            "--port",
+            &port_s,
+        ])
+    }
+
+    /// Run `devcon control-server start-forward --output json ...`.
+    pub fn control_server_start_forward(
+        host: &str,
+        server_port: u16,
+        container: &str,
+        port: u16,
+        config: &TestConfig,
+    ) -> DevconOutput {
+        let server_port_s = server_port.to_string();
+        let port_s = port.to_string();
+        Self::run(&[
+            "--config",
+            config.path.to_str().unwrap(),
+            "--output",
+            "json",
+            "control-server",
+            "start-forward",
+            container,
+            &port_s,
+            "--host",
+            host,
+            "--server-port",
+            &server_port_s,
+        ])
+    }
+
+    /// Run `devcon control-server end-forward --output json ...`.
+    pub fn control_server_end_forward(
+        host: &str,
+        server_port: u16,
+        container: &str,
+        port: u16,
+        config: &TestConfig,
+    ) -> DevconOutput {
+        let server_port_s = server_port.to_string();
+        let port_s = port.to_string();
+        Self::run(&[
+            "--config",
+            config.path.to_str().unwrap(),
+            "--output",
+            "json",
+            "control-server",
+            "end-forward",
+            container,
+            &port_s,
+            "--host",
+            host,
+            "--server-port",
+            &server_port_s,
+        ])
+    }
+
     /// Spawn `devcon serve` on an unused port in the background.
     ///
     /// Returns a [`ServeGuard`] (kills the process on drop) and the port it is
