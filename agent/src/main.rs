@@ -3,7 +3,6 @@
 //! This agent runs inside the container and communicates with the host control server via TCP.
 
 use clap::{Parser, Subcommand};
-use daemonize::Daemonize;
 use devcon_proto::{
     AgentHello, AgentMessage, OpenUrl, SocketRelayData, StartPortForward, StartSocketRelay,
     StopPortForward, StopSocketRelay, agent_message,
@@ -15,6 +14,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU32;
@@ -23,8 +23,47 @@ use std::sync::mpsc::{self, TryRecvError};
 use std::time::Duration;
 
 const DEFAULT_SSH_PORT: u16 = 22;
+const DAEMONIZED_ENV: &str = "DEVCON_AGENT_DAEMONIZED";
 
 type RelayStreamMap = Arc<Mutex<std::collections::HashMap<u32, Arc<Mutex<UnixStream>>>>>;
+
+fn spawn_detached_daemon(
+    cli: &Cli,
+    scan_interval: u64,
+    excluded_ports: &HashSet<u16>,
+) -> io::Result<()> {
+    let exe = std::env::current_exe()?;
+
+    let mut command = Command::new(exe);
+    command
+        .arg("--control-host")
+        .arg(&cli.control_host)
+        .arg("--control-port")
+        .arg(cli.control_port.to_string())
+        .arg("daemon")
+        .arg("--scan-interval")
+        .arg(scan_interval.to_string())
+        .arg("--foreground")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env(DAEMONIZED_ENV, "1");
+
+    if !excluded_ports.is_empty() {
+        let mut ports: Vec<u16> = excluded_ports.iter().copied().collect();
+        ports.sort_unstable();
+        let ports_csv = ports
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        command.arg("--exclude-ports").arg(ports_csv);
+    }
+
+    let child = command.spawn()?;
+    eprintln!("Started daemon process with PID {}", child.id());
+    Ok(())
+}
 
 fn get_configured_ssh_port() -> u16 {
     std::env::var("DEVCON_SSH_PORT")
@@ -728,8 +767,8 @@ fn main() {
             // Parse excluded ports from CLI arg or environment variable
             let mut excluded_ports = HashSet::new();
 
-            if let Some(ports) = cli.exclude_ports {
-                excluded_ports.extend(ports);
+            if let Some(ref ports) = cli.exclude_ports {
+                excluded_ports.extend(ports.iter().copied());
             } else if let Ok(env_ports) = std::env::var("DEVCON_FORWARDED_PORTS") {
                 for port_str in env_ports.split(',') {
                     if let Ok(port) = port_str.trim().parse::<u16>() {
@@ -753,21 +792,20 @@ fn main() {
                     scan_interval,
                     excluded_ports,
                 )
+            } else if std::env::var_os(DAEMONIZED_ENV).is_some() {
+                run_daemon(
+                    &cli.control_host,
+                    cli.control_port,
+                    scan_interval,
+                    excluded_ports,
+                )
             } else {
                 eprintln!("Running in daemon mode");
-                // Daemonize the process
-                let daemonize = Daemonize::new();
-
-                match daemonize.start() {
-                    Ok(_) => run_daemon(
-                        &cli.control_host,
-                        cli.control_port,
-                        scan_interval,
-                        excluded_ports,
-                    ),
+                match spawn_detached_daemon(&cli, scan_interval, &excluded_ports) {
+                    Ok(()) => Ok(()),
                     Err(e) => {
-                        eprintln!("Failed to daemonize: {}", e);
-                        Err(io::Error::other(e))
+                        eprintln!("Failed to spawn daemon process: {}", e);
+                        Err(e)
                     }
                 }
             }

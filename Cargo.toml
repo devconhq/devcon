@@ -13,7 +13,6 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 yaml_serde = "0.10.4"
 tempfile = "3.27"
-oci-spec = "0.10.0"
 reqwest = { version = "0.13.4", features = ["blocking", "json"] }
 flate2 = { version = "1.1.9", features = ["zlib", "zlib-rs"] }
 tar = "0.4.46"
@@ -35,7 +34,6 @@ sha2 = "0.11"
 json-strip-comments = "3.1.1"
 comfy-table = "7.2.2"
 assert_cmd = "2.2.2"
-daemonize = "0.5"
 pidlock = "0.2.2"
 tokio = "1.52.3"
 openport = "0.3.0"
@@ -64,7 +62,6 @@ serde.workspace = true
 serde_json.workspace = true
 yaml_serde.workspace = true
 tempfile.workspace = true
-oci-spec.workspace = true
 reqwest.workspace = true
 flate2.workspace = true
 tar.workspace = true
