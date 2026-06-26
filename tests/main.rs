@@ -51,6 +51,18 @@ fn test_build_with_features() {
         .build();
     let out = DevconRun::build(workspace.path(), &config);
     out.assert_success();
+    out.assert_output_contains("Building Image complete");
+}
+
+#[test]
+fn test_build_with_features_verbose() {
+    skip_if_unavailable!(get_runtime());
+    let config = TestConfig::agents_disabled();
+    let workspace = DevcontainerBuilder::new("test-features")
+        .feature("ghcr.io/devcontainers/features/node", &[("version", "18")])
+        .build();
+    let out = DevconRun::build_verbose(workspace.path(), &config);
+    out.assert_success();
     out.assert_output_contains("Evaluated feature order:");
     out.assert_output_contains("Evaluated environment summary:");
     out.assert_output_contains("Feature build progress:");
