@@ -1011,6 +1011,17 @@ impl DevconRun {
             workspace.to_str().unwrap(),
         ])
     }
+    /// Run `devcon build <workspace>` with the given config and verbose flag.
+    pub fn build_verbose(workspace: &std::path::Path, config: &TestConfig) -> DevconOutput {
+        Self::run(&[
+            "--config",
+            config.path.to_str().unwrap(),
+            "-ddddd",
+            "build",
+            "--verbose",
+            workspace.to_str().unwrap(),
+        ])
+    }
 
     /// Run `devcon up --output json <workspace>` with the given config.
     pub fn up(workspace: &std::path::Path, config: &TestConfig) -> DevconOutput {
