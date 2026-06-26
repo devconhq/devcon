@@ -84,7 +84,9 @@ use crate::driver::environment::{
 use crate::driver::feature_process::{
     FeatureLockContext, FeatureProcessResult, LockMode, build_lockfile_from_features,
 };
-use crate::driver::lifecycle::{guard_with_marker, run_lifecycle_command};
+use crate::driver::lifecycle::{
+    guard_with_marker, run_lifecycle_command_always, run_lifecycle_command_once,
+};
 use crate::driver::runtime::{
     ContainerImageInfo, ContainerProbeInfo, FeatureProgressItem, RuntimeParameters,
 };
@@ -1060,7 +1062,22 @@ impl ContainerOrchestrator {
                 }
 
                 match self.runtime.start_container(handle.id()) {
-                    Ok(restarted) => return Ok(restarted.id().to_string()),
+                    Ok(restarted) => {
+                        if let Some(command) =
+                            &devcontainer_workspace.devcontainer.post_start_command
+                        {
+                            run_lifecycle_command_always(
+                                self.runtime.as_ref(),
+                                restarted.as_ref(),
+                                &devcontainer_workspace,
+                                command,
+                                false,
+                                true,
+                            )?;
+                        }
+
+                        return Ok(restarted.id().to_string());
+                    }
                     Err(e) => {
                         // start_container can still fail for other reasons (e.g. GPG socket
                         // path moved, other stale mounts, or runtime error). Remove the stale
@@ -1514,7 +1531,7 @@ impl ContainerOrchestrator {
         }
 
         if let Some(command) = &devcontainer_workspace.devcontainer.on_create_command {
-            run_lifecycle_command(
+            run_lifecycle_command_once(
                 self.runtime.as_ref(),
                 handle.as_ref(),
                 &devcontainer_workspace,
@@ -1656,7 +1673,7 @@ impl ContainerOrchestrator {
         }
 
         if let Some(command) = &devcontainer_workspace.devcontainer.post_create_command {
-            run_lifecycle_command(
+            run_lifecycle_command_once(
                 self.runtime.as_ref(),
                 handle.as_ref(),
                 &devcontainer_workspace,
@@ -1689,12 +1706,11 @@ impl ContainerOrchestrator {
             })?;
 
         if let Some(command) = &devcontainer_workspace.devcontainer.post_start_command {
-            run_lifecycle_command(
+            run_lifecycle_command_always(
                 self.runtime.as_ref(),
                 handle.as_ref(),
                 &devcontainer_workspace,
                 command,
-                "postStartCommand",
                 false,
                 true,
             )?;
@@ -2045,12 +2061,11 @@ impl ContainerOrchestrator {
         }
 
         if let Some(command) = &devcontainer_workspace.devcontainer.post_attach_command {
-            run_lifecycle_command(
+            run_lifecycle_command_always(
                 self.runtime.as_ref(),
                 handle,
                 &devcontainer_workspace,
                 command,
-                "postAttachCommand",
                 false,
                 true,
             )?;

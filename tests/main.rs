@@ -248,6 +248,81 @@ fn test_start_reuses_stopped_container() {
     }
 }
 
+#[test]
+fn test_post_start_command_runs_on_each_start() {
+    let runtime = get_runtime();
+    skip_if_unavailable!(runtime);
+    cleanup_test_artifacts(runtime, "test-post-start-repeat");
+
+    let config = TestConfig::agents_disabled();
+    let workspace = DevcontainerBuilder::new("test-post-start-repeat")
+        .post_start("printf 'start\n' >> /tmp/devcon-post-start.log")
+        .build();
+
+    let up_out = DevconRun::up(workspace.path(), &config);
+    up_out.assert_success();
+    let id_after_up = get_running_container_id(runtime, "test-post-start-repeat")
+        .expect("Failed to resolve running container id after up");
+
+    stop_container(runtime, &id_after_up);
+
+    let start_out = DevconRun::start(workspace.path(), &config);
+    start_out.assert_success();
+    let restarted_id = get_running_container_id(runtime, "test-post-start-repeat")
+        .expect("Failed to resolve running container id after start");
+
+    let restarted = ContainerHandle::new(restarted_id, runtime);
+    let line_count = restarted
+        .exec(&[
+            "sh",
+            "-lc",
+            "wc -l < /tmp/devcon-post-start.log | tr -d ' '",
+        ])
+        .expect("Failed to count postStartCommand log lines");
+    assert_eq!(
+        line_count.trim(),
+        "2",
+        "Expected postStartCommand to run on initial up and on restart"
+    );
+}
+
+#[test]
+fn test_post_attach_command_runs_on_each_attach() {
+    let runtime = get_runtime();
+    skip_if_unavailable!(runtime);
+    cleanup_test_artifacts(runtime, "test-post-attach-repeat");
+
+    let config = TestConfig::from_raw("defaultShell: true\nagents:\n  disable: true\n");
+    let workspace = DevcontainerBuilder::new("test-post-attach-repeat")
+        .post_attach("printf 'attach\n' >> /tmp/devcon-post-attach.log")
+        .build();
+
+    let up_out = DevconRun::up(workspace.path(), &config);
+    up_out.assert_success();
+    let container_id = get_running_container_id(runtime, "test-post-attach-repeat")
+        .expect("Failed to resolve running container id after up");
+
+    let first_shell = DevconRun::shell(workspace.path(), &config);
+    first_shell.assert_success();
+
+    let second_shell = DevconRun::shell(workspace.path(), &config);
+    second_shell.assert_success();
+
+    let container = ContainerHandle::new(container_id, runtime);
+    let line_count = container
+        .exec(&[
+            "sh",
+            "-lc",
+            "wc -l < /tmp/devcon-post-attach.log | tr -d ' '",
+        ])
+        .expect("Failed to count postAttachCommand log lines");
+    assert_eq!(
+        line_count.trim(),
+        "2",
+        "Expected postAttachCommand to run on each shell attach"
+    );
+}
+
 /// Regression (#85): second `devcon up` without config changes must not rebuild the image.
 #[test]
 fn test_up_does_not_rebuild_existing_image() {
