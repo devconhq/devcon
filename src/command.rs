@@ -126,7 +126,11 @@ fn print_metadata_summary(metadata: &MergedImageMetadata, verbose: bool) {
 
     if verbose {
         println!("Image metadata:");
-        let feature_label = if feature_count == 1 { "feature" } else { "features" };
+        let feature_label = if feature_count == 1 {
+            "feature"
+        } else {
+            "features"
+        };
         println!("  Features ({} {}):", feature_count, feature_label);
         if metadata.feature_ids.is_empty() {
             println!("    (none)");
@@ -308,7 +312,10 @@ pub fn handle_build_command(
     )?;
 
     if output == OutputFormat::Json {
-        let response = BuildResponse { success: true, metadata: Some(metadata) };
+        let response = BuildResponse {
+            success: true,
+            metadata: Some(metadata),
+        };
         println!("{}", serde_json::to_string_pretty(&response)?);
     } else {
         print_metadata_summary(&metadata, verbose);
@@ -780,7 +787,10 @@ pub fn handle_up_command(
     }
 
     if output == OutputFormat::Json {
-        let response = UpResponse { container_id, metadata: Some(metadata) };
+        let response = UpResponse {
+            container_id,
+            metadata: Some(metadata),
+        };
         println!("{}", serde_json::to_string_pretty(&response)?);
     } else {
         print_metadata_summary(&metadata, verbose);
