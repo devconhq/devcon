@@ -51,7 +51,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use crate::feature_ref::{
@@ -60,7 +60,7 @@ pub use crate::feature_ref::{
 pub use crate::lifecycle::{LifecycleCommand, LifecycleCommandValue};
 
 /// Represents a port forwarding configuration
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum ForwardPort {
     /// Simple port number
@@ -111,7 +111,7 @@ pub enum PortProtocol {
 }
 
 /// Mount configuration
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum Mount {
     /// String format for mount
@@ -121,7 +121,7 @@ pub enum Mount {
 }
 
 /// Structured mount configuration
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StructuredMount {
     #[serde(rename = "type")]
@@ -131,7 +131,7 @@ pub struct StructuredMount {
 }
 
 /// Type of mount
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MountType {
     Bind,

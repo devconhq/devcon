@@ -102,6 +102,7 @@ pub struct ContainerOrchestrator {
     config: Config,
     pub runtime: Box<dyn ContainerRuntime>,
     silent: bool,
+    verbose: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -136,6 +137,7 @@ impl ContainerOrchestrator {
             config,
             runtime,
             silent: false,
+            verbose: false,
         }
     }
 
@@ -149,7 +151,14 @@ impl ContainerOrchestrator {
             config,
             runtime,
             silent,
+            verbose: false,
         }
+    }
+
+    /// Enables or disables verbose metadata output.
+    pub fn with_verbose(mut self, verbose: bool) -> Self {
+        self.verbose = verbose;
+        self
     }
 
     /// Resolves a running container ID for the given workspace.
@@ -502,6 +511,7 @@ impl ContainerOrchestrator {
             build_path,
             FeatureLockOptions::default(),
         )
+        .map(|_| ())
     }
 
     pub fn build_with_lock_options(
@@ -510,7 +520,7 @@ impl ContainerOrchestrator {
         env_variables: &[String],
         build_path: Option<PathBuf>,
         lock_options: FeatureLockOptions,
-    ) -> Result<()> {
+    ) -> Result<schema::MergedImageMetadata> {
         self.build_with_features(
             devcontainer_workspace,
             env_variables,
@@ -551,7 +561,7 @@ impl ContainerOrchestrator {
         processed_features: Option<Vec<FeatureProcessResult>>,
         build_path: Option<PathBuf>,
         lock_options: FeatureLockOptions,
-    ) -> Result<()> {
+    ) -> Result<schema::MergedImageMetadata> {
         let ctx = BuildContext::new(build_path)?;
         info!(
             "Building container in temporary directory: {}",
@@ -575,7 +585,7 @@ impl ContainerOrchestrator {
 
         let feature_progress = self.build_feature_progress_items(&processed_features);
 
-        if !self.silent {
+        if !self.silent && self.verbose {
             self.print_feature_evaluation_order(&feature_progress);
         }
 
@@ -659,7 +669,7 @@ impl ContainerOrchestrator {
                 .clone()
         };
 
-        // Determine probe user hint from devcontainer.json or metadata label.
+        // Determine probe user hint from devcontainer.json or existing metadata label.
         let probe_user_hint = devcontainer_workspace
             .devcontainer
             .remote_user
@@ -670,22 +680,7 @@ impl ContainerOrchestrator {
                     .ok()
                     .flatten()
                     .as_ref()
-                    .and_then(|inspect| {
-                        let label_str = inspect
-                            .config
-                            .labels
-                            .get("devcontainer.metadata")
-                            .map(String::as_str)?;
-                        let entries: serde_json::Value = serde_json::from_str(label_str).ok()?;
-                        entries.as_array()?.iter().rev().find_map(|entry| {
-                            entry
-                                .get("remoteUser")
-                                .and_then(|u| u.as_str())
-                                .map(str::trim)
-                                .filter(|s| !s.is_empty())
-                                .map(ToString::to_string)
-                        })
-                    })
+                    .and_then(Self::remote_user_from_metadata)
             });
 
         let probe_info = self
@@ -696,7 +691,6 @@ impl ContainerOrchestrator {
 
         let resolved_users =
             self.resolve_users_for_image(&devcontainer_workspace, &base_image, probe_info.as_ref());
-        let image_architecture = self.resolve_image_architecture(&base_image, probe_info.as_ref());
 
         let base_env =
             base_container_environment(self.runtime.as_ref(), &base_image, probe_info.as_ref());
@@ -707,7 +701,7 @@ impl ContainerOrchestrator {
             &base_env,
         );
 
-        if !self.silent {
+        if !self.silent && self.verbose {
             self.print_build_environment_summary(
                 &evaluated_env,
                 &base_env,
@@ -716,6 +710,89 @@ impl ContainerOrchestrator {
             );
             println!("Building Image");
         }
+
+        // Build the devcontainer.metadata label:
+        // 1. Prepend any entries already present on the base image.
+        // 2. Append one entry per feature.
+        // 3. Append one entry for devcontainer.json.
+        let mut metadata_entries: Vec<schema::ImageMetadataEntry> = self
+            .runtime
+            .inspect_image(&base_image)
+            .ok()
+            .flatten()
+            .as_ref()
+            .and_then(|inspect| {
+                inspect
+                    .config
+                    .labels
+                    .get("devcontainer.metadata")
+                    .map(|s| schema::parse_metadata_label(s))
+            })
+            .unwrap_or_default();
+
+        for feature_result in &processed_features {
+            let f = &feature_result.feature;
+            let mounts = f.mounts.as_ref().map(|ms| {
+                ms.iter()
+                    .filter_map(|m| serde_json::to_value(m).ok())
+                    .collect::<Vec<_>>()
+            });
+            metadata_entries.push(schema::ImageMetadataEntry {
+                id: Some(f.id.clone()),
+                init: f.init,
+                privileged: f.privileged,
+                cap_add: f.cap_add.clone(),
+                security_opt: f.security_opt.clone(),
+                entrypoint: f.entrypoint.clone(),
+                mounts,
+                container_env: f.container_env.clone(),
+                on_create_command: f.on_create_command.clone(),
+                update_content_command: f.update_content_command.clone(),
+                post_create_command: f.post_create_command.clone(),
+                post_start_command: f.post_start_command.clone(),
+                post_attach_command: f.post_attach_command.clone(),
+                ..Default::default()
+            });
+        }
+
+        // devcontainer.json entry (no id)
+        {
+            let dc = &devcontainer_workspace.devcontainer;
+            let mounts = dc.mounts.as_ref().map(|ms| {
+                ms.iter()
+                    .filter_map(|m| serde_json::to_value(m).ok())
+                    .collect::<Vec<_>>()
+            });
+            let forward_ports = dc.forward_ports.as_ref().map(|ps| {
+                ps.iter()
+                    .filter_map(|p| serde_json::to_value(p).ok())
+                    .collect::<Vec<_>>()
+            });
+            let remote_env = dc.remote_env.clone();
+            metadata_entries.push(schema::ImageMetadataEntry {
+                remote_user: dc.remote_user.clone(),
+                container_user: dc.container_user.clone(),
+                container_env: dc.container_env.clone(),
+                remote_env,
+                mounts,
+                forward_ports,
+                init: dc.init,
+                privileged: dc.privileged,
+                cap_add: dc.cap_add.clone(),
+                security_opt: dc.security_opt.clone(),
+                on_create_command: dc.on_create_command.clone(),
+                update_content_command: dc.update_content_command.clone(),
+                post_create_command: dc.post_create_command.clone(),
+                post_start_command: dc.post_start_command.clone(),
+                post_attach_command: dc.post_attach_command.clone(),
+                override_command: dc.override_command,
+                update_remote_user_uid: dc.update_remote_user_uid,
+                ..Default::default()
+            });
+        }
+
+        let metadata_label =
+            serde_json::to_string(&metadata_entries).unwrap_or_else(|_| "[]".to_string());
 
         // Phase 2: Build features Dockerfile using base_image
         let config_hash = self.get_devcontainer_id(&devcontainer_workspace);
@@ -734,7 +811,7 @@ impl ContainerOrchestrator {
             workspace_name: &workspace_name,
             runtime_host_address: &self.runtime.get_host_address(),
             config_hash: &config_hash,
-            image_architecture: &image_architecture,
+            metadata_label: &metadata_label,
             feature_install: &feature_install,
             env_setup: &env_setup,
             dotfiles_setup: &dotfiles_setup,
@@ -760,7 +837,60 @@ impl ContainerOrchestrator {
             self.silent,
         )?;
 
-        Ok(())
+        // Read back the metadata label from the built image and merge.
+        let merged = self
+            .runtime
+            .inspect_image(&latest_tag)
+            .ok()
+            .flatten()
+            .as_ref()
+            .and_then(|inspect| {
+                inspect
+                    .config
+                    .labels
+                    .get("devcontainer.metadata")
+                    .map(|s| schema::merge_metadata_entries(&schema::parse_metadata_label(s)))
+            })
+            .unwrap_or_default();
+
+        Ok(merged)
+    }
+
+    /// Reads the `devcontainer.metadata` label from the latest built image for
+    /// the given workspace and returns the merged metadata.  Returns an empty
+    /// [`MergedImageMetadata`] when the image does not exist or has no label.
+    pub fn read_image_metadata(
+        &self,
+        devcontainer_workspace: &Workspace,
+    ) -> schema::MergedImageMetadata {
+        let latest_tag = format!("{}:latest", self.get_image_tag(devcontainer_workspace));
+        self.runtime
+            .inspect_image(&latest_tag)
+            .ok()
+            .flatten()
+            .as_ref()
+            .and_then(|inspect| {
+                inspect
+                    .config
+                    .labels
+                    .get("devcontainer.metadata")
+                    .map(|s| schema::merge_metadata_entries(&schema::parse_metadata_label(s)))
+            })
+            .unwrap_or_default()
+    }
+
+    /// Extracts `remoteUser` from the `devcontainer.metadata` label of an
+    /// already-inspected image, using the last entry that specifies the field.
+    fn remote_user_from_metadata(inspect: &ContainerImageInfo) -> Option<String> {
+        let label_str = inspect
+            .config
+            .labels
+            .get("devcontainer.metadata")
+            .map(String::as_str)?;
+        schema::parse_metadata_label(label_str)
+            .into_iter()
+            .rev()
+            .find_map(|e| e.remote_user.filter(|u| !u.trim().is_empty()))
     }
 
     /// Starts a container from a built image.
@@ -984,22 +1114,7 @@ impl ContainerOrchestrator {
                     .ok()
                     .flatten()
                     .as_ref()
-                    .and_then(|inspect| {
-                        let label_str = inspect
-                            .config
-                            .labels
-                            .get("devcontainer.metadata")
-                            .map(String::as_str)?;
-                        let entries: serde_json::Value = serde_json::from_str(label_str).ok()?;
-                        entries.as_array()?.iter().rev().find_map(|entry| {
-                            entry
-                                .get("remoteUser")
-                                .and_then(|u| u.as_str())
-                                .map(str::trim)
-                                .filter(|s| !s.is_empty())
-                                .map(ToString::to_string)
-                        })
-                    })
+                    .and_then(Self::remote_user_from_metadata)
             });
 
         let probe_info = self
@@ -1985,22 +2100,7 @@ impl ContainerOrchestrator {
             .ok()
             .flatten()
             .as_ref()
-            .and_then(|inspect| {
-                let label_str = inspect
-                    .config
-                    .labels
-                    .get("devcontainer.metadata")
-                    .map(String::as_str)?;
-                let entries: serde_json::Value = serde_json::from_str(label_str).ok()?;
-                entries.as_array()?.iter().rev().find_map(|entry| {
-                    entry
-                        .get("remoteUser")
-                        .and_then(|u| u.as_str())
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(ToString::to_string)
-                })
-            })
+            .and_then(Self::remote_user_from_metadata)
     }
 
     fn feature_display_label(feature: &FeatureProcessResult) -> String {
@@ -2321,27 +2421,15 @@ impl ContainerOrchestrator {
         let inspect_architecture = inspect
             .as_ref()
             .and_then(Self::extract_architecture_from_inspect);
-        let labeled_architecture = inspect.as_ref().and_then(|i| {
-            i.config
-                .labels
-                .get("devcon.image-architecture")
-                .map(|arch| Self::canonical_image_architecture(arch))
-        });
         let image_architecture = detected_architecture
             .or(inspect_architecture)
-            .or(labeled_architecture)
             .unwrap_or_else(Self::host_image_architecture);
 
         debug!(
-            "Resolved image architecture for '{}': probe={:?}, inspect={:?}, label={:?}, final='{}'",
+            "Resolved image architecture for '{}': probe={:?}, inspect={:?}, final='{}'",
             image_tag,
             probe_info.and_then(|i| i.architecture.as_deref()),
             inspect.as_ref().and_then(|i| i.architecture.as_deref()),
-            inspect.as_ref().and_then(|i| i
-                .config
-                .labels
-                .get("devcon.image-architecture")
-                .map(String::as_str)),
             image_architecture
         );
 

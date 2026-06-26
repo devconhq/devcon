@@ -49,7 +49,8 @@ pub(crate) struct DockerfileParams<'a> {
     pub workspace_name: &'a str,
     pub runtime_host_address: &'a str,
     pub config_hash: &'a str,
-    pub image_architecture: &'a str,
+    /// JSON-serialised `devcontainer.metadata` label value (array of entries).
+    pub metadata_label: &'a str,
     pub feature_install: &'a str,
     pub env_setup: &'a str,
     pub dotfiles_setup: &'a str,
@@ -273,7 +274,7 @@ ENV _REMOTE_USER_HOME={{ remote_user_home }}
 ENV _CONTAINER_USER_HOME={{ container_user_home }}
 ENV DEVCON_CONTROL_HOST={{ runtime_host_address }}
 LABEL devcon.config-hash={{ config_hash }}
-LABEL devcon.image-architecture={{ image_architecture }}
+LABEL devcontainer.metadata={{ metadata_label }}
 
 USER root
 RUN mkdir /tmp/features
@@ -303,7 +304,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
             workspace_name => params.workspace_name,
             runtime_host_address => params.runtime_host_address,
             config_hash => params.config_hash,
-            image_architecture => params.image_architecture,
+            metadata_label => params.metadata_label,
         })?;
 
         fs::write(&dockerfile, contents)?;
@@ -567,7 +568,7 @@ mod tests {
                 workspace_name: "workspace",
                 runtime_host_address: "host.docker.internal",
                 config_hash: "abc123",
-                image_architecture: "arm64",
+                metadata_label: "[]",
                 feature_install: "",
                 env_setup: "",
                 dotfiles_setup: "",

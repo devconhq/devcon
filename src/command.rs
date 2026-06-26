@@ -57,6 +57,8 @@ use pidlock::Pidlock;
 use serde::Serialize;
 use tracing::{debug, info, trace, warn};
 
+use schema::MergedImageMetadata;
+
 const SSH_CONFIG_MARKER_START_PREFIX: &str = "# devcon-managed-start:";
 const SSH_CONFIG_MARKER_END_PREFIX: &str = "# devcon-managed-end:";
 
@@ -111,11 +113,73 @@ fn warn_if_serve_not_running() {
     }
 }
 
+// ── Metadata display ──────────────────────────────────────────────────────
+
+/// Prints a summary of the merged image metadata to stdout.
+///
+/// In non-verbose mode a single line is printed.  With `verbose` a multi-line
+/// block is printed that includes feature IDs, environment keys, mounts, and
+/// lifecycle hooks.
+fn print_metadata_summary(metadata: &MergedImageMetadata, verbose: bool) {
+    let feature_count = metadata.feature_ids.len();
+    let remote_user = metadata.remote_user.as_deref().unwrap_or("root");
+
+    if verbose {
+        println!("Image metadata:");
+        let feature_label = if feature_count == 1 { "feature" } else { "features" };
+        println!("  Features ({} {}):", feature_count, feature_label);
+        if metadata.feature_ids.is_empty() {
+            println!("    (none)");
+        } else {
+            for id in &metadata.feature_ids {
+                println!("    - {}", id);
+            }
+        }
+        println!("  Remote user: {}", remote_user);
+        if !metadata.container_env.is_empty() {
+            let mut keys: Vec<&str> = metadata.container_env.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            println!("  Container env: {}", keys.join(", "));
+        }
+        if !metadata.mounts.is_empty() {
+            println!("  Mounts: {}", metadata.mounts.len());
+        }
+        let mut hooks: Vec<&str> = Vec::new();
+        if !metadata.on_create_commands.is_empty() {
+            hooks.push("onCreateCommand");
+        }
+        if !metadata.update_content_commands.is_empty() {
+            hooks.push("updateContentCommand");
+        }
+        if !metadata.post_create_commands.is_empty() {
+            hooks.push("postCreateCommand");
+        }
+        if !metadata.post_start_commands.is_empty() {
+            hooks.push("postStartCommand");
+        }
+        if !metadata.post_attach_commands.is_empty() {
+            hooks.push("postAttachCommand");
+        }
+        if !hooks.is_empty() {
+            println!("  Lifecycle hooks: {}", hooks.join(", "));
+        }
+    } else {
+        let features_part = if feature_count == 1 {
+            "1 feature".to_string()
+        } else {
+            format!("{} features", feature_count)
+        };
+        println!("Image ready: {}, remoteUser={}", features_part, remote_user);
+    }
+}
+
 // ── JSON response structs ──────────────────────────────────────────────────
 
 #[derive(Serialize)]
 pub struct BuildResponse {
     pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<schema::MergedImageMetadata>,
 }
 
 #[derive(Serialize)]
@@ -126,6 +190,8 @@ pub struct StartResponse {
 #[derive(Serialize)]
 pub struct UpResponse {
     pub container_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<schema::MergedImageMetadata>,
 }
 
 #[derive(Serialize)]
@@ -207,7 +273,7 @@ pub struct ControlServerForwardResponse {
 /// # use devcon::command::handle_build_command;
 ///
 /// let project_path = PathBuf::from("/path/to/project");
-/// handle_build_command(project_path, None, None, devcon::output::OutputFormat::Text, false)?;
+/// handle_build_command(project_path, None, None, devcon::output::OutputFormat::Text, false, false)?;
 /// # Ok::<(), devcon::error::Error>(())
 /// ```
 pub fn handle_build_command(
@@ -216,6 +282,7 @@ pub fn handle_build_command(
     config_path: Option<PathBuf>,
     output: OutputFormat,
     frozen_lockfile: bool,
+    verbose: bool,
 ) -> Result<()> {
     let config = Config::load(config_path)?;
 
@@ -230,25 +297,21 @@ pub fn handle_build_command(
     debug!("Using runtime {:?}", runtime_name);
     let runtime = get_runtime_specific_config(&config, &runtime_name)?;
 
-    let driver = ContainerOrchestrator::new_silent(config, runtime, output == OutputFormat::Json);
+    let driver = ContainerOrchestrator::new_silent(config, runtime, output == OutputFormat::Json)
+        .with_verbose(verbose);
 
-    let result = driver.build_with_lock_options(
+    let metadata = driver.build_with_lock_options(
         devcontainer_workspace,
         &[],
         effective_build_path,
         FeatureLockOptions { frozen_lockfile },
-    );
-
-    if result.is_err() {
-        return Err(Error::new(format!(
-            "Failed to build the development container. Error: {:?}",
-            result.err()
-        )));
-    }
+    )?;
 
     if output == OutputFormat::Json {
-        let response = BuildResponse { success: true };
+        let response = BuildResponse { success: true, metadata: Some(metadata) };
         println!("{}", serde_json::to_string_pretty(&response)?);
+    } else {
+        print_metadata_summary(&metadata, verbose);
     }
 
     Ok(())
@@ -643,7 +706,7 @@ fn replace_or_append_host_block_by_alias(
 /// # use devcon::command::handle_up_command;
 ///
 /// let project_path = PathBuf::from("/path/to/project");
-/// handle_up_command(project_path, None, None, devcon::output::OutputFormat::Text, false, false)?;
+/// handle_up_command(project_path, None, None, devcon::output::OutputFormat::Text, false, false, false)?;
 /// # Ok::<(), devcon::error::Error>(())
 /// ```
 pub fn handle_up_command(
@@ -653,6 +716,7 @@ pub fn handle_up_command(
     output: OutputFormat,
     force_rebuild: bool,
     frozen_lockfile: bool,
+    verbose: bool,
 ) -> Result<()> {
     warn_if_serve_not_running();
     let config = Config::load(config_path)?;
@@ -667,7 +731,8 @@ pub fn handle_up_command(
     debug!("Using runtime {:?}", runtime_name);
     let runtime = get_runtime_specific_config(&config, &runtime_name)?;
 
-    let driver = ContainerOrchestrator::new_silent(config, runtime, output == OutputFormat::Json);
+    let driver = ContainerOrchestrator::new_silent(config, runtime, output == OutputFormat::Json)
+        .with_verbose(verbose);
 
     // Process features once
     let lock_options = FeatureLockOptions { frozen_lockfile };
@@ -681,8 +746,9 @@ pub fn handle_up_command(
     // container as stale and create a new one on every `devcon up` — the bug reported in #85.
     // The config hash (stored as a LABEL on the image) detects genuine changes while keeping
     // the no-op fast-path when nothing has changed.
-    if !force_rebuild && driver.image_is_current(&devcontainer_workspace)? {
+    let metadata = if !force_rebuild && driver.image_is_current(&devcontainer_workspace)? {
         debug!("Config hash unchanged, skipping build");
+        driver.read_image_metadata(&devcontainer_workspace)
     } else {
         if force_rebuild {
             debug!("Force rebuild requested, rebuilding image");
@@ -693,8 +759,8 @@ pub fn handle_up_command(
             Some(processed_features.clone()),
             effective_build_path,
             lock_options,
-        )?;
-    }
+        )?
+    };
 
     // Start the container with pre-processed features
     let container_id = driver.start_with_features(
@@ -714,13 +780,11 @@ pub fn handle_up_command(
     }
 
     if output == OutputFormat::Json {
-        let response = UpResponse { container_id };
+        let response = UpResponse { container_id, metadata: Some(metadata) };
         println!("{}", serde_json::to_string_pretty(&response)?);
     } else {
-        println!(
-            "Container built and started. Container ID: {}",
-            container_id
-        );
+        print_metadata_summary(&metadata, verbose);
+        println!("Container ID: {}", container_id);
     }
 
     Ok(())
