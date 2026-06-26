@@ -673,6 +673,8 @@ pub struct DevcontainerBuilder {
     features: HashMap<String, serde_json::Value>,
     on_create: Option<serde_json::Value>,
     post_create: Option<serde_json::Value>,
+    post_start: Option<serde_json::Value>,
+    post_attach: Option<serde_json::Value>,
     remote_env: HashMap<String, String>,
     container_env: HashMap<String, String>,
     local_features: Vec<LocalFeatureSpec>,
@@ -686,6 +688,8 @@ impl DevcontainerBuilder {
             features: HashMap::new(),
             on_create: None,
             post_create: None,
+            post_start: None,
+            post_attach: None,
             remote_env: HashMap::new(),
             container_env: HashMap::new(),
             local_features: Vec::new(),
@@ -736,6 +740,18 @@ impl DevcontainerBuilder {
     /// Set `postCreateCommand` to a JSON value.
     pub fn post_create_value(mut self, cmd: serde_json::Value) -> Self {
         self.post_create = Some(cmd);
+        self
+    }
+
+    /// Set `postStartCommand` to a shell string.
+    pub fn post_start(mut self, cmd: impl Into<String>) -> Self {
+        self.post_start = Some(serde_json::Value::String(cmd.into()));
+        self
+    }
+
+    /// Set `postAttachCommand` to a shell string.
+    pub fn post_attach(mut self, cmd: impl Into<String>) -> Self {
+        self.post_attach = Some(serde_json::Value::String(cmd.into()));
         self
     }
 
@@ -858,6 +874,12 @@ impl DevcontainerBuilder {
         if let Some(cmd) = self.post_create {
             config["postCreateCommand"] = cmd;
         }
+        if let Some(cmd) = self.post_start {
+            config["postStartCommand"] = cmd;
+        }
+        if let Some(cmd) = self.post_attach {
+            config["postAttachCommand"] = cmd;
+        }
         if !self.container_env.is_empty() {
             config["containerEnv"] = serde_json::Value::Object(
                 self.container_env
@@ -941,23 +963,30 @@ impl DevconOutput {
     /// Parse stdout as JSON.  Panics with full output if parsing fails.
     #[track_caller]
     pub fn json(&self) -> serde_json::Value {
-        // The agent inside the container may emit terminal escape sequences (e.g.
-        // OSC title-set `]0;...{...}`) before the JSON object.  These contain
-        // '{' characters that confuse a naive first-'{' search.  The actual JSON
-        // object always starts with '{' at the beginning of a new line, so look
-        // for '\n{' first; fall back to the first '{' if the output has no
-        // preceding newline (e.g. bare JSON output).
         let trimmed = self.stdout.trim();
-        let json_start = trimmed
-            .find("\n{")
-            .map(|i| i + 1)
-            .unwrap_or_else(|| trimmed.find('{').unwrap_or(0));
-        serde_json::from_str(&trimmed[json_start..]).unwrap_or_else(|err| {
-            panic!(
-                "devcon output is not valid JSON: {err}\nStdout:\n{}\nStderr:\n{}",
-                self.stdout, self.stderr
-            )
-        })
+        let mut candidates = Vec::new();
+
+        if let Some(index) = trimmed.find('{') {
+            candidates.push(index);
+        }
+
+        for (index, _) in trimmed.match_indices("\n{") {
+            candidates.push(index + 1);
+        }
+
+        candidates.sort_unstable();
+        candidates.dedup();
+
+        for json_start in candidates {
+            if let Ok(value) = serde_json::from_str(&trimmed[json_start..]) {
+                return value;
+            }
+        }
+
+        panic!(
+            "devcon output is not valid JSON.\nStdout:\n{}\nStderr:\n{}",
+            self.stdout, self.stderr
+        )
     }
 
     /// Extract the `container_id` field from JSON stdout.
@@ -1071,6 +1100,31 @@ impl DevconRun {
             "start",
             workspace.to_str().unwrap(),
         ])
+    }
+
+    /// Run `devcon shell <workspace>`.
+    pub fn shell(workspace: &std::path::Path, config: &TestConfig) -> DevconOutput {
+        use assert_cmd::cargo::cargo_bin;
+
+        let devcon = cargo_bin("devcon");
+        let output = Command::new("script")
+            .args([
+                "-q",
+                "/dev/null",
+                devcon.to_str().unwrap(),
+                "--config",
+                config.path.to_str().unwrap(),
+                "shell",
+                workspace.to_str().unwrap(),
+            ])
+            .output()
+            .expect("Failed to spawn devcon shell under script");
+
+        DevconOutput {
+            status: output.status,
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }
     }
 
     /// Run `devcon ssh connect --proxy <workspace>`.

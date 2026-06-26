@@ -22,9 +22,9 @@
 
 //! # Lifecycle Command Execution
 //!
-//! Helpers for running `onCreateCommand`, `postCreateCommand`, `postStartCommand`,
-//! and `postAttachCommand` hooks inside a running container, guarded by idempotency
-//! markers so each hook only executes once per container instance.
+//! Helpers for running devcontainer lifecycle hooks inside a running container.
+//! Some hooks are guarded by idempotency markers so they execute once per
+//! container instance, while others should run on every start or attach.
 
 use crate::devcontainer::{LifecycleCommand, LifecycleCommandValue};
 use crate::driver::runtime::{ContainerHandle, ContainerRuntime};
@@ -132,24 +132,14 @@ fn exec_lifecycle_value(
     }
 }
 
-/// Runs a lifecycle command hook inside the container, guarded by an idempotency marker.
-///
-/// If the marker already exists the command is skipped.  On success the marker is
-/// created so the command will not run again (relevant once containers are persisted
-/// across stop/start cycles).
-pub(crate) fn run_lifecycle_command(
+fn execute_lifecycle_command(
     runtime: &dyn ContainerRuntime,
     handle: &dyn ContainerHandle,
     devcontainer_workspace: &Workspace,
     command: &LifecycleCommand,
-    marker_name: &str,
     attach_stdin: bool,
     attach_stdout: bool,
 ) -> Result<()> {
-    if lifecycle_marker_exists(runtime, handle, marker_name) {
-        return Ok(());
-    }
-
     match command {
         LifecycleCommand::String(cmd) => exec_shell_lifecycle_command(
             runtime,
@@ -184,7 +174,55 @@ pub(crate) fn run_lifecycle_command(
         }
     }
 
+    Ok(())
+}
+
+/// Runs a lifecycle command hook inside the container, guarded by an idempotency marker.
+///
+/// If the marker already exists the command is skipped. On success the marker is
+/// created so the command will not run again.
+pub(crate) fn run_lifecycle_command_once(
+    runtime: &dyn ContainerRuntime,
+    handle: &dyn ContainerHandle,
+    devcontainer_workspace: &Workspace,
+    command: &LifecycleCommand,
+    marker_name: &str,
+    attach_stdin: bool,
+    attach_stdout: bool,
+) -> Result<()> {
+    if lifecycle_marker_exists(runtime, handle, marker_name) {
+        return Ok(());
+    }
+
+    execute_lifecycle_command(
+        runtime,
+        handle,
+        devcontainer_workspace,
+        command,
+        attach_stdin,
+        attach_stdout,
+    )?;
+
     create_lifecycle_marker(runtime, handle, marker_name)
+}
+
+/// Runs a lifecycle command hook inside the container every time it is invoked.
+pub(crate) fn run_lifecycle_command_always(
+    runtime: &dyn ContainerRuntime,
+    handle: &dyn ContainerHandle,
+    devcontainer_workspace: &Workspace,
+    command: &LifecycleCommand,
+    attach_stdin: bool,
+    attach_stdout: bool,
+) -> Result<()> {
+    execute_lifecycle_command(
+        runtime,
+        handle,
+        devcontainer_workspace,
+        command,
+        attach_stdin,
+        attach_stdout,
+    )
 }
 
 /// Wraps a shell command string so it runs at most once inside the container,
