@@ -168,6 +168,10 @@ enum Commands {
             help = "Resolve features from devcontainer-lock.json and do not update it."
         )]
         frozen_lockfile: bool,
+
+        /// Show detailed image metadata after build.
+        #[arg(long, help = "Show detailed image metadata summary after build.")]
+        verbose: bool,
     },
 
     /// Starts a development container for the specified path
@@ -204,6 +208,10 @@ enum Commands {
             help = "Resolve features from devcontainer-lock.json and do not update it."
         )]
         frozen_lockfile: bool,
+
+        /// Show detailed image metadata after build.
+        #[arg(long, help = "Show detailed image metadata summary after build/start.")]
+        verbose: bool,
     },
     /// Execs a shell in a development container for the specified path
     #[command(about = "Exec a shell in a development container with the devcontainer CLI")]
@@ -300,6 +308,7 @@ fn main() {
                 path,
                 build_path,
                 frozen_lockfile,
+                verbose,
             } => {
                 handle_build_command(
                     path.clone().unwrap_or(PathBuf::from(".").to_path_buf()),
@@ -307,6 +316,7 @@ fn main() {
                     config_path,
                     output,
                     *frozen_lockfile,
+                    *verbose,
                 )?;
             }
             Commands::Start { path } => {
@@ -321,6 +331,7 @@ fn main() {
                 build_path,
                 force_rebuild,
                 frozen_lockfile,
+                verbose,
             } => {
                 handle_up_command(
                     path.clone().unwrap_or(PathBuf::from(".").to_path_buf()),
@@ -329,6 +340,7 @@ fn main() {
                     output,
                     *force_rebuild,
                     *frozen_lockfile,
+                    *verbose,
                 )?;
             }
             Commands::Shell { path, env } => {

@@ -193,7 +193,7 @@ pub fn process_features(
     lock_context: &FeatureLockContext,
 ) -> Result<Vec<FeatureProcessResult>> {
     if !silent {
-        println!("Processing devcontainer features");
+        debug!("Processing devcontainer features");
     }
     let mut initial_results: Vec<FeatureProcessResult> = vec![];
 

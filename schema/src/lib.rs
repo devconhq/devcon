@@ -24,10 +24,14 @@ pub mod devcontainer;
 pub mod error;
 pub mod feature;
 mod feature_ref;
+pub mod image_metadata;
 pub mod lifecycle;
 pub mod lockfile;
 
 pub use devcontainer::*;
 pub use error::{Error, Result};
+pub use image_metadata::{
+    ImageMetadataEntry, MergedImageMetadata, merge_metadata_entries, parse_metadata_label,
+};
 pub use lifecycle::{LifecycleCommand, LifecycleCommandValue};
 pub use lockfile::*;
