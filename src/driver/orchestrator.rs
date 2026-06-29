@@ -2207,12 +2207,11 @@ impl ContainerOrchestrator {
             ));
         };
 
-        if let Ok(existing) = fs::read_to_string(&lock_path) {
-            if let Ok(existing_lockfile) = serde_json::from_str::<DevcontainerLockfile>(&existing) {
-                if &existing_lockfile == lockfile {
-                    return Ok(());
-                }
-            }
+        if let Ok(existing) = fs::read_to_string(&lock_path)
+            && let Ok(existing_lockfile) = serde_json::from_str::<DevcontainerLockfile>(&existing)
+            && &existing_lockfile == lockfile
+        {
+            return Ok(());
         }
 
         let mut serialized = serde_json::to_string_pretty(lockfile)?;
