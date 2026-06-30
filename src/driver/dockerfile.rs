@@ -39,6 +39,15 @@ use crate::driver::feature_process::FeatureProcessResult;
 use crate::driver::runtime::FEATURE_DONE_MARKER_PREFIX;
 use crate::error::{Error, Result};
 
+/// Escapes characters that Dockerfile may interpret in LABEL values.
+///
+/// In particular, `$` must be escaped so `${localEnv:...}` placeholders in
+/// `devcontainer.metadata` are preserved literally instead of being treated as
+/// Docker build-time variable interpolation.
+fn escape_dockerfile_label_value(value: &str) -> String {
+    value.replace('$', "\\$")
+}
+
 /// Metadata required to render the features Dockerfile template.
 pub(crate) struct DockerfileParams<'a> {
     pub base_image: &'a str,
@@ -292,6 +301,8 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
 "#,
         )?;
 
+        let escaped_metadata_label = escape_dockerfile_label_value(params.metadata_label);
+
         let contents = template.render(minijinja::context! {
             image => params.base_image,
             remote_user => params.remote_user,
@@ -304,7 +315,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
             workspace_name => params.workspace_name,
             runtime_host_address => params.runtime_host_address,
             config_hash => params.config_hash,
-            metadata_label => params.metadata_label,
+            metadata_label => escaped_metadata_label,
         })?;
 
         fs::write(&dockerfile, contents)?;
@@ -452,6 +463,46 @@ mod tests {
         let result = apply_feature_order_override(features, &["nonexistent".to_string()]).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].feature.id, "a");
+    }
+
+    #[test]
+    fn test_escape_dockerfile_label_value_escapes_dollar_tokens() {
+        let input = r#"[{"containerEnv":{"GH_TOKEN":"${localEnv:GH_TOKEN}"}}]"#;
+        let escaped = escape_dockerfile_label_value(input);
+        assert_eq!(
+            escaped,
+            r#"[{"containerEnv":{"GH_TOKEN":"\${localEnv:GH_TOKEN}"}}]"#
+        );
+    }
+
+    #[test]
+    fn test_write_dockerfile_escapes_metadata_local_env_tokens() {
+        let ctx = BuildContext::new(None).unwrap();
+        let dockerfile_path = ctx
+            .write_dockerfile(&DockerfileParams {
+                base_image: "mcr.microsoft.com/devcontainers/base:ubuntu",
+                remote_user: "vscode",
+                container_user: "vscode",
+                remote_user_home: "/home/vscode",
+                container_user_home: "/home/vscode",
+                workspace_name: "workspace",
+                runtime_host_address: "host.docker.internal",
+                config_hash: "abc123",
+                metadata_label: r#"[{"containerEnv":{"GH_TOKEN":"${localEnv:GH_TOKEN}"}}]"#,
+                feature_install: "",
+                env_setup: "",
+                dotfiles_setup: "",
+            })
+            .unwrap();
+
+        let dockerfile = std::fs::read_to_string(dockerfile_path).unwrap();
+        assert!(
+            dockerfile.contains(
+                r#"LABEL devcontainer.metadata=[{"containerEnv":{"GH_TOKEN":"\${localEnv:GH_TOKEN}"}}]"#
+            ),
+            "Dockerfile metadata label did not escape localEnv token:\n{}",
+            dockerfile
+        );
     }
 
     #[test]

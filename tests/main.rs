@@ -639,6 +639,28 @@ fn test_container_env_variable_is_set() {
         .assert_env("DEVCON_CONTAINER_VAR", "container-value");
 }
 
+/// Regression: `${localEnv:...}` in `containerEnv` must not be interpreted by
+/// Docker during image build when encoded in `devcontainer.metadata`.
+#[test]
+fn test_container_env_local_env_reference_does_not_break_build() {
+    let runtime = get_runtime();
+    skip_if_unavailable!(runtime);
+    cleanup_test_artifacts(runtime, "test-container-env-localenv");
+
+    let config = TestConfig::agents_disabled();
+    let workspace = DevcontainerBuilder::new("test-container-env-localenv")
+        .container_env("GH_TOKEN", "${localEnv:GH_TOKEN}")
+        .build();
+
+    let out = DevconRun::up(workspace.path(), &config);
+    out.assert_success();
+    assert!(
+        !out.stderr.contains("UndefinedVar"),
+        "Docker build reported UndefinedVar despite escaping localEnv token.\nStderr:\n{}",
+        out.stderr
+    );
+}
+
 /// `remoteEnv` variables are written to `~/.ssh/environment` by devcon's SSH
 /// setup so they are visible to SSH sessions.  This test needs agents enabled
 /// (SSH setup runs) and a running `devcon serve` so the agent can connect and
