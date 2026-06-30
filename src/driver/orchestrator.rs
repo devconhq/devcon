@@ -349,10 +349,12 @@ impl ContainerOrchestrator {
     /// Prepares features for building or starting a container.
     ///
     /// This method:
-    /// 1. Merges additional features from config
-    /// 2. Adds agent installation feature (if not disabled)
-    /// 3. Downloads and processes all features (including dependencies)
+    /// 1. Collects lockfile source features from `devcontainer.json`
+    /// 2. Collects runtime features by merging config `additionalFeatures`
+    ///    and optional agent feature
+    /// 3. Downloads and processes runtime features (including dependencies)
     /// 4. Applies override feature install order if specified
+    /// 5. Updates lockfile from `devcontainer.json` features only
     ///
     /// # Arguments
     ///
@@ -360,9 +362,9 @@ impl ContainerOrchestrator {
     ///
     /// # Returns
     ///
-    /// Returns a tuple of (processed_features, merged_features) where:
+    /// Returns a tuple of (processed_features, runtime_features) where:
     /// - `processed_features` - Features processed with dependencies resolved
-    /// - `merged_features` - The initial merged feature list
+    /// - `runtime_features` - Runtime feature roots used for processing
     ///
     /// # Errors
     ///
@@ -384,27 +386,10 @@ impl ContainerOrchestrator {
             self.config.additional_features
         );
 
-        // Merge additional features from config
-        let mut features = devcontainer_workspace
-            .devcontainer
-            .merge_additional_features(&self.config.additional_features)?;
-
-        // Add agent installation feature to the list
-        // The agent's dependencies will be resolved along with all other features
-        if !self.config.is_agent_disabled() {
-            let agent_config = AgentConfig::new(
-                self.config.get_agent_use_binary(),
-                self.config.get_agent_binary_url().cloned(),
-                self.config.get_agent_git_repository().cloned(),
-                self.config.get_agent_git_branch().cloned(),
-                self.config.get_agent_ssh_port(),
-                self.config.should_skip_agent_ssh_setup(),
-            );
-            debug!("Using agent configuration: {:?}", agent_config);
-            let agent_path = agent::Agent::new(agent_config).generate()?;
-            features.push(FeatureRef::new(FeatureSource::Local { path: agent_path }));
-        }
-        debug!("Initial feature list: {:?}", features);
+        let (lockfile_features, runtime_features) =
+            self.resolve_feature_roots(devcontainer_workspace)?;
+        debug!("Runtime feature roots: {:?}", runtime_features);
+        debug!("Lockfile feature roots: {:?}", lockfile_features);
 
         let lockfile = self.read_lockfile(devcontainer_workspace)?;
         let lock_context = match (lock_options.frozen_lockfile, lockfile) {
@@ -423,7 +408,8 @@ impl ContainerOrchestrator {
         };
 
         // Process all features including dependency resolution and topological sorting
-        let mut processed_features = process_features(&features, self.silent, &lock_context)?;
+        let mut processed_features =
+            process_features(&runtime_features, self.silent, &lock_context)?;
 
         // Apply override feature install order if specified
         if let Some(ref override_order) = devcontainer_workspace
@@ -446,13 +432,52 @@ impl ContainerOrchestrator {
         );
 
         if lock_context.mode == LockMode::Update {
+            let mut lockfile_processed_features =
+                process_features(&lockfile_features, self.silent, &lock_context)?;
+
+            if let Some(ref override_order) = devcontainer_workspace
+                .devcontainer
+                .override_feature_install_order
+            {
+                lockfile_processed_features =
+                    apply_feature_order_override(lockfile_processed_features, override_order)?;
+            }
+
             self.write_lockfile(
                 devcontainer_workspace,
-                &build_lockfile_from_features(&processed_features),
+                &build_lockfile_from_features(&lockfile_processed_features),
             )?;
         }
 
-        Ok((processed_features, features))
+        Ok((processed_features, runtime_features))
+    }
+
+    fn resolve_feature_roots(
+        &self,
+        devcontainer_workspace: &Workspace,
+    ) -> Result<(Vec<FeatureRef>, Vec<FeatureRef>)> {
+        let lockfile_features = devcontainer_workspace.devcontainer.features.clone();
+
+        let mut runtime_features = devcontainer_workspace
+            .devcontainer
+            .merge_additional_features(&self.config.additional_features)?;
+
+        // Add agent installation feature to the runtime set only.
+        if !self.config.is_agent_disabled() {
+            let agent_config = AgentConfig::new(
+                self.config.get_agent_use_binary(),
+                self.config.get_agent_binary_url().cloned(),
+                self.config.get_agent_git_repository().cloned(),
+                self.config.get_agent_git_branch().cloned(),
+                self.config.get_agent_ssh_port(),
+                self.config.should_skip_agent_ssh_setup(),
+            );
+            debug!("Using agent configuration: {:?}", agent_config);
+            let agent_path = agent::Agent::new(agent_config).generate()?;
+            runtime_features.push(FeatureRef::new(FeatureSource::Local { path: agent_path }));
+        }
+
+        Ok((lockfile_features, runtime_features))
     }
 
     /// Builds a container image with features installed.
@@ -2498,7 +2523,7 @@ fn normalize_capability_name(capability: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::DockerRuntimeConfig;
+    use crate::config::{AgentConfig, DockerRuntimeConfig};
 
     #[test]
     fn test_devcontainer_id_generation() {
@@ -2643,5 +2668,66 @@ mod tests {
 
         let content = ContainerOrchestrator::build_ssh_environment_file_content(&input);
         assert_eq!(content, "PATH=line1line2\n");
+    }
+
+    #[test]
+    fn test_resolve_feature_roots_excludes_config_features_from_lockfile_roots() {
+        use crate::config::Config;
+        use crate::driver::runtime::docker::DockerRuntime;
+        use std::collections::HashMap;
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let devcontainer_json = r#"{
+            "image": "mcr.microsoft.com/devcontainers/base:latest",
+            "features": {
+                "ghcr.io/devcontainers/features/git:1": {}
+            }
+        }"#;
+
+        fs::create_dir(temp_dir.path().join(".devcontainer")).unwrap();
+        fs::write(
+            temp_dir.path().join(".devcontainer/devcontainer.json"),
+            devcontainer_json,
+        )
+        .unwrap();
+
+        let workspace = Workspace::try_from(temp_dir.path().to_path_buf()).unwrap();
+
+        let mut config = Config::default();
+        config.additional_features = HashMap::from([(
+            "ghcr.io/devcontainers/features/node:1".to_string(),
+            serde_json::json!({}),
+        )]);
+        config.agents = Some(AgentConfig {
+            disable: Some(true),
+            ..Default::default()
+        });
+
+        let runtime = Box::new(DockerRuntime::new(DockerRuntimeConfig::default()));
+        let driver = ContainerOrchestrator::new(config, runtime);
+
+        let (lockfile_roots, runtime_roots) = driver.resolve_feature_roots(&workspace).unwrap();
+
+        let to_registry_ids = |features: &[FeatureRef]| {
+            features
+                .iter()
+                .filter_map(|feature| match &feature.source {
+                    FeatureSource::Registry { registry } => Some(format!(
+                        "ghcr.io/{}/{}/{}:{}",
+                        registry.owner, registry.repository, registry.name, registry.version
+                    )),
+                    FeatureSource::Local { .. } => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let lockfile_ids = to_registry_ids(&lockfile_roots);
+        let runtime_ids = to_registry_ids(&runtime_roots);
+
+        assert_eq!(lockfile_ids, vec!["ghcr.io/devcontainers/features/git:1"]);
+        assert!(runtime_ids.contains(&"ghcr.io/devcontainers/features/git:1".to_string()));
+        assert!(runtime_ids.contains(&"ghcr.io/devcontainers/features/node:1".to_string()));
     }
 }
