@@ -8,36 +8,40 @@ DevCon is a Rust CLI tool for managing and launching development containers. It 
 
 ## Workspace structure
 
-Cargo workspace with three members:
+Cargo workspace with four members:
 - **`.`** (`devcon`) — main binary and library
 - **`agent/`** — in-container agent binary that communicates back to the host
 - **`proto/`** — protobuf definitions compiled with `prost-build` (requires `protoc` installed)
+- **`schema/`** — schema crate containing `devcontainer.json` models, feature schema types, and lockfile/lifecycle schema logic
 
 ## Build, test, and lint
+
+Run these validation steps before considering a change complete. These commands mirror the CI pipeline.
 
 ```bash
 # Build
 cargo build
 cargo build --release
 
-# Format check / lint (mirrors CI)
+# Required format / lint checks (CI parity)
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features --workspace -- -D warnings
 
-# Unit tests (no runtime required)
-cargo test --lib --bins
+# Required unit test checks (CI parity)
+cargo test --lib --bins --verbose
+cargo test --lib --bins --all-features --verbose
 
 # Single unit test
 cargo test --lib <test_name>
 
-# Integration tests (requires Docker)
-CONTAINER_RUNTIME=docker cargo test --test main
+# Required integration tests (CI parity, requires Docker)
+RUST_BACKTRACE=full CONTAINER_RUNTIME=docker cargo test --test main --verbose
 
 # Single integration test
 CONTAINER_RUNTIME=docker cargo test --test main test_build_simple
 ```
 
-Integration tests skip automatically if the required runtime binary is not found. Test containers are named `devcon-test-*` and cleaned up after CI runs.
+Prerequisites: `protoc` is required for builds/tests, and Docker is required for CI-parity integration tests. Integration tests use `CONTAINER_RUNTIME` to choose runtime. Test containers are named `devcon-test-*` and cleaned up after CI runs.
 
 ## Architecture
 
@@ -47,12 +51,17 @@ Integration tests skip automatically if the required runtime binary is not found
 |---|---|
 | `command.rs` | Handler functions for each CLI subcommand; loads config, creates runtime/driver, delegates work |
 | `config.rs` | User config (YAML at `~/.config/devcon/config.yaml`); properties use camelCase dot-notation (e.g. `agents.binaryUrl`) |
-| `devcontainer.rs` | Parses `devcontainer.json`; `image` and `build.dockerfile` are mutually exclusive |
+| `devcontainer.rs` | Compatibility module that re-exports devcontainer schema/parsing APIs from `schema` |
+| `feature.rs` | Compatibility module that re-exports feature schema types from `schema` |
 | `driver/runtime.rs` | `ContainerRuntime` + `ContainerHandle` traits; impls in `driver/runtime/docker.rs` and `driver/runtime/container.rs` |
-| `driver/container.rs` | `ContainerDriver` — orchestrates full build→start→lifecycle-hooks flow |
+| `driver/orchestrator.rs` | `ContainerOrchestrator` — orchestrates full build→start→lifecycle-hooks flow |
+| `driver/dockerfile.rs` | Build context and Dockerfile generation for feature injection and metadata |
+| `driver/environment.rs` | Environment composition/resolution for container start and SSH session env |
 | `driver/feature_process.rs` | Downloads and installs devcontainer features from OCI registries (ghcr.io) |
+| `driver/lifecycle.rs` | Lifecycle hook execution utilities and marker-guarded command execution |
 | `driver/control_server.rs` | TCP server (default port 15000) started by `devcon serve`; manages agent connections |
 | `driver/agent.rs` | Host-side agent communication over protobuf |
+| `driver/agent_socket.rs` | SSH/GPG agent socket detection and forwarding helpers |
 | `error.rs` | Central `Error` enum + `Result<T>` type alias |
 | `workspace.rs` | Abstracts the project directory and devcontainer config discovery |
 | `output.rs` | `OutputFormat` enum (`text` / `json`); passed through all command handlers |
