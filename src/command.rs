@@ -37,8 +37,13 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
-use std::{io, io::IsTerminal};
+use std::{io, io::IsTerminal, io::Write};
 
+use crossterm::{
+    cursor::MoveTo,
+    execute,
+    terminal::{Clear, ClearType},
+};
 use dirs;
 
 use crate::error::{Error, Result};
@@ -853,9 +858,13 @@ pub fn handle_control_server_list_command(
     output: OutputFormat,
 ) -> Result<()> {
     let interval = Duration::from_secs(interval_secs.max(1));
+    let use_in_place_refresh = watch && output == OutputFormat::Text && io::stdout().is_terminal();
+    let mut refresh_count = 0u64;
 
     loop {
+        refresh_count += 1;
         let snapshot = control_server::fetch_control_server_snapshot(host, port)?;
+
         if output == OutputFormat::Json {
             let payload = ControlServerListResponse {
                 containers: snapshot.containers,
@@ -865,25 +874,25 @@ pub fn handle_control_server_list_command(
             } else {
                 println!("{}", serde_json::to_string_pretty(&payload)?);
             }
-        } else if snapshot.containers.is_empty() {
-            println!("No connected containers.");
         } else {
-            println!("Connected containers:");
-            for container in snapshot.containers {
+            if use_in_place_refresh {
+                // Clear and redraw to keep a single live-updating snapshot in terminal.
+                execute!(io::stdout(), Clear(ClearType::All), MoveTo(0, 0))?;
+            }
+
+            if watch {
                 println!(
-                    "- {} (workspace: {})",
-                    container.container_name, container.workspace_name
+                    "Watching control server mappings (refresh #{}, every {}s)",
+                    refresh_count,
+                    interval.as_secs()
                 );
-                if container.mappings.is_empty() {
-                    println!("  no forwarded ports");
-                } else {
-                    for mapping in container.mappings {
-                        println!(
-                            "  container {} -> host {}",
-                            mapping.container_port, mapping.host_port
-                        );
-                    }
-                }
+                println!();
+            }
+
+            print_control_server_snapshot_text(&snapshot.containers);
+
+            if use_in_place_refresh {
+                io::stdout().flush()?;
             }
         }
 
@@ -894,6 +903,47 @@ pub fn handle_control_server_list_command(
     }
 
     Ok(())
+}
+
+fn print_control_server_snapshot_text(containers: &[control_server::ContainerForwardSnapshot]) {
+    if containers.is_empty() {
+        println!("No connected containers.");
+        return;
+    }
+
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            "Container",
+            "Workspace",
+            "Container Port",
+            "Host Port",
+        ]);
+
+    for container in containers {
+        if container.mappings.is_empty() {
+            table.add_row(vec![
+                Cell::new(&container.container_name),
+                Cell::new(&container.workspace_name),
+                Cell::new("-"),
+                Cell::new("-"),
+            ]);
+            continue;
+        }
+
+        for mapping in &container.mappings {
+            table.add_row(vec![
+                Cell::new(&container.container_name),
+                Cell::new(&container.workspace_name),
+                Cell::new(mapping.container_port),
+                Cell::new(mapping.host_port),
+            ]);
+        }
+    }
+
+    println!("{}", table);
 }
 
 pub fn handle_control_server_start_forward_command(
