@@ -33,6 +33,7 @@ strip-ansi-escapes = "0.2.1"
 sha2 = "0.11"
 json-strip-comments = "3.1.1"
 comfy-table = "7.2.2"
+crossterm = "0.29.0"
 assert_cmd = "2.2.2"
 pidlock = "0.2.2"
 tokio = "1.52.3"
@@ -82,6 +83,7 @@ strip-ansi-escapes.workspace = true
 sha2.workspace = true
 json-strip-comments.workspace = true
 comfy-table.workspace = true
+crossterm.workspace = true
 pidlock.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "process", "sync", "time"] }
 schema.workspace = true
