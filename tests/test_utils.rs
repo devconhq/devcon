@@ -1016,6 +1016,10 @@ impl DevconOutput {
 pub struct DevconRun;
 
 impl DevconRun {
+    fn shell_single_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+
     fn run(args: &[&str]) -> DevconOutput {
         use assert_cmd::cargo::cargo_bin_cmd;
         let mut cmd = cargo_bin_cmd!("devcon");
@@ -1107,16 +1111,14 @@ impl DevconRun {
         use assert_cmd::cargo::cargo_bin;
 
         let devcon = cargo_bin("devcon");
+        let command = format!(
+            "exec {} --config {} shell {}",
+            Self::shell_single_quote(devcon.to_str().unwrap()),
+            Self::shell_single_quote(config.path.to_str().unwrap()),
+            Self::shell_single_quote(workspace.to_str().unwrap()),
+        );
         let output = Command::new("script")
-            .args([
-                "-q",
-                "/dev/null",
-                devcon.to_str().unwrap(),
-                "--config",
-                config.path.to_str().unwrap(),
-                "shell",
-                workspace.to_str().unwrap(),
-            ])
+            .args(["-q", "/dev/null", "/bin/sh", "-lc", &command])
             .output()
             .expect("Failed to spawn devcon shell under script");
 
