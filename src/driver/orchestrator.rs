@@ -2710,15 +2710,17 @@ mod tests {
 
         let workspace = Workspace::try_from(temp_dir.path().to_path_buf()).unwrap();
 
-        let mut config = Config::default();
-        config.additional_features = HashMap::from([(
-            "ghcr.io/devcontainers/features/node:1".to_string(),
-            serde_json::json!({}),
-        )]);
-        config.agents = Some(AgentConfig {
-            disable: Some(true),
+        let config = Config {
+            additional_features: HashMap::from([(
+                "ghcr.io/devcontainers/features/node:1".to_string(),
+                serde_json::json!({}),
+            )]),
+            agents: Some(AgentConfig {
+                disable: Some(true),
+                ..Default::default()
+            }),
             ..Default::default()
-        });
+        };
 
         let runtime = Box::new(DockerRuntime::new(DockerRuntimeConfig::default()));
         let driver = ContainerOrchestrator::new(config, runtime);
