@@ -48,7 +48,7 @@ Status legend:
 | General | `containerEnv` | Implemented | Merged and applied to container startup environment. |
 | General | `remoteEnv` | Implemented | Applied to remote/SSH session processes with merge semantics. |
 | General | `remoteUser` | Implemented | Supported, including user probing and runtime resolution. |
-| General | `containerUser` | Partial | Used for user resolution; full spec parity still depends on metadata parity work (#106). |
+| General | `containerUser` | Implemented | Supported for user resolution and metadata-backed behavior. |
 | General | `updateRemoteUserUID` | Missing | Parsed, but no Linux UID/GID sync step is implemented. |
 | General | `userEnvProbe` | Missing | Parsed, but no spec-driven probe mode behavior is implemented. |
 | General | `overrideCommand` | Missing | Parsed, but runtime command behavior is not controlled by this property. |
@@ -82,8 +82,8 @@ Status legend:
 | Lifecycle | `waitFor` gating semantics | Missing | Parsed, but command-stage gating behavior is not implemented. |
 | Lifecycle | String vs array command semantics | Implemented | Array commands are executed directly without shell; syntax conformance tracked in #91. |
 | Lifecycle | Object command parallel execution | Missing | Object commands are currently executed sequentially (#105). |
-| Metadata | `devcontainer.metadata` merge semantics | Partial | Metadata label is read for selected behavior (for example user hints), but full spec merge/write parity is pending (#106). |
-| Metadata | Metadata write/update support | Missing | Writing/maintaining complete spec metadata is not implemented (#106). |
+| Metadata | `devcontainer.metadata` merge semantics | Implemented | Metadata labels are parsed and merged according to spec-defined rules. |
+| Metadata | Metadata write/update support | Implemented | DevCon writes and updates `devcontainer.metadata` entries during image build. |
 
 ### Spec Requirements Not Built In Yet
 
@@ -94,7 +94,6 @@ The following implementor-spec requirements are still open and are intentionally
 - Host-side `initializeCommand` phase is not implemented.
 - `updateContentCommand` execution semantics are not implemented.
 - `waitFor` stage gating behavior is not implemented.
-- Full `devcontainer.metadata` merge/write behavior is not implemented (#106).
 - `updateRemoteUserUID` Linux UID/GID sync behavior is not implemented.
 - `userEnvProbe`-driven environment probing behavior is not implemented.
 - `runArgs`, `init`, `overrideCommand`, and `shutdownAction` are parsed but not applied as spec-defined runtime behavior.
