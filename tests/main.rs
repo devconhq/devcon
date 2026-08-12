@@ -248,6 +248,60 @@ fn test_start_reuses_stopped_container() {
     }
 }
 
+/// Regression: sshd and the devcon-agent daemon must come back up after
+/// `devcon start` restarts a previously-stopped container (e.g. reopening the
+/// devcontainer "the next day" without removing it first). Feature
+/// entrypoints are not wired into the container's own Docker
+/// ENTRYPOINT/CMD, so `devcon` must re-execute them explicitly on restart.
+#[test]
+#[serial]
+fn test_sshd_and_agent_restart_after_container_stop() {
+    let runtime = get_runtime();
+    skip_if_unavailable!(runtime);
+    cleanup_test_artifacts(runtime, "test-agent-sshd-restart");
+
+    let config = TestConfig::agents_enabled();
+    let workspace = DevcontainerBuilder::new("test-agent-sshd-restart").build();
+
+    let up_out = DevconRun::up(workspace.path(), &config);
+    up_out.assert_success();
+    let id_after_up = get_running_container_id(runtime, "test-agent-sshd-restart")
+        .expect("Failed to resolve running container id after up");
+
+    exec_in_container(
+        runtime,
+        &id_after_up,
+        &["sh", "-lc", "ps -ef | grep -q '[s]shd'"],
+    )
+    .expect("sshd should be running after initial up");
+    exec_in_container(
+        runtime,
+        &id_after_up,
+        &["sh", "-lc", "ps -ef | grep -q '[d]evcon-agent'"],
+    )
+    .expect("devcon-agent daemon should be running after initial up");
+
+    stop_container(runtime, &id_after_up);
+
+    let start_out = DevconRun::start(workspace.path(), &config);
+    start_out.assert_success();
+    let id_after_start = get_running_container_id(runtime, "test-agent-sshd-restart")
+        .expect("Failed to resolve running container id after start");
+
+    exec_in_container(
+        runtime,
+        &id_after_start,
+        &["sh", "-lc", "ps -ef | grep -q '[s]shd'"],
+    )
+    .expect("sshd should be running again after restarting the stopped container");
+    exec_in_container(
+        runtime,
+        &id_after_start,
+        &["sh", "-lc", "ps -ef | grep -q '[d]evcon-agent'"],
+    )
+    .expect("devcon-agent daemon should be running again after restarting the stopped container");
+}
+
 #[test]
 fn test_post_start_command_runs_on_each_start() {
     let runtime = get_runtime();

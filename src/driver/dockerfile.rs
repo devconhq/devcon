@@ -41,11 +41,21 @@ use crate::error::{Error, Result};
 
 /// Escapes characters that Dockerfile may interpret in LABEL values.
 ///
-/// In particular, `$` must be escaped so `${localEnv:...}` placeholders in
-/// `devcontainer.metadata` are preserved literally instead of being treated as
-/// Docker build-time variable interpolation.
+/// The `devcontainer.metadata` label value is a JSON string containing double
+/// quotes and, for e.g. `${localEnv:...}` placeholders, `$` characters. Docker's
+/// `LABEL` instruction parses its value like a shell word: unless the value is
+/// wrapped in (and this function assumes it will be wrapped in) double quotes,
+/// or unless embedded double quotes are escaped, Docker silently strips them,
+/// corrupting the JSON beyond repair (e.g. `{"id":"foo"}` becomes `{id:foo}`).
+/// Escaping `\` first (so existing backslashes survive), then `$` (to block
+/// Docker build-time variable interpolation), then `"` (so the value can be
+/// safely wrapped in a quoted `LABEL key="value"` instruction) keeps the label
+/// round-trippable as valid JSON when read back via `docker inspect`.
 fn escape_dockerfile_label_value(value: &str) -> String {
-    value.replace('$', "\\$")
+    value
+        .replace('\\', "\\\\")
+        .replace('$', "\\$")
+        .replace('"', "\\\"")
 }
 
 /// Metadata required to render the features Dockerfile template.
@@ -283,7 +293,7 @@ ENV _REMOTE_USER_HOME={{ remote_user_home }}
 ENV _CONTAINER_USER_HOME={{ container_user_home }}
 ENV DEVCON_CONTROL_HOST={{ runtime_host_address }}
 LABEL devcon.config-hash={{ config_hash }}
-LABEL devcontainer.metadata={{ metadata_label }}
+LABEL devcontainer.metadata="{{ metadata_label }}"
 
 USER root
 RUN mkdir /tmp/features
@@ -471,7 +481,7 @@ mod tests {
         let escaped = escape_dockerfile_label_value(input);
         assert_eq!(
             escaped,
-            r#"[{"containerEnv":{"GH_TOKEN":"\${localEnv:GH_TOKEN}"}}]"#
+            r#"[{\"containerEnv\":{\"GH_TOKEN\":\"\${localEnv:GH_TOKEN}\"}}]"#
         );
     }
 
@@ -498,7 +508,7 @@ mod tests {
         let dockerfile = std::fs::read_to_string(dockerfile_path).unwrap();
         assert!(
             dockerfile.contains(
-                r#"LABEL devcontainer.metadata=[{"containerEnv":{"GH_TOKEN":"\${localEnv:GH_TOKEN}"}}]"#
+                r#"LABEL devcontainer.metadata="[{\"containerEnv\":{\"GH_TOKEN\":\"\${localEnv:GH_TOKEN}\"}}]""#
             ),
             "Dockerfile metadata label did not escape localEnv token:\n{}",
             dockerfile

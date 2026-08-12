@@ -891,19 +891,7 @@ impl ContainerOrchestrator {
         devcontainer_workspace: &Workspace,
     ) -> schema::MergedImageMetadata {
         let latest_tag = format!("{}:latest", self.get_image_tag(devcontainer_workspace));
-        self.runtime
-            .inspect_image(&latest_tag)
-            .ok()
-            .flatten()
-            .as_ref()
-            .and_then(|inspect| {
-                inspect
-                    .config
-                    .labels
-                    .get("devcontainer.metadata")
-                    .map(|s| schema::merge_metadata_entries(&schema::parse_metadata_label(s)))
-            })
-            .unwrap_or_default()
+        self.read_image_metadata_for_tag(&latest_tag)
     }
 
     /// Extracts `remoteUser` from the `devcontainer.metadata` label of an
@@ -918,6 +906,62 @@ impl ContainerOrchestrator {
             .into_iter()
             .rev()
             .find_map(|e| e.remote_user.filter(|u| !u.trim().is_empty()))
+    }
+
+    /// Runs every feature `entrypoint` command declared in the built image's
+    /// `devcontainer.metadata` label inside the given running container.
+    ///
+    /// Feature entrypoints (e.g. the devcon-agent feature's
+    /// `devcon-agent-start` script, which starts `sshd` and the
+    /// `devcon-agent` daemon) are not wired into the container's actual
+    /// Docker `ENTRYPOINT`/`CMD`, so they must be re-invoked manually
+    /// whenever the container process tree may have been reset — both right
+    /// after creating a brand new container and after restarting a
+    /// previously stopped one (`docker start` does not restart these
+    /// processes on its own).
+    ///
+    /// Reading the entrypoints from the image metadata label (rather than
+    /// from `processed_features`) means this works even when the caller
+    /// doesn't have `processed_features` on hand, such as when restarting an
+    /// already-built, already-stopped container.
+    fn run_feature_entrypoints(
+        &self,
+        handle: &dyn crate::driver::runtime::ContainerHandle,
+        latest_tag: &str,
+    ) -> Result<()> {
+        let merged = self.read_image_metadata_for_tag(latest_tag);
+
+        for entrypoint in &merged.entrypoints {
+            info!("Executing feature entrypoint script: {}", entrypoint);
+            self.runtime.exec(
+                handle,
+                vec!["bash", "-c", "-i", entrypoint],
+                &[],
+                false,
+                true,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Reads and merges the `devcontainer.metadata` label for a specific
+    /// image tag. Returns an empty [`schema::MergedImageMetadata`] when the
+    /// image does not exist or has no label.
+    fn read_image_metadata_for_tag(&self, image_tag: &str) -> schema::MergedImageMetadata {
+        self.runtime
+            .inspect_image(image_tag)
+            .ok()
+            .flatten()
+            .as_ref()
+            .and_then(|inspect| {
+                inspect
+                    .config
+                    .labels
+                    .get("devcontainer.metadata")
+                    .map(|s| schema::merge_metadata_entries(&schema::parse_metadata_label(s)))
+            })
+            .unwrap_or_default()
     }
 
     /// Starts a container from a built image.
@@ -1088,6 +1132,15 @@ impl ContainerOrchestrator {
 
                 match self.runtime.start_container(handle.id()) {
                     Ok(restarted) => {
+                        // `docker start` only resumes the container's own
+                        // ENTRYPOINT/CMD (a no-op sleep loop for devcon
+                        // images); it does not re-run feature entrypoints
+                        // such as the devcon-agent feature's startup script
+                        // (sshd + devcon-agent daemon). Re-execute them here
+                        // so a restarted container behaves like a freshly
+                        // created one.
+                        self.run_feature_entrypoints(restarted.as_ref(), &latest_tag)?;
+
                         if let Some(command) =
                             &devcontainer_workspace.devcontainer.post_start_command
                         {
@@ -1709,26 +1762,8 @@ impl ContainerOrchestrator {
             )?;
         }
 
-        // Check if feature has entrypoint script which should start now
-        processed_features
-            .iter()
-            .try_for_each(|feature_result| -> Result<()> {
-                if let Some(entrypoint) = &feature_result.feature.entrypoint {
-                    info!(
-                        "Executing entrypoint script for feature '{}'",
-                        feature_result.feature.id
-                    );
-                    let wrapped_cmd = entrypoint.to_string();
-                    self.runtime.exec(
-                        handle.as_ref(),
-                        vec!["bash", "-c", "-i", &wrapped_cmd],
-                        &[],
-                        false,
-                        true,
-                    )?;
-                }
-                Ok(())
-            })?;
+        // Check if any feature has an entrypoint script which should start now
+        self.run_feature_entrypoints(handle.as_ref(), &latest_tag)?;
 
         if let Some(command) = &devcontainer_workspace.devcontainer.post_start_command {
             run_lifecycle_command_always(
@@ -2746,5 +2781,215 @@ mod tests {
         assert_eq!(lockfile_ids, vec!["ghcr.io/devcontainers/features/git:1"]);
         assert!(runtime_ids.contains(&"ghcr.io/devcontainers/features/git:1".to_string()));
         assert!(runtime_ids.contains(&"ghcr.io/devcontainers/features/node:1".to_string()));
+    }
+
+    /// A minimal `ContainerHandle` for testing that just carries an id.
+    struct FakeHandle(String);
+
+    impl crate::driver::runtime::ContainerHandle for FakeHandle {
+        fn id(&self) -> &str {
+            &self.0
+        }
+    }
+
+    /// A minimal `ContainerRuntime` stub that only implements `inspect_image` and
+    /// `exec` (recording every command it was asked to run), panicking on any
+    /// other method. Used to test `run_feature_entrypoints` without needing a
+    /// real container runtime.
+    struct EntrypointRecordingRuntime {
+        metadata_label: Option<String>,
+        recorded_commands: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl crate::driver::runtime::ContainerRuntime for EntrypointRecordingRuntime {
+        fn build(
+            &self,
+            _dockerfile_path: &std::path::Path,
+            _context_path: &std::path::Path,
+            _image_tag: Vec<&str>,
+            _phase_label: Option<&str>,
+            _feature_progress: Option<&[FeatureProgressItem]>,
+            _silent: bool,
+        ) -> Result<()> {
+            unimplemented!("not needed for this test")
+        }
+
+        fn build_with_args(
+            &self,
+            _dockerfile_path: &std::path::Path,
+            _context_path: &std::path::Path,
+            _image_tag: Vec<&str>,
+            _args: &Option<HashMap<String, String>>,
+            _target: &Option<String>,
+            _options: &Option<Vec<String>>,
+            _phase_label: Option<&str>,
+            _feature_progress: Option<&[FeatureProgressItem]>,
+            _silent: bool,
+        ) -> Result<()> {
+            unimplemented!("not needed for this test")
+        }
+
+        fn run(
+            &self,
+            _image_tag: &str,
+            _volume_mount: &str,
+            _label: &str,
+            _env_vars: &[String],
+            _runtime_parameters: RuntimeParameters,
+        ) -> Result<Box<dyn crate::driver::runtime::ContainerHandle>> {
+            unimplemented!("not needed for this test")
+        }
+
+        fn exec(
+            &self,
+            _container_handle: &dyn crate::driver::runtime::ContainerHandle,
+            command: Vec<&str>,
+            _env_vars: &[String],
+            _attach_stdin: bool,
+            _attach_stdout: bool,
+        ) -> Result<()> {
+            self.recorded_commands
+                .lock()
+                .unwrap()
+                .push(command.join(" "));
+            Ok(())
+        }
+
+        fn mapped_host_port(
+            &self,
+            _container_id: &str,
+            _container_port: u16,
+        ) -> Result<Option<u16>> {
+            unimplemented!("not needed for this test")
+        }
+
+        #[allow(clippy::type_complexity)]
+        fn list(
+            &self,
+        ) -> Result<
+            Vec<(
+                String,
+                String,
+                Box<dyn crate::driver::runtime::ContainerHandle>,
+            )>,
+        > {
+            unimplemented!("not needed for this test")
+        }
+
+        #[allow(clippy::type_complexity)]
+        fn list_all(
+            &self,
+        ) -> Result<
+            Vec<(
+                String,
+                String,
+                Box<dyn crate::driver::runtime::ContainerHandle>,
+            )>,
+        > {
+            unimplemented!("not needed for this test")
+        }
+
+        fn start_container(
+            &self,
+            _container_id: &str,
+        ) -> Result<Box<dyn crate::driver::runtime::ContainerHandle>> {
+            unimplemented!("not needed for this test")
+        }
+
+        fn remove_container(&self, _container_id: &str) -> Result<()> {
+            unimplemented!("not needed for this test")
+        }
+
+        fn images(&self) -> Result<Vec<String>> {
+            unimplemented!("not needed for this test")
+        }
+
+        fn image_id(&self, _image_tag: &str) -> Result<Option<String>> {
+            unimplemented!("not needed for this test")
+        }
+
+        fn inspect_image(&self, _image_tag: &str) -> Result<Option<ContainerImageInfo>> {
+            Ok(self.metadata_label.clone().map(|label| ContainerImageInfo {
+                architecture: None,
+                config: crate::driver::runtime::ContainerImageConfig {
+                    labels: HashMap::from([("devcontainer.metadata".to_string(), label)]),
+                    env: Vec::new(),
+                },
+            }))
+        }
+
+        fn image_label(&self, _image_tag: &str, _label_key: &str) -> Result<Option<String>> {
+            unimplemented!("not needed for this test")
+        }
+
+        fn probe_image_info(
+            &self,
+            _image_tag: &str,
+            _user: Option<&str>,
+        ) -> Result<Option<ContainerProbeInfo>> {
+            unimplemented!("not needed for this test")
+        }
+
+        fn get_host_address(&self) -> String {
+            unimplemented!("not needed for this test")
+        }
+    }
+
+    #[test]
+    fn test_run_feature_entrypoints_executes_each_merged_entrypoint() {
+        use std::sync::{Arc, Mutex};
+
+        let metadata_label = serde_json::json!([
+            {
+                "id": "ghcr.io/devconhq/devcon/devcon-agent:1",
+                "entrypoint": "/usr/local/bin/devcon-agent-start"
+            },
+            {
+                "id": "ghcr.io/devcontainers/features/docker-in-docker:1",
+                "entrypoint": "/usr/local/share/docker-init.sh"
+            }
+        ])
+        .to_string();
+
+        let recorded_commands = Arc::new(Mutex::new(Vec::new()));
+        let runtime = Box::new(EntrypointRecordingRuntime {
+            metadata_label: Some(metadata_label),
+            recorded_commands: Arc::clone(&recorded_commands),
+        });
+
+        let config = Config::default();
+        let driver = ContainerOrchestrator::new(config, runtime);
+        let handle = FakeHandle("test-container".to_string());
+
+        driver
+            .run_feature_entrypoints(&handle, "devcon-myproject:latest")
+            .unwrap();
+
+        let recorded = recorded_commands.lock().unwrap();
+        assert_eq!(recorded.len(), 2);
+        assert!(recorded[0].contains("devcon-agent-start"));
+        assert!(recorded[1].contains("docker-init.sh"));
+    }
+
+    #[test]
+    fn test_run_feature_entrypoints_no_entrypoints_runs_nothing() {
+        use std::sync::{Arc, Mutex};
+
+        let recorded_commands = Arc::new(Mutex::new(Vec::new()));
+        let runtime = Box::new(EntrypointRecordingRuntime {
+            metadata_label: None,
+            recorded_commands: Arc::clone(&recorded_commands),
+        });
+
+        let config = Config::default();
+        let driver = ContainerOrchestrator::new(config, runtime);
+        let handle = FakeHandle("test-container".to_string());
+
+        // Should not error and should not attempt any exec calls.
+        driver
+            .run_feature_entrypoints(&handle, "devcon-myproject:latest")
+            .unwrap();
+
+        assert!(recorded_commands.lock().unwrap().is_empty());
     }
 }
