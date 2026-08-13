@@ -471,6 +471,88 @@ pub fn get_image_id(runtime: Runtime, image_tag: &str) -> Option<String> {
     }
 }
 
+/// Get the value of an arbitrary label on an image, returns `None` if the
+/// image or label doesn't exist.
+#[allow(dead_code)]
+pub fn get_image_label(runtime: Runtime, image_tag: &str, label_key: &str) -> Option<String> {
+    let cmd = runtime_cmd(runtime);
+    match runtime {
+        Runtime::Docker => {
+            let format = format!("{{{{ index .Config.Labels \"{}\" }}}}", label_key);
+            let output = Command::new(cmd)
+                .arg("image")
+                .arg("inspect")
+                .arg(image_tag)
+                .arg("--format")
+                .arg(format)
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if value.is_empty() { None } else { Some(value) }
+        }
+        Runtime::Container => {
+            let output = Command::new(cmd)
+                .arg("image")
+                .arg("inspect")
+                .arg(image_tag)
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+            let entry = match &parsed {
+                serde_json::Value::Array(items) => items.first()?,
+                obj @ serde_json::Value::Object(_) => obj,
+                _ => return None,
+            };
+            entry
+                .get("config")
+                .and_then(|v| v.get("labels"))
+                .and_then(|v| v.get(label_key))
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string)
+        }
+    }
+}
+
+/// Simulates the pre-fix bug where a `devcontainer.metadata` OCI label got
+/// corrupted (invalid JSON) by an unquoted Dockerfile `LABEL` instruction, by
+/// rebuilding the given image on top of itself with a deliberately corrupted
+/// label value, retagged over the original tag.
+#[allow(dead_code)]
+pub fn corrupt_metadata_label(runtime: Runtime, image_tag: &str) {
+    let cmd = runtime_cmd(runtime);
+    let temp_dir = TempDir::new().expect("failed to create temp dir for corruption build");
+    let dockerfile_path = temp_dir.path().join("Dockerfile");
+    std::fs::write(
+        &dockerfile_path,
+        format!(
+            "FROM {}\nLABEL devcontainer.metadata=[{{id:foo,entrypoint:/bin/bar}}]\n",
+            image_tag
+        ),
+    )
+    .expect("failed to write corrupting Dockerfile");
+
+    let status = Command::new(cmd)
+        .arg("build")
+        .arg("-t")
+        .arg(image_tag)
+        .arg("-f")
+        .arg(&dockerfile_path)
+        .arg(temp_dir.path())
+        .status()
+        .expect("failed to run build to corrupt metadata label");
+    assert!(
+        status.success(),
+        "failed to corrupt devcontainer.metadata label on {}",
+        image_tag
+    );
+}
+
 /// Check if a container is running
 #[allow(dead_code)]
 pub fn is_container_running(runtime: Runtime, container_name: &str) -> bool {

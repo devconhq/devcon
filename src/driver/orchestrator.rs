@@ -838,6 +838,7 @@ impl ContainerOrchestrator {
             workspace_name: &workspace_name,
             runtime_host_address: &self.runtime.get_host_address(),
             config_hash: &config_hash,
+            devcon_version: env!("CARGO_PKG_VERSION"),
             metadata_label: &metadata_label,
             feature_install: &feature_install,
             env_setup: &env_setup,
@@ -964,14 +965,31 @@ impl ContainerOrchestrator {
             .unwrap_or_default()
     }
 
-    /// Starts a container from a built image.
-    ///
-    /// This method:
-    /// 1. Starts the container with the project directory mounted
-    /// 2. Executes lifecycle commands in order:
-    ///    - `onCreateCommand`
-    ///    - Dotfiles setup (if configured)
-    ///    - `postCreateCommand`
+    /// Checks whether the built image's `devcontainer.metadata` label is
+    /// present but corrupted (invalid JSON) rather than genuinely empty or
+    /// absent — the signature of the pre-fix bug where an unquoted
+    /// Dockerfile `LABEL` instruction silently stripped embedded double
+    /// quotes, corrupting the label and (as a direct consequence) preventing
+    /// `run_feature_entrypoints` from finding anything to execute, so
+    /// `sshd`/`devcon-agent` never start. Returns `None` when the label is
+    /// absent or parses successfully.
+    fn corrupted_metadata_warning(&self, image_tag: &str) -> Option<String> {
+        let label = self
+            .runtime
+            .image_label(image_tag, "devcontainer.metadata")
+            .ok()
+            .flatten()?;
+        match schema::parse_metadata_label_checked(&label) {
+            Ok(_) => None,
+            Err(err) => Some(format!(
+                "Image '{}' has a corrupted devcontainer.metadata label ({}); it was likely \
+                 built by an older devcon version affected by a label-encoding bug. Rebuilding \
+                 automatically so feature entrypoints (sshd/devcon-agent) work correctly.",
+                image_tag, err
+            )),
+        }
+    }
+
     ///    - `postStartCommand`
     /// 3. Starts the agent listener in a background thread
     ///
@@ -1195,6 +1213,34 @@ impl ContainerOrchestrator {
             return Err(Error::new(
                 "Image not found. Run 'devcon build' or 'devcon up' first.".to_string(),
             ));
+        }
+
+        // A corrupted `devcontainer.metadata` label (e.g. produced by an
+        // older devcon binary that shipped the unquoted-LABEL bug) means
+        // feature entrypoints (sshd/devcon-agent) silently never run.
+        // Unlike a plain version mismatch, there's no reasonable way to
+        // "just start it anyway" here, so rebuild automatically rather than
+        // only warning.
+        if let Some(warning) = self.corrupted_metadata_warning(&latest_tag) {
+            warn!("{}", warning);
+            self.build_with_features(
+                devcontainer_workspace.clone(),
+                env_variables,
+                processed_features.clone(),
+                None,
+                lock_options,
+            )?;
+        } else if let Some(warning) = devcon_version_mismatch_message(
+            self.runtime
+                .image_label(&latest_tag, "devcon.version")
+                .ok()
+                .flatten()
+                .as_deref(),
+            env!("CARGO_PKG_VERSION"),
+        ) {
+            // A version mismatch alone is purely informational: the image is
+            // structurally fine, so the container still starts normally.
+            warn!("{}", warning);
         }
 
         // Determine the user hint for probing: devcontainer.json remoteUser overrides, otherwise
@@ -2570,6 +2616,36 @@ fn normalize_capability_name(capability: &str) -> String {
     capability.trim().to_ascii_uppercase()
 }
 
+/// Computes a purely informational warning when the devcon binary version
+/// baked into an image's `devcon.version` label differs from the version of
+/// the devcon binary currently running, or is missing entirely (the image
+/// predates version tracking).
+///
+/// Returns `None` when the versions match. This never influences control
+/// flow: a version mismatch alone does not block starting or reusing the
+/// image; it only surfaces the discrepancy so the user can decide whether to
+/// rebuild.
+fn devcon_version_mismatch_message(
+    image_version: Option<&str>,
+    running_version: &str,
+) -> Option<String> {
+    match image_version {
+        Some(v) if v == running_version => None,
+        Some(v) => Some(format!(
+            "Image was built with devcon {} but the running devcon binary is {}. Run \
+             `devcon build --force-rebuild` if you want the image to pick up changes tied to \
+             the newer version.",
+            v, running_version
+        )),
+        None => Some(format!(
+            "Image predates devcon version tracking (no devcon.version label) and was built by \
+             an older devcon binary; the running devcon binary is {}. Run `devcon build \
+             --force-rebuild` if you encounter issues.",
+            running_version
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2918,8 +2994,12 @@ mod tests {
             }))
         }
 
-        fn image_label(&self, _image_tag: &str, _label_key: &str) -> Result<Option<String>> {
-            unimplemented!("not needed for this test")
+        fn image_label(&self, _image_tag: &str, label_key: &str) -> Result<Option<String>> {
+            if label_key == "devcontainer.metadata" {
+                Ok(self.metadata_label.clone())
+            } else {
+                Ok(None)
+            }
         }
 
         fn probe_image_info(
@@ -2991,5 +3071,78 @@ mod tests {
             .unwrap();
 
         assert!(recorded_commands.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_devcon_version_mismatch_message_matching_versions_returns_none() {
+        assert_eq!(
+            devcon_version_mismatch_message(Some("1.2.3"), "1.2.3"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_devcon_version_mismatch_message_mismatched_versions_returns_message() {
+        let message = devcon_version_mismatch_message(Some("1.0.0"), "1.2.3")
+            .expect("mismatched versions should produce a warning");
+        assert!(message.contains("1.0.0"));
+        assert!(message.contains("1.2.3"));
+    }
+
+    #[test]
+    fn test_devcon_version_mismatch_message_missing_label_returns_message() {
+        let message = devcon_version_mismatch_message(None, "1.2.3")
+            .expect("missing devcon.version label should produce a warning");
+        assert!(message.contains("predates devcon version tracking"));
+        assert!(message.contains("1.2.3"));
+    }
+
+    #[test]
+    fn test_corrupted_metadata_warning_valid_label_returns_none() {
+        let metadata_label = serde_json::json!([{"remoteUser": "vscode"}]).to_string();
+        let runtime = Box::new(EntrypointRecordingRuntime {
+            metadata_label: Some(metadata_label),
+            recorded_commands: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        });
+        let driver = ContainerOrchestrator::new(Config::default(), runtime);
+
+        assert!(
+            driver
+                .corrupted_metadata_warning("devcon-myproject:latest")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_corrupted_metadata_warning_absent_label_returns_none() {
+        let runtime = Box::new(EntrypointRecordingRuntime {
+            metadata_label: None,
+            recorded_commands: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        });
+        let driver = ContainerOrchestrator::new(Config::default(), runtime);
+
+        assert!(
+            driver
+                .corrupted_metadata_warning("devcon-myproject:latest")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_corrupted_metadata_warning_corrupted_label_returns_message() {
+        // Unquoted keys, matching the shape produced by the pre-fix unquoted
+        // `LABEL` Dockerfile instruction.
+        let corrupted = "[{id:foo,entrypoint:/bin/bar}]".to_string();
+        let runtime = Box::new(EntrypointRecordingRuntime {
+            metadata_label: Some(corrupted),
+            recorded_commands: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        });
+        let driver = ContainerOrchestrator::new(Config::default(), runtime);
+
+        let message = driver
+            .corrupted_metadata_warning("devcon-myproject:latest")
+            .expect("corrupted metadata label should produce a warning");
+        assert!(message.contains("corrupted"));
+        assert!(message.contains("devcon-myproject:latest"));
     }
 }

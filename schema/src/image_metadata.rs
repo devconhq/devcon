@@ -148,12 +148,27 @@ pub struct MergedImageMetadata {
 /// Accepts both the canonical JSON-array form and the single-object shorthand
 /// permitted by the spec.  Returns an empty `Vec` on any parse failure so
 /// callers can treat a missing or malformed label as "no metadata".
+///
+/// Callers that need to distinguish a genuinely empty/absent label from one
+/// that is present but corrupted (e.g. invalid JSON caused by an unquoted
+/// Docker `LABEL` instruction stripping embedded double quotes) should use
+/// [`parse_metadata_label_checked`] instead.
 pub fn parse_metadata_label(label: &str) -> Vec<ImageMetadataEntry> {
-    let value: serde_json::Value = match serde_json::from_str(label) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-    match value {
+    parse_metadata_label_checked(label).unwrap_or_default()
+}
+
+/// Like [`parse_metadata_label`], but returns the top-level JSON parse error
+/// instead of silently swallowing it.
+///
+/// This lets callers detect a *corrupted* label (present but not valid JSON)
+/// as distinct from a label that is simply absent or genuinely empty, so
+/// they can react to corruption (e.g. by triggering a rebuild) rather than
+/// treating it the same as "no metadata".
+pub fn parse_metadata_label_checked(
+    label: &str,
+) -> std::result::Result<Vec<ImageMetadataEntry>, serde_json::Error> {
+    let value: serde_json::Value = serde_json::from_str(label)?;
+    Ok(match value {
         serde_json::Value::Array(arr) => arr
             .into_iter()
             .filter_map(|v| serde_json::from_value(v).ok())
@@ -162,7 +177,7 @@ pub fn parse_metadata_label(label: &str) -> Vec<ImageMetadataEntry> {
             serde_json::from_value(obj).ok().into_iter().collect()
         }
         _ => Vec::new(),
-    }
+    })
 }
 
 /// Merges a slice of [`ImageMetadataEntry`] items into a single [`MergedImageMetadata`]
@@ -300,6 +315,29 @@ mod tests {
     fn test_parse_metadata_label_invalid() {
         assert!(parse_metadata_label("not json").is_empty());
         assert!(parse_metadata_label("42").is_empty());
+    }
+
+    #[test]
+    fn test_parse_metadata_label_checked_valid_returns_ok() {
+        let label = r#"[{"id":"ghcr.io/devcontainers/features/node:1","remoteUser":"vscode"}]"#;
+        let entries = parse_metadata_label_checked(label).expect("valid JSON should parse");
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_metadata_label_checked_empty_json_array_is_ok_and_empty() {
+        let entries = parse_metadata_label_checked("[]").expect("empty array is valid JSON");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_parse_metadata_label_checked_corrupted_returns_err() {
+        // Unquoted keys, as produced by the pre-fix unquoted `LABEL` Dockerfile
+        // instruction stripping embedded double quotes from the JSON.
+        let corrupted = "[{id:ghcr.io/devcontainers/features/node:1,entrypoint:/bin/bar}]";
+        assert!(parse_metadata_label_checked(corrupted).is_err());
+        // The lenient variant still treats this the same as "no metadata".
+        assert!(parse_metadata_label(corrupted).is_empty());
     }
 
     #[test]

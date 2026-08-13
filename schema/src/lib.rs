@@ -32,6 +32,7 @@ pub use devcontainer::*;
 pub use error::{Error, Result};
 pub use image_metadata::{
     ImageMetadataEntry, MergedImageMetadata, merge_metadata_entries, parse_metadata_label,
+    parse_metadata_label_checked,
 };
 pub use lifecycle::{LifecycleCommand, LifecycleCommandValue};
 pub use lockfile::*;
