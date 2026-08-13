@@ -302,6 +302,91 @@ fn test_sshd_and_agent_restart_after_container_stop() {
     .expect("devcon-agent daemon should be running again after restarting the stopped container");
 }
 
+/// The built image must carry the running devcon binary's version as a
+/// `devcon.version` OCI label, so a future devcon binary can detect version
+/// drift and warn the user.
+#[test]
+fn test_build_labels_image_with_devcon_version() {
+    let runtime = get_runtime();
+    skip_if_unavailable!(runtime);
+    cleanup_test_artifacts(runtime, "test-version-label");
+
+    let config = TestConfig::agents_disabled();
+    let workspace = DevcontainerBuilder::new("test-version-label").build();
+
+    DevconRun::build(workspace.path(), &config).assert_success();
+
+    let label = get_image_label(
+        runtime,
+        "devcon-test-version-label:latest",
+        "devcon.version",
+    )
+    .expect("Built image should carry a devcon.version label");
+    assert_eq!(
+        label,
+        env!("CARGO_PKG_VERSION"),
+        "devcon.version label did not match the running devcon binary's version"
+    );
+}
+
+/// Regression: an image whose `devcontainer.metadata` label is corrupted
+/// (invalid JSON, as produced by an older devcon binary affected by the
+/// unquoted-`LABEL` bug) must be rebuilt automatically by `devcon start` so
+/// feature entrypoints (sshd/devcon-agent) work again, rather than silently
+/// starting a container with no working entrypoints.
+#[test]
+#[serial]
+fn test_start_rebuilds_automatically_when_metadata_label_is_corrupted() {
+    let runtime = get_runtime();
+    skip_if_unavailable!(runtime);
+    cleanup_test_artifacts(runtime, "test-corrupt-metadata-rebuild");
+
+    let config = TestConfig::agents_enabled();
+    let workspace = DevcontainerBuilder::new("test-corrupt-metadata-rebuild").build();
+
+    let up_out = DevconRun::up(workspace.path(), &config);
+    up_out.assert_success();
+    let id_after_up = get_running_container_id(runtime, "test-corrupt-metadata-rebuild")
+        .expect("Failed to resolve running container id after up");
+    stop_container(runtime, &id_after_up);
+
+    // Simulate an image built by an older, pre-fix devcon binary: corrupt the
+    // devcontainer.metadata label on the already-built image in place.
+    corrupt_metadata_label(runtime, "devcon-test-corrupt-metadata-rebuild:latest");
+
+    let start_out = DevconRun::start(workspace.path(), &config);
+    start_out.assert_success();
+    let id_after_start = get_running_container_id(runtime, "test-corrupt-metadata-rebuild")
+        .expect("Failed to resolve running container id after start");
+
+    exec_in_container(
+        runtime,
+        &id_after_start,
+        &["sh", "-lc", "ps -ef | grep -q '[s]shd'"],
+    )
+    .expect("sshd should be running after devcon start auto-rebuilds the corrupted image");
+    exec_in_container(
+        runtime,
+        &id_after_start,
+        &["sh", "-lc", "ps -ef | grep -q '[d]evcon-agent'"],
+    )
+    .expect(
+        "devcon-agent daemon should be running after devcon start auto-rebuilds the corrupted image",
+    );
+
+    let label = get_image_label(
+        runtime,
+        "devcon-test-corrupt-metadata-rebuild:latest",
+        "devcontainer.metadata",
+    )
+    .expect("Rebuilt image should carry a devcontainer.metadata label");
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&label).is_ok(),
+        "devcontainer.metadata label should be valid JSON after automatic rebuild, got: {}",
+        label
+    );
+}
+
 #[test]
 fn test_post_start_command_runs_on_each_start() {
     let runtime = get_runtime();

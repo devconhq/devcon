@@ -68,6 +68,11 @@ pub(crate) struct DockerfileParams<'a> {
     pub workspace_name: &'a str,
     pub runtime_host_address: &'a str,
     pub config_hash: &'a str,
+    /// The devcon binary version (`env!("CARGO_PKG_VERSION")`) that produced
+    /// this build, baked in as the `devcon.version` label so a later devcon
+    /// binary can detect when it's reusing an image built by a different
+    /// version and warn the user.
+    pub devcon_version: &'a str,
     /// JSON-serialised `devcontainer.metadata` label value (array of entries).
     pub metadata_label: &'a str,
     pub feature_install: &'a str,
@@ -293,6 +298,7 @@ ENV _REMOTE_USER_HOME={{ remote_user_home }}
 ENV _CONTAINER_USER_HOME={{ container_user_home }}
 ENV DEVCON_CONTROL_HOST={{ runtime_host_address }}
 LABEL devcon.config-hash={{ config_hash }}
+LABEL devcon.version={{ devcon_version }}
 LABEL devcontainer.metadata="{{ metadata_label }}"
 
 USER root
@@ -325,6 +331,7 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
             workspace_name => params.workspace_name,
             runtime_host_address => params.runtime_host_address,
             config_hash => params.config_hash,
+            devcon_version => params.devcon_version,
             metadata_label => escaped_metadata_label,
         })?;
 
@@ -498,6 +505,7 @@ mod tests {
                 workspace_name: "workspace",
                 runtime_host_address: "host.docker.internal",
                 config_hash: "abc123",
+                devcon_version: "0.1.0",
                 metadata_label: r#"[{"containerEnv":{"GH_TOKEN":"${localEnv:GH_TOKEN}"}}]"#,
                 feature_install: "",
                 env_setup: "",
@@ -511,6 +519,35 @@ mod tests {
                 r#"LABEL devcontainer.metadata="[{\"containerEnv\":{\"GH_TOKEN\":\"\${localEnv:GH_TOKEN}\"}}]""#
             ),
             "Dockerfile metadata label did not escape localEnv token:\n{}",
+            dockerfile
+        );
+    }
+
+    #[test]
+    fn test_write_dockerfile_includes_devcon_version_label() {
+        let ctx = BuildContext::new(None).unwrap();
+        let dockerfile_path = ctx
+            .write_dockerfile(&DockerfileParams {
+                base_image: "mcr.microsoft.com/devcontainers/base:ubuntu",
+                remote_user: "vscode",
+                container_user: "vscode",
+                remote_user_home: "/home/vscode",
+                container_user_home: "/home/vscode",
+                workspace_name: "workspace",
+                runtime_host_address: "host.docker.internal",
+                config_hash: "abc123",
+                devcon_version: "1.2.3",
+                metadata_label: "[]",
+                feature_install: "",
+                env_setup: "",
+                dotfiles_setup: "",
+            })
+            .unwrap();
+
+        let dockerfile = std::fs::read_to_string(dockerfile_path).unwrap();
+        assert!(
+            dockerfile.contains("LABEL devcon.version=1.2.3"),
+            "Dockerfile did not contain the devcon.version label:\n{}",
             dockerfile
         );
     }
@@ -629,6 +666,7 @@ mod tests {
                 workspace_name: "workspace",
                 runtime_host_address: "host.docker.internal",
                 config_hash: "abc123",
+                devcon_version: "0.1.0",
                 metadata_label: "[]",
                 feature_install: "",
                 env_setup: "",
