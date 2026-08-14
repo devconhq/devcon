@@ -1150,6 +1150,8 @@ impl ContainerOrchestrator {
 
                 match self.runtime.start_container(handle.id()) {
                     Ok(restarted) => {
+                        self.ensure_agent_host_address_file(restarted.as_ref());
+
                         // `docker start` only resumes the container's own
                         // ENTRYPOINT/CMD (a no-op sleep loop for devcon
                         // images); it does not re-run feature entrypoints
@@ -1631,6 +1633,8 @@ impl ContainerOrchestrator {
             },
         )?;
 
+        self.ensure_agent_host_address_file(handle.as_ref());
+
         if !self.config.should_skip_agent_ssh_setup() {
             self.ensure_ssh_authorized_key(handle.as_ref(), &resolved_users)?;
 
@@ -1823,6 +1827,51 @@ impl ContainerOrchestrator {
         }
 
         Ok(handle.id().to_string())
+    }
+
+    /// Writes a runtime-discovered host address (if any) into the container so
+    /// the in-container agent can dial back to the host without relying on a
+    /// static address that may be unreachable (e.g. `host.container.internal`
+    /// requiring manual DNS registration on the `container` runtime).
+    ///
+    /// This is best-effort: failures are logged as warnings and never abort
+    /// container startup, since the agent still falls back to its configured
+    /// default host address (`DEVCON_CONTROL_HOST`) if this file is missing.
+    fn ensure_agent_host_address_file(&self, handle: &dyn crate::driver::runtime::ContainerHandle) {
+        let host_address = match self.runtime.get_host_address_for_agent(handle) {
+            Ok(address) => address,
+            Err(err) => {
+                warn!(
+                    "Failed to resolve a runtime-specific host address for the agent: {}",
+                    err
+                );
+                return;
+            }
+        };
+
+        let Some(host_address) = host_address else {
+            return;
+        };
+
+        let quoted = shell_single_quote(&host_address);
+        let command = format!(
+            "sudo mkdir -p /var/lib/devcon && printf '%s' {quoted} | sudo tee /var/lib/devcon/host-ip > /dev/null"
+        );
+
+        if let Err(err) = self
+            .runtime
+            .exec(handle, vec!["bash", "-c", &command], &[], false, false)
+        {
+            warn!(
+                "Failed to write discovered host address into container: {}",
+                err
+            );
+        } else {
+            debug!(
+                "Wrote discovered host address '{}' into container",
+                host_address
+            );
+        }
     }
 
     fn ensure_ssh_authorized_key(

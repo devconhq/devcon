@@ -361,6 +361,34 @@ fn container_inspect_entry(parsed: &serde_json::Value) -> Option<&serde_json::Va
     }
 }
 
+/// Extracts the vmnet gateway address (e.g. `192.168.64.1`) from a
+/// `container inspect <id>` JSON payload.
+///
+/// This address is reported per-network at `status.networks[].ipv4Gateway`
+/// and has been verified (live, against `container` CLI 1.2.2) to be the
+/// same address the host's outbound connections into the container present
+/// as their source IP — i.e. it is a reliable, zero-configuration address
+/// for the container to reach the host back on.
+fn extract_container_host_gateway(parsed: &serde_json::Value) -> Option<String> {
+    let entry = container_inspect_entry(parsed)?;
+
+    let networks = entry
+        .get("status")
+        .or_else(|| entry.get("Status"))
+        .and_then(|value| value.get("networks").or_else(|| value.get("Networks")))
+        .and_then(|value| value.as_array())?;
+
+    networks.iter().find_map(|network| {
+        network
+            .get("ipv4Gateway")
+            .or_else(|| network.get("Ipv4Gateway"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    })
+}
+
 fn extract_container_image_id(parsed: &serde_json::Value) -> Option<String> {
     let entry = container_inspect_entry(parsed)?;
 
@@ -1084,6 +1112,23 @@ impl ContainerRuntime for ContainerCliRuntime {
     fn get_host_address(&self) -> String {
         "host.container.internal".to_string()
     }
+
+    fn get_host_address_for_agent(
+        &self,
+        container_handle: &dyn super::ContainerHandle,
+    ) -> Result<Option<String>> {
+        let output = Command::new("container")
+            .arg("inspect")
+            .arg(container_handle.id())
+            .output()?;
+
+        if !output.status.success() {
+            return Ok(None);
+        }
+
+        let inspect: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        Ok(extract_container_host_gateway(&inspect))
+    }
 }
 
 fn validate_container_runtime_security_request(
@@ -1262,6 +1307,51 @@ mod tests {
 
         let id = extract_container_image_id(&parsed);
         assert_eq!(id, Some("sha256:abc123".to_string()));
+    }
+
+    #[test]
+    fn test_extract_container_host_gateway_from_live_shaped_payload() {
+        // Shape verified live against `container` CLI 1.2.2 output.
+        let parsed = serde_json::json!([
+            {
+                "status": {
+                    "networks": [
+                        {
+                            "hostname": "buildkit",
+                            "ipv4Address": "192.168.64.7/24",
+                            "ipv4Gateway": "192.168.64.1",
+                            "network": "default"
+                        }
+                    ]
+                }
+            }
+        ]);
+
+        let gateway = extract_container_host_gateway(&parsed);
+        assert_eq!(gateway, Some("192.168.64.1".to_string()));
+    }
+
+    #[test]
+    fn test_extract_container_host_gateway_supports_pascal_case_keys() {
+        let parsed = serde_json::json!({
+            "Status": {
+                "Networks": [
+                    { "Ipv4Gateway": "192.168.64.1" }
+                ]
+            }
+        });
+
+        let gateway = extract_container_host_gateway(&parsed);
+        assert_eq!(gateway, Some("192.168.64.1".to_string()));
+    }
+
+    #[test]
+    fn test_extract_container_host_gateway_missing_returns_none() {
+        let parsed = serde_json::json!({ "status": { "networks": [] } });
+        assert_eq!(extract_container_host_gateway(&parsed), None);
+
+        let parsed = serde_json::json!({});
+        assert_eq!(extract_container_host_gateway(&parsed), None);
     }
 
     #[test]

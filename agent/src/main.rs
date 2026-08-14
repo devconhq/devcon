@@ -167,6 +167,68 @@ fn connect_to_control_server(host: &str, port: u16) -> io::Result<TcpStream> {
     TcpStream::connect(addr)
 }
 
+/// Path to the host address discovered and written by the host after
+/// starting the container (see `ensure_agent_host_address_file` in
+/// `src/driver/orchestrator.rs`). Used by runtimes (currently the `container`
+/// runtime) that have no reliable static host alias.
+const DISCOVERED_HOST_ADDRESS_FILE: &str = "/var/lib/devcon/host-ip";
+
+/// Resolves the host address to dial, preferring a host address discovered
+/// and persisted by the orchestrator over the statically configured
+/// `--control-host`/`DEVCON_CONTROL_HOST` value. Falls back to the
+/// configured value if the file is missing, empty, or unreadable.
+fn resolve_control_host(configured_host: &str) -> String {
+    resolve_control_host_from_path(Path::new(DISCOVERED_HOST_ADDRESS_FILE), configured_host)
+}
+
+/// Implementation of [`resolve_control_host`] with an injectable file path,
+/// so the fallback priority logic can be unit tested without touching the
+/// real `/var/lib/devcon/host-ip` path.
+fn resolve_control_host_from_path(discovered_host_path: &Path, configured_host: &str) -> String {
+    std::fs::read_to_string(discovered_host_path)
+        .ok()
+        .map(|contents| contents.trim().to_string())
+        .filter(|contents| !contents.is_empty())
+        .unwrap_or_else(|| configured_host.to_string())
+}
+
+/// Connects to the control server, retrying with a fixed delay.
+///
+/// `host` is the address to dial and is expected to already be resolved
+/// (i.e. the discovered-file-vs-configured-default decision has already been
+/// made by the caller). Each retry attempt re-resolves the host again by
+/// calling `resolve_fn`, so a discovery file written by the host *after* the
+/// first attempt(s) failed is picked up without restarting the daemon.
+fn connect_to_control_server_with_retry(
+    host: &str,
+    port: u16,
+    max_attempts: u32,
+    retry_delay: Duration,
+    resolve_fn: impl Fn() -> String,
+) -> io::Result<TcpStream> {
+    let mut last_err = None;
+    let mut host = host.to_string();
+    for attempt in 1..=max_attempts {
+        match connect_to_control_server(&host, port) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => {
+                eprintln!(
+                    "Attempt {}/{} to connect to control server at {}:{} failed: {}",
+                    attempt, max_attempts, host, port, e
+                );
+                last_err = Some(e);
+                if attempt < max_attempts {
+                    std::thread::sleep(retry_delay);
+                    // Re-resolve before the next attempt: the discovery file
+                    // may have been written by the host in the meantime.
+                    host = resolve_fn();
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| io::Error::other("failed to connect to control server")))
+}
+
 /// Handle tunnel request - open NEW connection to data port and proxy data
 fn handle_tunnel_request(
     host: &str,
@@ -335,12 +397,30 @@ fn run_port_forward_daemon(stream: &mut TcpStream, port: u16, host: &str) -> io:
 
 /// Run the agent as a daemon, maintaining connection to control server
 fn run_daemon(
-    host: &str,
+    configured_host: &str,
     port: u16,
     scan_interval_secs: u64,
     excluded_ports: HashSet<u16>,
 ) -> io::Result<()> {
-    let mut stream = connect_to_control_server(host, port)?;
+    // Resolve the control host up front: if the host has written a
+    // discovered address to DISCOVERED_HOST_ADDRESS_FILE (see
+    // `ensure_agent_host_address_file` in `src/driver/orchestrator.rs`), the
+    // `host` variable used below is that file's IP, not the statically
+    // configured `--control-host`/`DEVCON_CONTROL_HOST` value.
+    let host = resolve_control_host(configured_host);
+    if host == configured_host {
+        eprintln!("Using configured control host: {}", host);
+    } else {
+        eprintln!(
+            "Using discovered control host: {} (configured default was {})",
+            host, configured_host
+        );
+    }
+
+    let mut stream =
+        connect_to_control_server_with_retry(&host, port, 30, Duration::from_secs(1), || {
+            resolve_control_host(configured_host)
+        })?;
     eprintln!("Connected to control server");
 
     // Send AgentHello message to identify this container
@@ -826,6 +906,92 @@ mod tests {
         StopPortForward, StopSocketRelay, TunnelRequest, agent_message,
     };
     use std::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn test_resolve_control_host_prefers_discovered_file() {
+        let path = std::env::temp_dir().join("devcon_agent_test_host_ip_present");
+        std::fs::write(&path, "192.168.64.1\n").unwrap();
+
+        let host = resolve_control_host_from_path(&path, "host.container.internal");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(host, "192.168.64.1");
+    }
+
+    #[test]
+    fn test_resolve_control_host_falls_back_when_file_missing() {
+        let path = std::env::temp_dir().join("devcon_agent_test_host_ip_missing");
+        let _ = std::fs::remove_file(&path);
+
+        let host = resolve_control_host_from_path(&path, "host.container.internal");
+        assert_eq!(host, "host.container.internal");
+    }
+
+    #[test]
+    fn test_resolve_control_host_falls_back_when_file_empty() {
+        let path = std::env::temp_dir().join("devcon_agent_test_host_ip_empty");
+        std::fs::write(&path, "   \n").unwrap();
+
+        let host = resolve_control_host_from_path(&path, "host.container.internal");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(host, "host.container.internal");
+    }
+
+    #[test]
+    fn test_connect_to_control_server_with_retry_succeeds_on_first_attempt() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener.try_clone().unwrap());
+        std::thread::spawn(move || {
+            let _ = listener.accept();
+        });
+
+        let stream = connect_to_control_server_with_retry(
+            "127.0.0.1",
+            port,
+            3,
+            Duration::from_millis(10),
+            || "127.0.0.1".to_string(),
+        );
+        assert!(stream.is_ok());
+    }
+
+    #[test]
+    fn test_connect_to_control_server_with_retry_exhausts_attempts_and_fails() {
+        // Port 0 never accepts connections, so every attempt fails.
+        let result = connect_to_control_server_with_retry(
+            "127.0.0.1",
+            0,
+            2,
+            Duration::from_millis(1),
+            || "127.0.0.1".to_string(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_connect_to_control_server_with_retry_reresolves_between_attempts() {
+        // First attempt uses a host that can never connect (port 0 is
+        // reserved); the resolve closure then returns a host that succeeds,
+        // simulating the discovery file appearing mid-retry.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let _ = listener.accept();
+        });
+
+        let attempt = std::sync::atomic::AtomicU32::new(0);
+        let stream = connect_to_control_server_with_retry(
+            "0.0.0.0", // unroutable placeholder for the first attempt
+            port,
+            3,
+            Duration::from_millis(10),
+            || {
+                attempt.fetch_add(1, Ordering::SeqCst);
+                "127.0.0.1".to_string()
+            },
+        );
+        assert!(stream.is_ok());
+    }
 
     #[test]
     fn test_message_encoding_decoding_start_port_forward() {

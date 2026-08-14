@@ -723,4 +723,23 @@ pub trait ContainerRuntime: Send {
     ///
     /// A string representing the host address.
     fn get_host_address(&self) -> String;
+
+    /// Resolve a host address that is verified reachable from inside a
+    /// specific running container, if the runtime supports discovering one.
+    ///
+    /// Unlike [`ContainerRuntime::get_host_address`] (a static, build-time
+    /// value baked into the image), this is resolved after the container has
+    /// started and may vary per container/network instance. Runtimes that
+    /// have no better option than the static host address (e.g. Docker's
+    /// `host.docker.internal`) should return `Ok(None)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the runtime's inspection command fails to execute.
+    fn get_host_address_for_agent(
+        &self,
+        _container_handle: &dyn ContainerHandle,
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
 }
