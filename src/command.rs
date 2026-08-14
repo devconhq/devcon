@@ -842,17 +842,6 @@ pub fn handle_serve_command(
     let runtime_name = config.resolve_runtime()?;
     debug!("Using runtime {:?}", runtime_name);
 
-    if runtime_name == "container" {
-        println!(
-            "⚠️  Warning: For the connection to work, you have to register the dns entry 'host.container.internal' for localhost."
-        );
-        println!("   You can do this by invoking following command with sudo: ");
-        println!(
-            "     sudo container system dns create --localhost 192.168.2.10 host.container.internal"
-        );
-        println!("   More info: refer to the container CLI documentation for host DNS setup.");
-    }
-
     control_server::start_control_server(port, output)
 }
 
