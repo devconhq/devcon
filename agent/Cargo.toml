@@ -9,6 +9,7 @@ devcon-proto.workspace = true
 prost.workspace = true
 bytes.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
+libc = "0.2"
 
 [[bin]]
 name = "devcon-agent"

@@ -13,6 +13,7 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -27,27 +28,25 @@ const DAEMONIZED_ENV: &str = "DEVCON_AGENT_DAEMONIZED";
 
 type RelayStreamMap = Arc<Mutex<std::collections::HashMap<u32, Arc<Mutex<UnixStream>>>>>;
 
-fn spawn_detached_daemon(
+/// Builds the argv (excluding the program name) for the respawned detached
+/// daemon child process. `exclude_ports` must be placed BEFORE the `daemon`
+/// subcommand token: it's a top-level Cli argument (declared before the
+/// `#[command(subcommand)]` field) without `global = true`, so clap only
+/// recognizes it when it appears before the subcommand. Placed after
+/// `daemon` and its own flags, clap rejects it with "unexpected argument"
+/// and the respawned child exits immediately (silently, since its
+/// stdout/stderr are discarded) before ever reaching `run_daemon`.
+fn build_daemon_child_args(
     cli: &Cli,
     scan_interval: u64,
     excluded_ports: &HashSet<u16>,
-) -> io::Result<()> {
-    let exe = std::env::current_exe()?;
-
-    let mut command = Command::new(exe);
-    command
-        .arg("--control-host")
-        .arg(&cli.control_host)
-        .arg("--control-port")
-        .arg(cli.control_port.to_string())
-        .arg("daemon")
-        .arg("--scan-interval")
-        .arg(scan_interval.to_string())
-        .arg("--foreground")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env(DAEMONIZED_ENV, "1");
+) -> Vec<String> {
+    let mut args = vec![
+        "--control-host".to_string(),
+        cli.control_host.clone(),
+        "--control-port".to_string(),
+        cli.control_port.to_string(),
+    ];
 
     if !excluded_ports.is_empty() {
         let mut ports: Vec<u16> = excluded_ports.iter().copied().collect();
@@ -57,7 +56,48 @@ fn spawn_detached_daemon(
             .map(u16::to_string)
             .collect::<Vec<_>>()
             .join(",");
-        command.arg("--exclude-ports").arg(ports_csv);
+        args.push("--exclude-ports".to_string());
+        args.push(ports_csv);
+    }
+
+    args.push("daemon".to_string());
+    args.push("--scan-interval".to_string());
+    args.push(scan_interval.to_string());
+    args.push("--foreground".to_string());
+
+    args
+}
+
+fn spawn_detached_daemon(
+    cli: &Cli,
+    scan_interval: u64,
+    excluded_ports: &HashSet<u16>,
+) -> io::Result<()> {
+    let exe = std::env::current_exe()?;
+    let args = build_daemon_child_args(cli, scan_interval, excluded_ports);
+
+    let mut command = Command::new(exe);
+    command
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env(DAEMONIZED_ENV, "1");
+
+    // Detach the child into its own session so it survives the invoking
+    // process's session/controlling-terminal teardown. Without this, when
+    // `devcon-agent daemon` is invoked as part of a `container exec`/`docker
+    // exec` session (e.g. from `devcon-agent-start`), the daemon child stays
+    // in the same session as that exec process; once the exec process exits,
+    // the whole session (and the still-running child with it) can be torn
+    // down immediately, disconnecting the daemon right after it connects.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
     }
 
     let child = command.spawn()?;
@@ -793,9 +833,18 @@ fn handle_incoming_stop_socket_relay(stop: StopSocketRelay, relay_streams: Relay
 fn main() {
     let cli = Cli::parse();
 
+    // These one-shot subcommands (invoked as fresh `devcon-agent` process
+    // executions, e.g. via the `devcon-browser` wrapper script for
+    // OpenUrl) must resolve the discovered host address the same way the
+    // daemon does, otherwise they silently fall back to the static
+    // `--control-host`/`DEVCON_CONTROL_HOST` default (e.g.
+    // `host.container.internal`), which does not resolve on the `container`
+    // runtime.
+    let resolved_control_host = resolve_control_host(&cli.control_host);
+
     let result = match cli.command {
         Commands::StartPortForward { port } => {
-            match connect_to_control_server(&cli.control_host, cli.control_port) {
+            match connect_to_control_server(&resolved_control_host, cli.control_port) {
                 Ok(mut stream) => {
                     eprintln!("Requesting port forward for port {}", port);
                     let msg = AgentMessage {
@@ -807,7 +856,7 @@ fn main() {
                         Ok(_) => {
                             eprintln!("Port forward request sent, keeping connection alive...");
                             // Keep connection alive and handle any reverse tunnel requests
-                            run_port_forward_daemon(&mut stream, port, &cli.control_host)
+                            run_port_forward_daemon(&mut stream, port, &resolved_control_host)
                         }
                         Err(e) => Err(e),
                     }
@@ -816,7 +865,7 @@ fn main() {
             }
         }
         Commands::StopPortForward { port } => {
-            match connect_to_control_server(&cli.control_host, cli.control_port) {
+            match connect_to_control_server(&resolved_control_host, cli.control_port) {
                 Ok(mut stream) => {
                     let msg = AgentMessage {
                         message: Some(agent_message::Message::StopPortForward(StopPortForward {
@@ -829,7 +878,7 @@ fn main() {
             }
         }
         Commands::OpenUrl { url } => {
-            match connect_to_control_server(&cli.control_host, cli.control_port) {
+            match connect_to_control_server(&resolved_control_host, cli.control_port) {
                 Ok(mut stream) => {
                     let msg = AgentMessage {
                         message: Some(agent_message::Message::OpenUrl(OpenUrl { url })),
@@ -906,6 +955,61 @@ mod tests {
         StopPortForward, StopSocketRelay, TunnelRequest, agent_message,
     };
     use std::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn test_build_daemon_child_args_parses_with_excluded_ports() {
+        // Regression test: excluded_ports is always non-empty in practice
+        // (the SSH port is unconditionally inserted), so --exclude-ports is
+        // always present in the respawned child's argv. It must be placed
+        // before the `daemon` subcommand token or clap rejects it.
+        let cli = Cli {
+            control_host: "127.0.0.1".to_string(),
+            control_port: 15000,
+            exclude_ports: None,
+            command: Commands::Daemon {
+                scan_interval: 1,
+                foreground: false,
+            },
+        };
+        let mut excluded_ports = HashSet::new();
+        excluded_ports.insert(22);
+
+        let args = build_daemon_child_args(&cli, 1, &excluded_ports);
+
+        let mut full_args = vec!["devcon-agent".to_string()];
+        full_args.extend(args);
+        let parsed = Cli::try_parse_from(&full_args);
+        assert!(
+            parsed.is_ok(),
+            "expected respawned daemon args to parse successfully, got: {:?}",
+            parsed.err()
+        );
+    }
+
+    #[test]
+    fn test_build_daemon_child_args_parses_without_excluded_ports() {
+        let cli = Cli {
+            control_host: "127.0.0.1".to_string(),
+            control_port: 15000,
+            exclude_ports: None,
+            command: Commands::Daemon {
+                scan_interval: 1,
+                foreground: false,
+            },
+        };
+        let excluded_ports = HashSet::new();
+
+        let args = build_daemon_child_args(&cli, 1, &excluded_ports);
+
+        let mut full_args = vec!["devcon-agent".to_string()];
+        full_args.extend(args);
+        let parsed = Cli::try_parse_from(&full_args);
+        assert!(
+            parsed.is_ok(),
+            "expected respawned daemon args to parse successfully, got: {:?}",
+            parsed.err()
+        );
+    }
 
     #[test]
     fn test_resolve_control_host_prefers_discovered_file() {

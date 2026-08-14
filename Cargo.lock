@@ -411,6 +411,7 @@ dependencies = [
  "bytes",
  "clap",
  "devcon-proto",
+ "libc",
  "prost",
 ]
 
