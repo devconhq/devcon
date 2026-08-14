@@ -723,4 +723,40 @@ pub trait ContainerRuntime: Send {
     ///
     /// A string representing the host address.
     fn get_host_address(&self) -> String;
+
+    /// How the devcon agent should establish its control connection for this runtime.
+    ///
+    /// Defaults to [`AgentConnectionMode::DialHost`], matching the historical behavior
+    /// where the in-container agent dials out to the host's control server.
+    fn agent_connection_mode(&self) -> AgentConnectionMode {
+        AgentConnectionMode::DialHost
+    }
+
+    /// Resolve the routable IP address of a running container, if the runtime can provide one.
+    ///
+    /// Used by runtimes that report [`AgentConnectionMode::ListenForHost`] so the host's
+    /// control server can dial directly into the container instead of relying on the
+    /// container dialing out. Runtimes that don't need this (e.g. Docker, which relies on
+    /// `host.docker.internal`) can return `Ok(None)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if inspecting the container fails.
+    fn get_container_ip_address(&self, container_id: &str) -> Result<Option<String>> {
+        let _ = container_id;
+        Ok(None)
+    }
+}
+
+/// How the devcon agent establishes its control connection with the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentConnectionMode {
+    /// The in-container agent dials out to the host's control server address
+    /// (e.g. `host.docker.internal`). This is the historical/default behavior.
+    DialHost,
+    /// The agent listens on a fixed port inside the container, and the host's
+    /// control server dials into the container's own IP address instead. Used
+    /// for runtimes (like `container`) where a reliable host-reachable alias
+    /// isn't available without fragile manual DNS configuration.
+    ListenForHost,
 }

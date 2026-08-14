@@ -1084,6 +1084,64 @@ impl ContainerRuntime for ContainerCliRuntime {
     fn get_host_address(&self) -> String {
         "host.container.internal".to_string()
     }
+
+    fn agent_connection_mode(&self) -> super::AgentConnectionMode {
+        super::AgentConnectionMode::ListenForHost
+    }
+
+    fn get_container_ip_address(&self, container_id: &str) -> Result<Option<String>> {
+        let output = Command::new("container")
+            .arg("inspect")
+            .arg(container_id)
+            .output()?;
+
+        if !output.status.success() {
+            return Ok(None);
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&stdout).unwrap_or(serde_json::Value::Null);
+        Ok(extract_container_ip_address(&parsed))
+    }
+}
+
+/// Extract the container's routable IP address from `container inspect` JSON output.
+///
+/// The real `container inspect` schema reports the assigned network address(es) under
+/// `status.networks[].ipv4Address` (a CIDR-suffixed string, e.g. `192.168.64.2/24`), not
+/// under a top-level `networks` map. Falls back to a top-level/`configuration`-level
+/// `networks` array in the same shape in case future versions relocate the field.
+fn extract_container_ip_address(parsed: &serde_json::Value) -> Option<String> {
+    let entry = container_inspect_entry(parsed)?;
+
+    ["status", "Status"]
+        .into_iter()
+        .filter_map(|key| entry.get(key))
+        .chain(std::iter::once(entry))
+        .find_map(extract_ipv4_from_networks_array)
+}
+
+/// Given a JSON object that may contain a `networks`/`Networks` array of per-interface
+/// entries, find the first non-empty `ipv4Address` (stripping any trailing CIDR suffix,
+/// e.g. `192.168.64.2/24` -> `192.168.64.2`).
+fn extract_ipv4_from_networks_array(value: &serde_json::Value) -> Option<String> {
+    let networks = value
+        .get("networks")
+        .or_else(|| value.get("Networks"))?
+        .as_array()?;
+
+    networks.iter().find_map(|network| {
+        network
+            .get("ipv4Address")
+            .or_else(|| network.get("Ipv4Address"))
+            .or_else(|| network.get("address"))
+            .or_else(|| network.get("Address"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(|address| address.split('/').next().unwrap_or(address).to_string())
+    })
 }
 
 fn validate_container_runtime_security_request(
@@ -1262,6 +1320,101 @@ mod tests {
 
         let id = extract_container_image_id(&parsed);
         assert_eq!(id, Some("sha256:abc123".to_string()));
+    }
+
+    #[test]
+    fn test_extract_container_ip_address_from_real_container_inspect_shape() {
+        // Verbatim capture from `container inspect <name>` (container CLI 1.2.2 on macOS):
+        // the assigned address lives at the array-wrapped entry's `status.networks[].ipv4Address`,
+        // with a CIDR suffix.
+        let raw = r#"[
+  {
+    "configuration" : {
+      "id" : "devcon-ip-test2",
+      "networks" : [
+        {
+          "network" : "default",
+          "options" : {
+            "hostname" : "devcon-ip-test2",
+            "mtu" : 1280
+          }
+        }
+      ]
+    },
+    "id" : "devcon-ip-test2",
+    "status" : {
+      "networks" : [
+        {
+          "hostname" : "devcon-ip-test2",
+          "ipv4Address" : "192.168.64.3/24",
+          "ipv4Gateway" : "192.168.64.1",
+          "ipv6Address" : "fdb3:90e9:7be4:f8c9:fc27:f3ff:fe05:30e1/64",
+          "macAddress" : "fe:27:f3:05:30:e1",
+          "mtu" : 1280,
+          "network" : "default",
+          "variant" : "reserved"
+        }
+      ],
+      "startedDate" : "2026-08-14T09:32:43Z",
+      "state" : "running"
+    }
+  }
+]"#;
+        let parsed: serde_json::Value = serde_json::from_str(raw).unwrap();
+
+        let ip = extract_container_ip_address(&parsed);
+        assert_eq!(ip, Some("192.168.64.3".to_string()));
+    }
+
+    #[test]
+    fn test_extract_container_ip_address_without_cidr_suffix() {
+        let parsed = serde_json::json!({
+            "id": "devcon-myproject",
+            "status": {
+                "networks": [
+                    { "network": "default", "ipv4Address": "192.168.64.5" }
+                ]
+            }
+        });
+
+        let ip = extract_container_ip_address(&parsed);
+        assert_eq!(ip, Some("192.168.64.5".to_string()));
+    }
+
+    #[test]
+    fn test_extract_container_ip_address_supports_capitalized_keys() {
+        let parsed = serde_json::json!({
+            "Status": {
+                "Networks": [
+                    { "Address": "192.168.64.9/24" }
+                ]
+            }
+        });
+
+        let ip = extract_container_ip_address(&parsed);
+        assert_eq!(ip, Some("192.168.64.9".to_string()));
+    }
+
+    #[test]
+    fn test_extract_container_ip_address_returns_none_when_missing() {
+        let parsed = serde_json::json!({
+            "id": "devcon-myproject"
+        });
+
+        let ip = extract_container_ip_address(&parsed);
+        assert_eq!(ip, None);
+    }
+
+    #[test]
+    fn test_extract_container_ip_address_returns_none_for_empty_networks_array() {
+        let parsed = serde_json::json!({
+            "status": {
+                "networks": []
+            }
+        });
+
+        let ip = extract_container_ip_address(&parsed);
+        assert_eq!(ip, None);
     }
 
     #[test]

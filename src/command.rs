@@ -777,6 +777,10 @@ pub fn handle_up_command(
         lock_options,
     )?;
 
+    // For runtimes where the agent listens instead of dialing out (e.g. `container`),
+    // proactively ask the control server to dial into the container's own IP address.
+    driver.ensure_agent_connected(&container_id);
+
     let remote_user = driver.resolve_remote_user_for_workspace(&devcontainer_workspace);
     if let Err(err) = write_ssh_config_entry(&devcontainer_workspace, &remote_user, false) {
         warn!("failed to write SSH config entry: {}", err);
@@ -841,17 +845,6 @@ pub fn handle_serve_command(
     // Create runtime based on config
     let runtime_name = config.resolve_runtime()?;
     debug!("Using runtime {:?}", runtime_name);
-
-    if runtime_name == "container" {
-        println!(
-            "⚠️  Warning: For the connection to work, you have to register the dns entry 'host.container.internal' for localhost."
-        );
-        println!("   You can do this by invoking following command with sudo: ");
-        println!(
-            "     sudo container system dns create --localhost 192.168.2.10 host.container.internal"
-        );
-        println!("   More info: refer to the container CLI documentation for host DNS setup.");
-    }
 
     control_server::start_control_server(port, output)
 }

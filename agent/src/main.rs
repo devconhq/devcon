@@ -31,6 +31,7 @@ fn spawn_detached_daemon(
     cli: &Cli,
     scan_interval: u64,
     excluded_ports: &HashSet<u16>,
+    listen: bool,
 ) -> io::Result<()> {
     let exe = std::env::current_exe()?;
 
@@ -49,6 +50,10 @@ fn spawn_detached_daemon(
         .stderr(Stdio::null())
         .env(DAEMONIZED_ENV, "1");
 
+    if listen {
+        command.arg("--listen");
+    }
+
     if !excluded_ports.is_empty() {
         let mut ports: Vec<u16> = excluded_ports.iter().copied().collect();
         ports.sort_unstable();
@@ -63,6 +68,28 @@ fn spawn_detached_daemon(
     let child = command.spawn()?;
     eprintln!("Started daemon process with PID {}", child.id());
     Ok(())
+}
+
+/// Whether the agent should listen for the host to connect in, based on the CLI flag
+/// or the `DEVCON_AGENT_MODE=listen` environment variable.
+fn should_listen_for_host(listen_flag: bool) -> bool {
+    listen_flag
+        || std::env::var("DEVCON_AGENT_MODE")
+            .map(|v| v.eq_ignore_ascii_case("listen"))
+            .unwrap_or(false)
+}
+
+fn build_connection_source(cli: &Cli, listen: bool) -> AgentConnectionSource<'_> {
+    if listen {
+        AgentConnectionSource::ListenForHost {
+            listen_port: get_configured_listen_port(),
+        }
+    } else {
+        AgentConnectionSource::DialHost {
+            host: &cli.control_host,
+            port: cli.control_port,
+        }
+    }
 }
 
 fn get_configured_ssh_port() -> u16 {
@@ -132,6 +159,13 @@ enum Commands {
         /// Run in foreground (don't daemonize)
         #[arg(long, default_value = "false")]
         foreground: bool,
+
+        /// Listen for the host's control server to connect in, instead of dialing out
+        /// to `--control-host`. Used for runtimes (like `container`) where the
+        /// container's own IP is reliably reachable from the host, avoiding fragile
+        /// DNS-alias setups. Can also be enabled via `DEVCON_AGENT_MODE=listen`.
+        #[arg(long, default_value = "false")]
+        listen: bool,
     },
 }
 
@@ -333,15 +367,67 @@ fn run_port_forward_daemon(stream: &mut TcpStream, port: u16, host: &str) -> io:
     Ok(())
 }
 
+/// Default port the agent listens on when using [`AgentConnectionSource::ListenForHost`],
+/// i.e. when the host's control server dials into the container instead of the agent
+/// dialing out (used for runtimes like `container` where a reliable host alias for the
+/// agent to dial isn't available).
+const DEFAULT_AGENT_LISTEN_PORT: u16 = devcon_proto::DEFAULT_AGENT_LISTEN_PORT;
+
+/// How the agent should obtain its connection to the host's control server.
+enum AgentConnectionSource<'a> {
+    /// Dial out to `host:port` (historical/default behavior, used e.g. for Docker's
+    /// `host.docker.internal`).
+    DialHost { host: &'a str, port: u16 },
+    /// Listen on `listen_port` and wait for the host's control server to connect in
+    /// (used for runtimes where the container's own IP is reliably reachable from the
+    /// host, avoiding fragile DNS-alias setups).
+    ListenForHost { listen_port: u16 },
+}
+
+fn get_configured_listen_port() -> u16 {
+    std::env::var("DEVCON_AGENT_LISTEN_PORT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u16>().ok())
+        .filter(|p| *p != 0)
+        .unwrap_or(DEFAULT_AGENT_LISTEN_PORT)
+}
+
+/// Wait for the host's control server to connect in on `listen_port`.
+///
+/// Binds a listener on all interfaces (the host reaches the container via the
+/// container's own routable IP) and accepts a single incoming connection.
+fn listen_for_control_server(listen_port: u16) -> io::Result<TcpStream> {
+    let listener = std::net::TcpListener::bind(("0.0.0.0", listen_port))?;
+    eprintln!(
+        "Listening for control server connection on 0.0.0.0:{}",
+        listen_port
+    );
+    let (stream, peer) = listener.accept()?;
+    eprintln!("Control server connected from {}", peer);
+    Ok(stream)
+}
+
 /// Run the agent as a daemon, maintaining connection to control server
 fn run_daemon(
-    host: &str,
-    port: u16,
+    connection_source: AgentConnectionSource<'_>,
     scan_interval_secs: u64,
     excluded_ports: HashSet<u16>,
 ) -> io::Result<()> {
-    let mut stream = connect_to_control_server(host, port)?;
+    let mut stream = match connection_source {
+        AgentConnectionSource::DialHost { host, port } => connect_to_control_server(host, port)?,
+        AgentConnectionSource::ListenForHost { listen_port } => {
+            listen_for_control_server(listen_port)?
+        }
+    };
     eprintln!("Connected to control server");
+
+    // Derive the control server's address from the established connection (rather than
+    // trusting a fixed hostname) so tunnel data connections work identically whether the
+    // agent dialed out or the host dialed in.
+    let control_server_host = stream
+        .peer_addr()
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|_| "127.0.0.1".to_string());
 
     // Send AgentHello message to identify this container
     let workspace_name =
@@ -508,7 +594,7 @@ fn run_daemon(
                         );
 
                         // Spawn new thread to handle this tunnel
-                        let host = host.to_string();
+                        let host = control_server_host.clone();
                         std::thread::spawn(move || {
                             if let Err(e) =
                                 handle_tunnel_request(&host, data_port, service_port, tunnel_id)
@@ -762,6 +848,7 @@ fn main() {
         Commands::Daemon {
             scan_interval,
             foreground,
+            listen,
         } => {
             // We're now in the child process
             // Parse excluded ports from CLI arg or environment variable
@@ -784,24 +871,24 @@ fn main() {
                 eprintln!("Excluding ports from auto-forwarding: {:?}", excluded_ports);
             }
 
+            let listen = should_listen_for_host(listen);
+
             if foreground {
                 eprintln!("Running in foreground mode (not daemonized)");
                 run_daemon(
-                    &cli.control_host,
-                    cli.control_port,
+                    build_connection_source(&cli, listen),
                     scan_interval,
                     excluded_ports,
                 )
             } else if std::env::var_os(DAEMONIZED_ENV).is_some() {
                 run_daemon(
-                    &cli.control_host,
-                    cli.control_port,
+                    build_connection_source(&cli, listen),
                     scan_interval,
                     excluded_ports,
                 )
             } else {
                 eprintln!("Running in daemon mode");
-                match spawn_detached_daemon(&cli, scan_interval, &excluded_ports) {
+                match spawn_detached_daemon(&cli, scan_interval, &excluded_ports, listen) {
                     Ok(()) => Ok(()),
                     Err(e) => {
                         eprintln!("Failed to spawn daemon process: {}", e);
@@ -1158,5 +1245,67 @@ mod tests {
         unsafe {
             std::env::remove_var("DEVCON_SSH_PORT");
         }
+    }
+
+    #[test]
+    fn test_should_listen_for_host_flag_and_env() {
+        unsafe {
+            std::env::remove_var("DEVCON_AGENT_MODE");
+        }
+        assert!(should_listen_for_host(true));
+        assert!(!should_listen_for_host(false));
+
+        unsafe {
+            std::env::set_var("DEVCON_AGENT_MODE", "listen");
+        }
+        assert!(should_listen_for_host(false));
+
+        unsafe {
+            std::env::set_var("DEVCON_AGENT_MODE", "dial");
+        }
+        assert!(!should_listen_for_host(false));
+
+        unsafe {
+            std::env::remove_var("DEVCON_AGENT_MODE");
+        }
+    }
+
+    #[test]
+    fn test_get_configured_listen_port_defaults_and_overrides() {
+        unsafe {
+            std::env::remove_var("DEVCON_AGENT_LISTEN_PORT");
+        }
+        assert_eq!(get_configured_listen_port(), DEFAULT_AGENT_LISTEN_PORT);
+
+        unsafe {
+            std::env::set_var("DEVCON_AGENT_LISTEN_PORT", "16000");
+        }
+        assert_eq!(get_configured_listen_port(), 16000);
+
+        unsafe {
+            std::env::remove_var("DEVCON_AGENT_LISTEN_PORT");
+        }
+    }
+
+    #[test]
+    fn test_listen_for_control_server_accepts_incoming_connection() {
+        // Use port 0 semantics via a fixed high port picked for the test; retry a
+        // couple of candidates in case of a collision on the test machine.
+        let listen_port = 0;
+        let listener = TcpListener::bind(("127.0.0.1", listen_port)).unwrap();
+        let bound_port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let handle = std::thread::spawn(move || listen_for_control_server(bound_port));
+
+        // Give the listener a moment to bind before connecting.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let client = TcpStream::connect(("127.0.0.1", bound_port)).unwrap();
+
+        let accepted = handle.join().unwrap().unwrap();
+        assert_eq!(
+            accepted.peer_addr().unwrap().ip(),
+            client.local_addr().unwrap().ip()
+        );
     }
 }

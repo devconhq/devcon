@@ -384,7 +384,7 @@ runtimeConfig:
 
 - The runtime always passes `--rosetta` when starting containers, enabling Rosetta 2 translation for x86_64 images on ARM64 Macs automatically.
 - Privileged containers use `--virtualization` instead of Docker's `--privileged` flag.
-- The host is reachable from inside the container at `host.container.internal`.
+- Container-to-host communication (port forwarding, SSH agent forwarding, etc.) works automatically: no manual DNS or `host.container.internal` registration is required. Instead of relying on a DNS alias, devcon has the host's control server dial directly into the container's own IP address (discovered via `container inspect`), which the `container` runtime always makes reachable from the host without any extra setup.
 
 ## Building from Source
 

@@ -94,6 +94,23 @@ message ControlError {
   string message = 1;
 }
 
+// Request the control server to actively dial into a container's own IP address
+// and register it as an agent connection, instead of waiting for the agent to
+// dial out. Used for runtimes (like `container`) where the container's IP is
+// reliably reachable from the host but a stable DNS alias for the agent to dial
+// isn't available.
+message ConnectAgentRequest {
+  string container_ip = 1;
+  uint32 agent_port = 2;
+  string container_name = 3;
+  string workspace_name = 4;
+}
+
+message ConnectAgentResponse {
+  bool accepted = 1;
+  string error = 2;
+}
+
 // Wrapper message for all agent communication
 message AgentMessage {
   oneof message {
@@ -112,5 +129,7 @@ message AgentMessage {
     EndForwardRequest end_forward_request = 13;
     EndForwardResponse end_forward_response = 14;
     ControlError control_error = 15;
+    ConnectAgentRequest connect_agent_request = 16;
+    ConnectAgentResponse connect_agent_response = 17;
   }
 }

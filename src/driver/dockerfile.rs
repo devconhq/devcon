@@ -67,6 +67,11 @@ pub(crate) struct DockerfileParams<'a> {
     pub container_user_home: &'a str,
     pub workspace_name: &'a str,
     pub runtime_host_address: &'a str,
+    /// `"listen"` when the agent should listen for the host to connect in (instead of
+    /// dialing out), `"dial"` otherwise. See [`crate::driver::runtime::AgentConnectionMode`].
+    pub agent_connection_mode: &'a str,
+    /// Port the agent listens on when `agent_connection_mode` is `"listen"`.
+    pub agent_listen_port: u16,
     pub config_hash: &'a str,
     /// The devcon binary version (`env!("CARGO_PKG_VERSION")`) that produced
     /// this build, baked in as the `devcon.version` label so a later devcon
@@ -297,6 +302,8 @@ ENV _CONTAINER_USER={{ container_user }}
 ENV _REMOTE_USER_HOME={{ remote_user_home }}
 ENV _CONTAINER_USER_HOME={{ container_user_home }}
 ENV DEVCON_CONTROL_HOST={{ runtime_host_address }}
+ENV DEVCON_AGENT_MODE={{ agent_connection_mode }}
+ENV DEVCON_AGENT_LISTEN_PORT={{ agent_listen_port }}
 LABEL devcon.config-hash={{ config_hash }}
 LABEL devcon.version={{ devcon_version }}
 LABEL devcontainer.metadata="{{ metadata_label }}"
@@ -330,6 +337,8 @@ CMD ["-c", "echo Container started\ntrap \"exit 0\" 15\n\nexec \"$@\"\nPATH=/usr
             env_setup => params.env_setup,
             workspace_name => params.workspace_name,
             runtime_host_address => params.runtime_host_address,
+            agent_connection_mode => params.agent_connection_mode,
+            agent_listen_port => params.agent_listen_port,
             config_hash => params.config_hash,
             devcon_version => params.devcon_version,
             metadata_label => escaped_metadata_label,
@@ -504,6 +513,8 @@ mod tests {
                 container_user_home: "/home/vscode",
                 workspace_name: "workspace",
                 runtime_host_address: "host.docker.internal",
+                agent_connection_mode: "dial",
+                agent_listen_port: 15001,
                 config_hash: "abc123",
                 devcon_version: "0.1.0",
                 metadata_label: r#"[{"containerEnv":{"GH_TOKEN":"${localEnv:GH_TOKEN}"}}]"#,
@@ -535,6 +546,8 @@ mod tests {
                 container_user_home: "/home/vscode",
                 workspace_name: "workspace",
                 runtime_host_address: "host.docker.internal",
+                agent_connection_mode: "dial",
+                agent_listen_port: 15001,
                 config_hash: "abc123",
                 devcon_version: "1.2.3",
                 metadata_label: "[]",
@@ -665,6 +678,8 @@ mod tests {
                 container_user_home: "/home/vscode",
                 workspace_name: "workspace",
                 runtime_host_address: "host.docker.internal",
+                agent_connection_mode: "dial",
+                agent_listen_port: 15001,
                 config_hash: "abc123",
                 devcon_version: "0.1.0",
                 metadata_label: "[]",

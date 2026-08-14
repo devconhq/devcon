@@ -88,11 +88,12 @@ use crate::driver::lifecycle::{
     guard_with_marker, run_lifecycle_command_always, run_lifecycle_command_once,
 };
 use crate::driver::runtime::{
-    ContainerImageInfo, ContainerProbeInfo, FeatureProgressItem, RuntimeParameters,
+    AgentConnectionMode, ContainerImageInfo, ContainerProbeInfo, FeatureProgressItem,
+    RuntimeParameters,
 };
 use crate::{
-    config::Config, driver::feature_process::process_features, driver::runtime::ContainerRuntime,
-    workspace::Workspace,
+    config::Config, driver::control_server, driver::feature_process::process_features,
+    driver::runtime::ContainerRuntime, workspace::Workspace,
 };
 use schema::{DevcontainerLockfile, resolve_lockfile_path};
 
@@ -837,6 +838,11 @@ impl ContainerOrchestrator {
             container_user_home: &resolved_users.container_user_home,
             workspace_name: &workspace_name,
             runtime_host_address: &self.runtime.get_host_address(),
+            agent_connection_mode: match self.runtime.agent_connection_mode() {
+                AgentConnectionMode::DialHost => "dial",
+                AgentConnectionMode::ListenForHost => "listen",
+            },
+            agent_listen_port: devcon_proto::DEFAULT_AGENT_LISTEN_PORT,
             config_hash: &config_hash,
             devcon_version: env!("CARGO_PKG_VERSION"),
             metadata_label: &metadata_label,
@@ -2067,6 +2073,61 @@ impl ContainerOrchestrator {
         }
 
         detect_ssh_socket().map(|path| path.to_string_lossy().to_string())
+    }
+
+    /// Ensures the devcon agent inside a just-started container is connected to the
+    /// host's control server.
+    ///
+    /// For runtimes that report [`crate::driver::runtime::AgentConnectionMode::ListenForHost`]
+    /// (currently the `container` runtime), the in-container agent listens for an
+    /// inbound connection instead of dialing out via a host alias. Since apple/container
+    /// guarantees a container's own IP is directly reachable from the host, this method
+    /// resolves that IP and asks the running control server to dial into it, avoiding the
+    /// fragile `host.container.internal` DNS setup that runtime otherwise requires.
+    ///
+    /// This is a no-op for runtimes using the default [`crate::driver::runtime::AgentConnectionMode::DialHost`]
+    /// mode (e.g. Docker), where the agent already reliably dials out on its own.
+    ///
+    /// Failures are logged and swallowed rather than propagated: a container that starts
+    /// but whose agent doesn't connect should not fail `devcon up` outright, since the
+    /// user can still use the container without agent-dependent features (port
+    /// forwarding, SSH agent forwarding helpers, etc.).
+    pub fn ensure_agent_connected(&self, container_id: &str) {
+        if self.runtime.agent_connection_mode() != AgentConnectionMode::ListenForHost {
+            return;
+        }
+
+        let container_ip = match self.runtime.get_container_ip_address(container_id) {
+            Ok(Some(ip)) => ip,
+            Ok(None) => {
+                warn!(
+                    "Could not determine IP address for container {}; the devcon agent may not connect",
+                    container_id
+                );
+                return;
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to resolve IP address for container {}: {}",
+                    container_id, e
+                );
+                return;
+            }
+        };
+
+        if let Err(e) = control_server::request_connect_agent(
+            "127.0.0.1",
+            devcon_proto::DEFAULT_CONTROL_SERVER_PORT,
+            &container_ip,
+            devcon_proto::DEFAULT_AGENT_LISTEN_PORT,
+            container_id,
+            container_id,
+        ) {
+            warn!(
+                "Failed to ask control server to connect to agent for container {} at {}: {}",
+                container_id, container_ip, e
+            );
+        }
     }
 
     /// Shells into a started container.

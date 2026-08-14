@@ -746,6 +746,52 @@ fn send_control_error(stream: &mut TcpStream, message: impl Into<String>) -> Res
 }
 
 /// Handle a single agent connection
+/// Number of attempts to dial into an agent's listen port before giving up.
+const CONNECT_AGENT_MAX_ATTEMPTS: u32 = 30;
+/// Delay between dial attempts when connecting into an agent's listen port.
+const CONNECT_AGENT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Actively dial into a container's own IP address (used for runtimes where the
+/// agent listens instead of dialing out) and, once connected, hand the resulting
+/// stream off to the same connection-handling logic used for inbound agent
+/// connections. Retries with a short delay since the agent process inside the
+/// container may not have started listening yet.
+fn dial_agent_with_retry(
+    container_ip: String,
+    agent_port: u16,
+    peer_info: ContainerInfo,
+    manager: PortForwardManager,
+) {
+    for attempt in 1..=CONNECT_AGENT_MAX_ATTEMPTS {
+        match TcpStream::connect((container_ip.as_str(), agent_port)) {
+            Ok(stream) => {
+                info!(
+                    "Connected to agent at {}:{} for container {} (attempt {})",
+                    container_ip, agent_port, peer_info.container_name, attempt
+                );
+                if let Err(e) = handle_agent_connection(stream, manager) {
+                    error!(
+                        "Error handling dialed agent connection for {}: {}",
+                        peer_info.container_name, e
+                    );
+                }
+                return;
+            }
+            Err(e) => {
+                debug!(
+                    "Attempt {}/{} to dial agent at {}:{} failed: {}",
+                    attempt, CONNECT_AGENT_MAX_ATTEMPTS, container_ip, agent_port, e
+                );
+                thread::sleep(CONNECT_AGENT_RETRY_DELAY);
+            }
+        }
+    }
+    error!(
+        "Giving up dialing agent at {}:{} for container {} after {} attempts",
+        container_ip, agent_port, peer_info.container_name, CONNECT_AGENT_MAX_ATTEMPTS
+    );
+}
+
 fn handle_agent_connection(mut stream: TcpStream, manager: PortForwardManager) -> Result<()> {
     let peer_addr = stream.peer_addr()?;
     info!("New agent connection from {}", peer_addr);
@@ -915,8 +961,39 @@ fn handle_agent_connection(mut stream: TcpStream, manager: PortForwardManager) -
                 Some(ProtoMessage::ListForwardsResponse(_))
                 | Some(ProtoMessage::StartForwardResponse(_))
                 | Some(ProtoMessage::EndForwardResponse(_))
+                | Some(ProtoMessage::ConnectAgentResponse(_))
                 | Some(ProtoMessage::ControlError(_)) => {
                     warn!("Received unexpected control response message from peer");
+                }
+                Some(ProtoMessage::ConnectAgentRequest(req)) => {
+                    let container_ip = req.container_ip.clone();
+                    let agent_port = req.agent_port as u16;
+                    let peer_info = ContainerInfo {
+                        container_name: req.container_name.clone(),
+                        workspace_name: req.workspace_name.clone(),
+                    };
+                    info!(
+                        "Dialing agent at {}:{} for container {}",
+                        container_ip, agent_port, peer_info.container_name
+                    );
+
+                    let manager_clone = manager.clone();
+                    thread::spawn(move || {
+                        dial_agent_with_retry(container_ip, agent_port, peer_info, manager_clone);
+                    });
+
+                    let response = AgentMessage {
+                        message: Some(ProtoMessage::ConnectAgentResponse(
+                            devcon_proto::ConnectAgentResponse {
+                                accepted: true,
+                                error: String::new(),
+                            },
+                        )),
+                    };
+                    if let Err(e) = send_message(&mut stream, &response) {
+                        error!("Failed to send ConnectAgentResponse: {}", e);
+                    }
+                    break;
                 }
                 None => {
                     warn!("Received message with no content");
@@ -1052,6 +1129,44 @@ pub fn request_end_forward(
         Some(ProtoMessage::ControlError(err)) => Err(Error::runtime(err.message)),
         _ => Err(Error::runtime(
             "Unexpected response from control server for end-forward request".to_string(),
+        )),
+    }
+}
+
+/// Ask a running control server to actively dial into a container's own IP address
+/// instead of waiting for the in-container agent to dial out.
+///
+/// This is fire-and-forget from the caller's perspective: the control server accepts
+/// the request immediately and retries the dial (with backoff) in the background,
+/// since the agent process inside the container may not be listening yet.
+pub fn request_connect_agent(
+    host: &str,
+    port: u16,
+    container_ip: &str,
+    agent_port: u16,
+    container_name: &str,
+    workspace_name: &str,
+) -> Result<()> {
+    let mut stream = connect_to_control_server(host, port)?;
+    let request = AgentMessage {
+        message: Some(ProtoMessage::ConnectAgentRequest(
+            devcon_proto::ConnectAgentRequest {
+                container_ip: container_ip.to_string(),
+                agent_port: agent_port as u32,
+                container_name: container_name.to_string(),
+                workspace_name: workspace_name.to_string(),
+            },
+        )),
+    };
+    send_message(&mut stream, &request)?;
+
+    let response = read_message(&mut stream)?;
+    match response.message {
+        Some(ProtoMessage::ConnectAgentResponse(resp)) if resp.accepted => Ok(()),
+        Some(ProtoMessage::ConnectAgentResponse(resp)) => Err(Error::runtime(resp.error)),
+        Some(ProtoMessage::ControlError(err)) => Err(Error::runtime(err.message)),
+        _ => Err(Error::runtime(
+            "Unexpected response from control server for connect-agent request".to_string(),
         )),
     }
 }
@@ -1238,5 +1353,45 @@ mod tests {
 
         drop(stream_a_client);
         drop(stream_b_client);
+    }
+
+    #[test]
+    fn request_connect_agent_dials_into_fake_agent_listener() {
+        // Simulate a container agent in listen mode: bind a listener and remember its port
+        // before the control server (dialer) is even started.
+        let agent_listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind fake agent listener");
+        let agent_port = agent_listener.local_addr().expect("agent addr").port();
+
+        // Reserve a free port for the control server, then let start_control_server bind it.
+        let reserve = TcpListener::bind(("127.0.0.1", 0)).expect("reserve control server port");
+        let control_port = reserve.local_addr().expect("control server addr").port();
+        drop(reserve);
+
+        thread::spawn(move || {
+            let _ = start_control_server(control_port, OutputFormat::Text);
+        });
+
+        // Give the control server a moment to bind before issuing the request.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        request_connect_agent(
+            "127.0.0.1",
+            control_port,
+            "127.0.0.1",
+            agent_port,
+            "devcon-test-container",
+            "test-workspace",
+        )
+        .expect("connect-agent request should be accepted");
+
+        // The control server should dial into our fake agent listener in the background.
+        let (accepted, _) = agent_listener
+            .accept()
+            .expect("control server should dial the fake agent listener");
+        assert_eq!(
+            accepted.local_addr().unwrap().port(),
+            agent_port,
+            "control server dialed the expected fake agent port"
+        );
     }
 }
