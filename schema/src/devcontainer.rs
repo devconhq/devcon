@@ -631,7 +631,7 @@ impl TryFrom<PathBuf> for Devcontainer {
         if file_result.is_err() {
             return Err(Error::devcontainer(format!(
                 "Devcontainer definition cannot be read {}",
-                &final_path.to_string_lossy()
+                final_path.to_string_lossy()
             )));
         }
 

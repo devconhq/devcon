@@ -178,7 +178,7 @@ pub fn stream_build_output(
             spinner.println("Feature build progress:");
         }
         spinner.enable_steady_tick(Duration::from_millis(100));
-        spinner.set_message(format!("{}..", &phase_label));
+        spinner.set_message(format!("{}..", phase_label));
     }
 
     // Non-interactive: emit plain-text headers now for test capture.
@@ -242,7 +242,7 @@ pub fn stream_build_output(
                             let total = progress.len() + 1;
                             spinner_bar.set_message(format!(
                                 "{phase} [{done}/{total}] Active: {active}",
-                                phase = &phase,
+                                phase = phase,
                                 done = done,
                                 total = total,
                                 active = active,
@@ -305,7 +305,7 @@ pub fn stream_build_output(
                             let total = progress.len() + 1;
                             spinner_bar.set_message(format!(
                                 "{phase} [{done}/{total}] Active: {active}",
-                                phase = &phase,
+                                phase = phase,
                                 done = done,
                                 total = total,
                                 active = active,
@@ -349,25 +349,25 @@ pub fn stream_build_output(
                     if tail.is_empty() {
                         display_spinner.set_message(format!(
                             "{phase} [{done}/{total}] Active: {active}",
-                            phase = &display_phase,
+                            phase = display_phase,
                         ));
                     } else {
                         display_spinner.set_message(format!(
                             "{phase} [{done}/{total}] Active: {active} | {tail}",
-                            phase = &display_phase,
+                            phase = display_phase,
                             tail = dim.apply_to(&tail),
                         ));
                     }
                 } else {
                     display_spinner.set_message(format!(
                         "{phase} [{done}/{total}] Finalizing",
-                        phase = &display_phase,
+                        phase = display_phase,
                     ));
                 }
             } else if !tail.is_empty() {
                 display_spinner.set_message(format!(
                     "{phase} | {tail}",
-                    phase = &display_phase,
+                    phase = display_phase,
                     tail = dim.apply_to(&tail),
                 ));
             } else {

@@ -549,7 +549,7 @@ impl ContainerRuntime for DockerRuntime {
         if result.status.code() != Some(0) {
             return Err(Error::runtime(format!(
                 "Docker exec command failed: {}",
-                &String::from_utf8(result.stderr).unwrap()
+                String::from_utf8(result.stderr).unwrap()
             )));
         }
 

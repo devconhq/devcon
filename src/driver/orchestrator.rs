@@ -1453,7 +1453,7 @@ impl ContainerOrchestrator {
                         all_mounts.push(crate::devcontainer::Mount::String(format!(
                             "{}:{}/.gnupg/S.gpg-agent",
                             socket.display(),
-                            &resolved_users.remote_user_home,
+                            resolved_users.remote_user_home,
                         )));
                         // Also mount keyboxd socket if present — required for
                         // `gpg --list-keys` / `gpg --list-secret-keys` on modern GnuPG.
@@ -1462,7 +1462,7 @@ impl ContainerOrchestrator {
                             all_mounts.push(crate::devcontainer::Mount::String(format!(
                                 "{}:{}/.gnupg/S.keyboxd",
                                 keyboxd_socket.display(),
-                                &resolved_users.remote_user_home,
+                                resolved_users.remote_user_home,
                             )));
                         }
                         // Homedir staged read-only for data file copying in post-start.
@@ -1499,7 +1499,7 @@ impl ContainerOrchestrator {
                     all_mounts.push(crate::devcontainer::Mount::String(format!(
                         "{}:{}/.config/gh",
                         config_dir.display(),
-                        &resolved_users.remote_user_home
+                        resolved_users.remote_user_home
                     )));
                 } else {
                     info!("GitHub CLI forwarding enabled but no configuration found");
