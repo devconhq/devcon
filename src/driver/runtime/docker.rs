@@ -354,6 +354,13 @@ impl ContainerRuntime for DockerRuntime {
             }
         }
 
+        // On Linux, Docker Engine does not resolve `host.docker.internal` by
+        // default during `docker build` any more than it does for `docker
+        // run`. Inject the same `host-gateway` alias so `RUN` steps (e.g. the
+        // devcon-agent feature's binary download) can reach the host.
+        #[cfg(target_os = "linux")]
+        cmd.arg("--add-host=host.docker.internal:host-gateway");
+
         // BuildKit can suppress RUN stdout/stderr in non-plain modes; force plain output
         // when feature marker tracking is active so completion markers are observable.
         if feature_progress.is_some() {

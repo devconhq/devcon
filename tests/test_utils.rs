@@ -1,5 +1,13 @@
 #![allow(dead_code)]
-use std::{collections::HashMap, path::PathBuf, process::Command};
+use std::{
+    collections::HashMap,
+    net::{TcpListener, TcpStream},
+    path::PathBuf,
+    process::Command,
+    sync::OnceLock,
+    thread,
+    time::Duration,
+};
 use tempfile::TempDir;
 
 /// Represents a container runtime type
@@ -357,6 +365,31 @@ pub fn exec_in_container(
     }
 }
 
+/// Poll `ps -ef | grep -q '[p]attern'` inside the container until it succeeds
+/// or the retry budget is exhausted.
+///
+/// Lifecycle-hook-launched daemons (sshd, devcon-agent) start asynchronously
+/// in the background, so a one-shot check right after `devcon up`/`start`
+/// can race the daemon's startup, especially on slower/shared CI runners.
+pub fn wait_for_process_running(
+    runtime: Runtime,
+    container_name: &str,
+    process_pattern: &str,
+) -> Result<(), String> {
+    let grep_pattern = format!("[{}]{}", &process_pattern[..1], &process_pattern[1..]);
+    let command = format!("ps -ef | grep -q '{}'", grep_pattern);
+
+    let mut last_err = String::new();
+    for _ in 0..30 {
+        match exec_in_container(runtime, container_name, &["sh", "-lc", &command]) {
+            Ok(_) => return Ok(()),
+            Err(e) => last_err = e,
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    Err(last_err)
+}
+
 /// Get the running container ID for a DevCon project name.
 pub fn get_running_container_id(runtime: Runtime, project_name: &str) -> Option<String> {
     let cmd = runtime_cmd(runtime);
@@ -651,6 +684,89 @@ macro_rules! skip_if_no_gpg_agent {
     };
 }
 
+// ─── Local devcon-agent binary server ─────────────────────────────────────────
+//
+// devcon's default agent install downloads whatever is currently the latest
+// published GitHub release, which can lag behind unreleased fixes to
+// `agent/src/main.rs`. Agent-enabled integration tests must instead exercise
+// today's agent code, so we build `devcon-agent` from the current source
+// tree once and serve it to test containers over a local HTTP server via
+// `agents.binaryUrl`.
+
+/// Returns a `binaryUrl: <url>` YAML line (or an empty string) to append to
+/// an agent-enabled `TestConfig`.
+///
+/// Only enabled on Linux: a host-native `cargo build` there produces a
+/// binary that can run inside the (Linux) devcontainer, matching CI. On
+/// other hosts (e.g. macOS, where the host binary can't run in a Linux
+/// container without cross-compilation) this returns an empty string and
+/// falls back to devcon's default release-download behavior.
+fn agent_binary_url_yaml_line() -> String {
+    if !cfg!(target_os = "linux") {
+        return String::new();
+    }
+    match agent_binary_server_url() {
+        Some(url) => format!("  binaryUrl: {url}\n"),
+        None => String::new(),
+    }
+}
+
+/// Lazily builds `devcon-agent` from the current source tree and serves it
+/// over a background HTTP server, returning the URL a container can reach
+/// via `host.docker.internal`.
+fn agent_binary_server_url() -> Option<&'static str> {
+    static URL: OnceLock<Option<String>> = OnceLock::new();
+    URL.get_or_init(build_and_serve_agent_binary).as_deref()
+}
+
+fn build_and_serve_agent_binary() -> Option<String> {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").ok()?;
+    let status = Command::new("cargo")
+        .args(["build", "-p", "devcon-agent", "--bin", "devcon-agent"])
+        .current_dir(&manifest_dir)
+        .status()
+        .ok()?;
+    if !status.success() {
+        eprintln!("Failed to build devcon-agent for integration tests");
+        return None;
+    }
+
+    let binary_path = PathBuf::from(&manifest_dir)
+        .join("target")
+        .join("debug")
+        .join("devcon-agent");
+    let binary = std::fs::read(&binary_path).ok()?;
+
+    let listener = TcpListener::bind("0.0.0.0:0").ok()?;
+    let port = listener.local_addr().ok()?.port();
+
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let binary = binary.clone();
+            thread::spawn(move || serve_binary_once(&mut stream, &binary));
+        }
+    });
+
+    Some(format!("http://host.docker.internal:{port}/devcon-agent"))
+}
+
+/// Serves `binary` as the body of a single HTTP response, ignoring the
+/// request itself (this server only ever has one file to offer).
+fn serve_binary_once(stream: &mut TcpStream, binary: &[u8]) {
+    use std::io::{Read, Write};
+
+    let mut discard = [0u8; 1024];
+    let _ = stream.read(&mut discard);
+
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+        binary.len()
+    );
+    let _ = stream.write_all(header.as_bytes());
+    let _ = stream.write_all(binary);
+}
+
 // ─── TestConfig ───────────────────────────────────────────────────────────────
 
 /// Builder for the devcon YAML config used in tests.
@@ -685,18 +801,25 @@ impl TestConfig {
     /// Config with agents enabled at a custom SSH port.
     pub fn with_ssh_port(port: u16) -> Self {
         Self::from_yaml(&format!(
-            "agents:\n  disable: false\n  sshPort: {port}\n  skipSshSetup: false\n"
+            "agents:\n  disable: false\n  sshPort: {port}\n  skipSshSetup: false\n{}",
+            agent_binary_url_yaml_line()
         ))
     }
 
     /// Config with agents enabled but SSH setup skipped.
     pub fn skip_ssh_setup() -> Self {
-        Self::from_yaml("agents:\n  disable: false\n  skipSshSetup: true\n")
+        Self::from_yaml(&format!(
+            "agents:\n  disable: false\n  skipSshSetup: true\n{}",
+            agent_binary_url_yaml_line()
+        ))
     }
 
     /// Config with agents enabled (default port 22, no SSH skip).
     pub fn agents_enabled() -> Self {
-        Self::from_yaml("agents:\n  disable: false\n")
+        Self::from_yaml(&format!(
+            "agents:\n  disable: false\n{}",
+            agent_binary_url_yaml_line()
+        ))
     }
 
     /// Config from raw YAML string.
@@ -713,16 +836,18 @@ impl TestConfig {
 
     /// Config with SSH agent forwarding enabled (requires `devcon serve` to be running).
     pub fn with_ssh_forwarding() -> Self {
-        Self::from_yaml(
-            "agents:\n  disable: false\n  skipSshSetup: false\nagentForwarding:\n  sshEnabled: true\n",
-        )
+        Self::from_yaml(&format!(
+            "agents:\n  disable: false\n  skipSshSetup: false\nagentForwarding:\n  sshEnabled: true\n{}",
+            agent_binary_url_yaml_line()
+        ))
     }
 
     /// Config with GPG agent forwarding enabled (requires `devcon serve` to be running).
     pub fn with_gpg_forwarding() -> Self {
-        Self::from_yaml(
-            "agents:\n  disable: false\n  skipSshSetup: false\nagentForwarding:\n  gpgEnabled: true\n",
-        )
+        Self::from_yaml(&format!(
+            "agents:\n  disable: false\n  skipSshSetup: false\nagentForwarding:\n  gpgEnabled: true\n{}",
+            agent_binary_url_yaml_line()
+        ))
     }
 }
 
@@ -1199,8 +1324,18 @@ impl DevconRun {
             Self::shell_single_quote(config.path.to_str().unwrap()),
             Self::shell_single_quote(workspace.to_str().unwrap()),
         );
-        let output = Command::new("script")
-            .args(["-q", "/dev/null", "/bin/sh", "-lc", &command])
+        // `script`'s argument syntax differs between BSD (macOS) and
+        // util-linux (Linux): BSD `script` takes a trailing `[command ...]`
+        // after the typescript file, while util-linux `script` parses the
+        // whole argv with getopt and requires the command to be passed via
+        // `-c`.
+        let mut script_cmd = Command::new("script");
+        if cfg!(target_os = "linux") {
+            script_cmd.args(["-qc", &command, "/dev/null"]);
+        } else {
+            script_cmd.args(["-q", "/dev/null", "/bin/sh", "-lc", &command]);
+        }
+        let output = script_cmd
             .output()
             .expect("Failed to spawn devcon shell under script");
 
@@ -1484,5 +1619,43 @@ mod tests {
     fn test_runtime_cmd() {
         assert_eq!(runtime_cmd(Runtime::Docker), "docker");
         assert_eq!(runtime_cmd(Runtime::Container), "container");
+    }
+
+    #[test]
+    fn test_serve_binary_once_writes_full_body() {
+        let payload = b"fake devcon-agent binary bytes".to_vec();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind test listener");
+        let addr = listener.local_addr().unwrap();
+
+        let server_payload = payload.clone();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("Failed to accept connection");
+            serve_binary_once(&mut stream, &server_payload);
+        });
+
+        let mut client =
+            std::net::TcpStream::connect(addr).expect("Failed to connect to test server");
+        use std::io::{Read, Write};
+        client
+            .write_all(b"GET /devcon-agent HTTP/1.1\r\nHost: test\r\n\r\n")
+            .expect("Failed to send request");
+
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .expect("Failed to read response");
+
+        let body_start = response
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("Response missing header/body separator")
+            + 4;
+        assert_eq!(&response[body_start..], payload.as_slice());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn test_agent_binary_url_yaml_line_empty_on_non_linux() {
+        assert_eq!(agent_binary_url_yaml_line(), "");
     }
 }

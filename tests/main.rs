@@ -268,18 +268,10 @@ fn test_sshd_and_agent_restart_after_container_stop() {
     let id_after_up = get_running_container_id(runtime, "test-agent-sshd-restart")
         .expect("Failed to resolve running container id after up");
 
-    exec_in_container(
-        runtime,
-        &id_after_up,
-        &["sh", "-lc", "ps -ef | grep -q '[s]shd'"],
-    )
-    .expect("sshd should be running after initial up");
-    exec_in_container(
-        runtime,
-        &id_after_up,
-        &["sh", "-lc", "ps -ef | grep -q '[d]evcon-agent'"],
-    )
-    .expect("devcon-agent daemon should be running after initial up");
+    wait_for_process_running(runtime, &id_after_up, "sshd")
+        .expect("sshd should be running after initial up");
+    wait_for_process_running(runtime, &id_after_up, "devcon-agent")
+        .expect("devcon-agent daemon should be running after initial up");
 
     stop_container(runtime, &id_after_up);
 
@@ -288,18 +280,11 @@ fn test_sshd_and_agent_restart_after_container_stop() {
     let id_after_start = get_running_container_id(runtime, "test-agent-sshd-restart")
         .expect("Failed to resolve running container id after start");
 
-    exec_in_container(
-        runtime,
-        &id_after_start,
-        &["sh", "-lc", "ps -ef | grep -q '[s]shd'"],
-    )
-    .expect("sshd should be running again after restarting the stopped container");
-    exec_in_container(
-        runtime,
-        &id_after_start,
-        &["sh", "-lc", "ps -ef | grep -q '[d]evcon-agent'"],
-    )
-    .expect("devcon-agent daemon should be running again after restarting the stopped container");
+    wait_for_process_running(runtime, &id_after_start, "sshd")
+        .expect("sshd should be running again after restarting the stopped container");
+    wait_for_process_running(runtime, &id_after_start, "devcon-agent").expect(
+        "devcon-agent daemon should be running again after restarting the stopped container",
+    );
 }
 
 /// The built image must carry the running devcon binary's version as a
@@ -359,18 +344,9 @@ fn test_start_rebuilds_automatically_when_metadata_label_is_corrupted() {
     let id_after_start = get_running_container_id(runtime, "test-corrupt-metadata-rebuild")
         .expect("Failed to resolve running container id after start");
 
-    exec_in_container(
-        runtime,
-        &id_after_start,
-        &["sh", "-lc", "ps -ef | grep -q '[s]shd'"],
-    )
-    .expect("sshd should be running after devcon start auto-rebuilds the corrupted image");
-    exec_in_container(
-        runtime,
-        &id_after_start,
-        &["sh", "-lc", "ps -ef | grep -q '[d]evcon-agent'"],
-    )
-    .expect(
+    wait_for_process_running(runtime, &id_after_start, "sshd")
+        .expect("sshd should be running after devcon start auto-rebuilds the corrupted image");
+    wait_for_process_running(runtime, &id_after_start, "devcon-agent").expect(
         "devcon-agent daemon should be running after devcon start auto-rebuilds the corrupted image",
     );
 
