@@ -403,7 +403,7 @@ dependencies = [
 
 [[package]]
 name = "devcon"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "assert_cmd",
  "bytes",
@@ -442,7 +442,7 @@ dependencies = [
 
 [[package]]
 name = "devcon-agent"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "bytes",
  "clap",
@@ -453,7 +453,7 @@ dependencies = [
 
 [[package]]
 name = "devcon-proto"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "bytes",
  "prost",
@@ -1908,7 +1908,7 @@ dependencies = [
 
 [[package]]
 name = "schema"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "json-strip-comments",
  "serde",
