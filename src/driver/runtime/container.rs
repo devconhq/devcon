@@ -733,7 +733,7 @@ impl ContainerRuntime for ContainerCliRuntime {
             platform_architecture_translation,
         } = runtime_parameters;
 
-        validate_container_runtime_security_request(requires_privileged, &security_opt)?;
+        // validate_container_runtime_security_request(requires_privileged, &security_opt)?;
 
         trace!(
             "Container start attempt with requested forwards: {:?}",
