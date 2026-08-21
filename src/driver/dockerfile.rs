@@ -191,7 +191,11 @@ impl BuildContext {
         let dotfiles_helper_content = r#"
 #!/bin/sh
 set -e
-cd && git clone $1 .dotfiles && cd .dotfiles
+cd
+# Remove any leftover clone from a previous, interrupted run so this script
+# can be safely retried without `git clone` failing on a non-empty directory.
+rm -rf .dotfiles
+git clone $1 .dotfiles && cd .dotfiles
 if [ -n "$2" ]; then
     chmod +x $2
     ./$2 || true
@@ -676,5 +680,89 @@ mod tests {
 
         assert!(dockerfile_path.exists());
         assert!(ctx.path().join("Dockerfile").exists());
+    }
+
+    #[test]
+    fn test_write_dotfiles_helper_writes_executable_script() {
+        let ctx = BuildContext::new(None).unwrap();
+        ctx.write_dotfiles_helper().unwrap();
+
+        let script_path = ctx.dir.join("dotfiles_helper.sh");
+        let content = std::fs::read_to_string(&script_path).unwrap();
+        assert!(content.contains("git clone"));
+        assert!(content.contains("rm -rf .dotfiles"));
+    }
+
+    /// Runs the generated dotfiles helper script (with `HOME` pointed at a
+    /// temp directory) against a local bare git "remote" repository, and
+    /// returns the exit status. Used to verify the helper tolerates being
+    /// re-run after a previous, interrupted attempt left a partial
+    /// `.dotfiles` clone behind.
+    fn run_dotfiles_helper(script_path: &std::path::Path, home_dir: &std::path::Path) -> bool {
+        std::process::Command::new("sh")
+            .arg(script_path)
+            .arg(format!("file://{}", home_dir.join("remote.git").display()))
+            .env("HOME", home_dir)
+            .status()
+            .expect("run dotfiles helper")
+            .success()
+    }
+
+    #[test]
+    fn test_dotfiles_helper_retries_after_partial_previous_clone() {
+        let ctx = BuildContext::new(None).unwrap();
+        ctx.write_dotfiles_helper().unwrap();
+        let script_path = ctx.dir.join("dotfiles_helper.sh");
+
+        let home = tempfile::tempdir().unwrap();
+        let remote = home.path().join("remote.git");
+
+        // Set up a minimal bare git repository to clone from.
+        let run_git = |args: &[&str], cwd: &std::path::Path| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {:?} failed", args);
+        };
+        run_git(&["init", "--bare", "remote.git"], home.path());
+
+        let seed = tempfile::tempdir().unwrap();
+        run_git(&["init"], seed.path());
+        run_git(&["config", "user.email", "test@example.com"], seed.path());
+        run_git(&["config", "user.name", "Test"], seed.path());
+        run_git(&["config", "commit.gpgsign", "false"], seed.path());
+        run_git(&["config", "tag.gpgsign", "false"], seed.path());
+        std::fs::write(seed.path().join("README.md"), "hello").unwrap();
+        run_git(&["add", "README.md"], seed.path());
+        run_git(&["commit", "-m", "init"], seed.path());
+        run_git(
+            &["push", remote.to_str().unwrap(), "HEAD:refs/heads/main"],
+            seed.path(),
+        );
+        run_git(
+            &[
+                "-c",
+                "safe.bareRepository=all",
+                "-C",
+                remote.to_str().unwrap(),
+                "symbolic-ref",
+                "HEAD",
+                "refs/heads/main",
+            ],
+            home.path(),
+        );
+
+        // Simulate a leftover, partial clone from a previously failed run.
+        let leftover = home.path().join(".dotfiles");
+        std::fs::create_dir_all(&leftover).unwrap();
+        std::fs::write(leftover.join("stale.txt"), "leftover from a failed attempt").unwrap();
+
+        assert!(
+            run_dotfiles_helper(&script_path, home.path()),
+            "dotfiles helper should succeed even when .dotfiles already exists from a prior failed attempt"
+        );
+        assert!(home.path().join(".dotfiles").join("README.md").exists());
     }
 }

@@ -946,6 +946,38 @@ impl ContainerOrchestrator {
         Ok(())
     }
 
+    /// Runs the dotfiles setup helper inside the given container, guarded by
+    /// the `dotfilesSetup` marker so it only runs once (per marker
+    /// lifetime). No-op if no dotfiles repository is configured.
+    ///
+    /// Since the marker is only created on success (see
+    /// [`guard_with_marker`]), it is safe — and necessary for reliability —
+    /// to call this both right after creating a brand new container and
+    /// when restarting a previously stopped one: if the first attempt
+    /// failed (e.g. a transient network error during `git clone`), calling
+    /// this again on a later `devcon up` gives it a chance to succeed
+    /// instead of being silently skipped forever.
+    fn run_dotfiles_setup(
+        &self,
+        handle: &dyn crate::driver::runtime::ContainerHandle,
+    ) -> Result<()> {
+        let Some(repo) = self.config.dotfiles_repository.as_deref() else {
+            return Ok(());
+        };
+
+        let dotfiles_cmd = format!(
+            "/dotfiles_helper.sh {} {}",
+            repo,
+            self.config
+                .dotfiles_install_command
+                .as_deref()
+                .unwrap_or("")
+        );
+        let guarded = guard_with_marker(dotfiles_cmd.trim(), "dotfilesSetup");
+        self.runtime
+            .exec(handle, vec!["bash", "-c", &guarded], &[], false, false)
+    }
+
     /// Reads and merges the `devcontainer.metadata` label for a specific
     /// image tag. Returns an empty [`schema::MergedImageMetadata`] when the
     /// image does not exist or has no label.
@@ -1160,6 +1192,13 @@ impl ContainerOrchestrator {
                         // so a restarted container behaves like a freshly
                         // created one.
                         self.run_feature_entrypoints(restarted.as_ref(), &latest_tag)?;
+
+                        // Retry dotfiles setup on restart: the `dotfilesSetup`
+                        // marker is only created on success, so this is a
+                        // no-op if it already succeeded, but gives a prior
+                        // failed attempt (e.g. a transient network error) a
+                        // chance to succeed instead of never running again.
+                        self.run_dotfiles_setup(restarted.as_ref())?;
 
                         if let Some(command) =
                             &devcontainer_workspace.devcontainer.post_start_command
@@ -1725,24 +1764,7 @@ impl ContainerOrchestrator {
         }
 
         // Add dotfiles setup if repository is provided
-        if let Some(repo) = self.config.dotfiles_repository.as_deref() {
-            let dotfiles_cmd = format!(
-                "/dotfiles_helper.sh {} {}",
-                repo,
-                self.config
-                    .dotfiles_install_command
-                    .as_deref()
-                    .unwrap_or("")
-            );
-            let guarded = guard_with_marker(dotfiles_cmd.trim(), "dotfilesSetup");
-            self.runtime.exec(
-                handle.as_ref(),
-                vec!["bash", "-c", &guarded],
-                &[],
-                false,
-                false,
-            )?;
-        };
+        self.run_dotfiles_setup(handle.as_ref())?;
 
         // Add gh token to environment if GitHub CLI forwarding enabled and token is available
         if self

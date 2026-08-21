@@ -228,14 +228,16 @@ pub(crate) fn run_lifecycle_command_always(
 /// Wraps a shell command string so it runs at most once inside the container,
 /// guarded by a marker file at `/var/lib/devcon/lifecycle-markers/{marker_name}`.
 ///
-/// The marker is created only when the command succeeds (`&&`). With `--rm`
-/// (current default) the container filesystem is discarded on stop, so the guard
-/// has no effect today. Once containers are persisted across stop/start cycles the
-/// marker will survive and prevent the command from re-running on subsequent starts.
+/// The marker is created only when the command succeeds (`&&`), so a failing
+/// command both surfaces its non-zero exit status (propagated up through
+/// `docker`/`container exec`) and is eligible to run again on a subsequent
+/// invocation. Containers are not run with `--rm`, so they persist across
+/// stop/start cycles and the marker survives, preventing a successful command
+/// from re-running on later starts.
 pub(crate) fn guard_with_marker(cmd: &str, marker_name: &str) -> String {
     let marker = lifecycle_marker_path(marker_name);
     format!(
-        "MARKER='{}'; if [ ! -f \"$MARKER\" ]; then {}; sudo mkdir -p \"$(dirname \"$MARKER\")\" && sudo touch \"$MARKER\"; fi",
+        "MARKER='{}'; if [ ! -f \"$MARKER\" ]; then {} && sudo mkdir -p \"$(dirname \"$MARKER\")\" && sudo touch \"$MARKER\"; fi",
         marker, cmd
     )
 }
@@ -272,5 +274,85 @@ mod tests {
     fn test_guard_with_marker_touch_after_success() {
         let result = guard_with_marker("my_command", "testMarker");
         assert!(result.contains("sudo touch"));
+    }
+
+    /// Runs a `guard_with_marker`-generated snippet through a real shell,
+    /// using a `sudo` stub on `PATH` that simply execs its arguments (so the
+    /// test doesn't require actual root privileges), and a marker file under
+    /// a temp directory instead of `/var/lib/devcon/...`.
+    fn run_guarded_snippet(cmd: &str, marker_path: &std::path::Path) -> std::process::ExitStatus {
+        let sudo_stub_dir = tempfile::tempdir().expect("create sudo stub dir");
+        let sudo_stub_path = sudo_stub_dir.path().join("sudo");
+        std::fs::write(&sudo_stub_path, "#!/bin/sh\nexec \"$@\"\n").expect("write sudo stub");
+        let mut perms = std::fs::metadata(&sudo_stub_path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&sudo_stub_path, perms).unwrap();
+
+        let path_env = format!(
+            "{}:{}",
+            sudo_stub_dir.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
+        // Reconstruct the snippet with the temp marker path instead of the
+        // real (unwritable-by-tests) lifecycle-markers directory.
+        let snippet = format!(
+            "MARKER='{}'; if [ ! -f \"$MARKER\" ]; then {} && sudo mkdir -p \"$(dirname \"$MARKER\")\" && sudo touch \"$MARKER\"; fi",
+            marker_path.display(),
+            cmd
+        );
+
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&snippet)
+            .env("PATH", path_env)
+            .status()
+            .expect("run guarded snippet")
+    }
+
+    #[test]
+    fn test_guard_with_marker_does_not_create_marker_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker_path = dir.path().join("markers").join("testMarker");
+
+        let status = run_guarded_snippet("false", &marker_path);
+
+        assert!(!status.success(), "guarded command should fail overall");
+        assert!(
+            !marker_path.exists(),
+            "marker must not be created when the guarded command fails"
+        );
+    }
+
+    #[test]
+    fn test_guard_with_marker_creates_marker_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker_path = dir.path().join("markers").join("testMarker");
+
+        let status = run_guarded_snippet("true", &marker_path);
+
+        assert!(status.success(), "guarded command should succeed overall");
+        assert!(
+            marker_path.exists(),
+            "marker must be created when the guarded command succeeds"
+        );
+    }
+
+    #[test]
+    fn test_guard_with_marker_skips_rerun_once_marker_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let markers_dir = dir.path().join("markers");
+        std::fs::create_dir_all(&markers_dir).unwrap();
+        let marker_path = markers_dir.join("testMarker");
+        std::fs::write(&marker_path, "").unwrap();
+
+        // "false" would fail if executed, so success here proves the guarded
+        // command was skipped because the marker already exists.
+        let status = run_guarded_snippet("false", &marker_path);
+
+        assert!(
+            status.success(),
+            "already-marked command should be skipped, not re-run"
+        );
     }
 }
