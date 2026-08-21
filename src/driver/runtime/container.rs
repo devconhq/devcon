@@ -727,13 +727,13 @@ impl ContainerRuntime for ContainerCliRuntime {
         let RuntimeParameters {
             additional_mounts,
             ports,
-            requires_privileged,
+            requires_privileged: _requires_privileged,
             cap_add,
-            security_opt,
+            security_opt: _security_opt,
             platform_architecture_translation,
         } = runtime_parameters;
 
-        // validate_container_runtime_security_request(requires_privileged, &security_opt)?;
+        // validate_container_runtime_security_request(_requires_privileged, &_security_opt)?;
 
         trace!(
             "Container start attempt with requested forwards: {:?}",
@@ -1131,6 +1131,9 @@ impl ContainerRuntime for ContainerCliRuntime {
     }
 }
 
+// TODO: re-enable this security check once container runtime privileged/security_opt
+// support is revisited (see commit 94473c7a "fix: remove security check for container runtime").
+#[allow(dead_code)]
 fn validate_container_runtime_security_request(
     requires_privileged: bool,
     security_opt: &[String],
